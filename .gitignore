@@ -1,0 +1,33 @@
+# ---- Build artifacts ----
+.build/
+DerivedData/
+build/
+*.o
+*.swiftmodule
+
+# ---- Xcode user/local state & generated project ----
+# FlowTranslate.xcodeproj is generated from project.yml via `xcodegen generate`.
+FlowTranslate.xcodeproj/
+*.xcworkspace/xcuserdata/
+**/xcuserdata/
+*.xcuserstate
+.swiftpm/
+
+# ---- Packaging output ----
+Packaging/build/
+*.dmg
+*.zip
+
+# ---- macOS ----
+.DS_Store
+
+# ---- Internal / not needed by open-source consumers ----
+# Chinese design docs, spec-kit internals, tests and local agent instructions.
+specs/
+Tests/
+.specify/
+.vscode/
+.github/agents/
+.github/prompts/
+.github/copilot-instructions.md
+CLAUDE.md

@@ -1,0 +1,49 @@
+name: FlowTranslate
+options:
+  bundleIdPrefix: dev.flowtranslate
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+
+packages:
+  FlowTranslateCore:
+    path: .
+  FluidAudio:
+    url: https://github.com/FluidInference/FluidAudio.git
+    from: "0.15.0"
+  # Pinned to a minor version so the MLXLLM/MLXLMCommon API matches our code.
+  # 2.29.x is required to compile under Xcode 26 / Swift 6.
+  MLXSwiftExamples:
+    url: https://github.com/ml-explore/mlx-swift-examples.git
+    minorVersion: 2.29.1
+
+targets:
+  FlowTranslate:
+    type: application
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: FlowTranslate
+    dependencies:
+      - package: FlowTranslateCore
+        product: FlowTranslateCore
+      - package: FluidAudio
+        product: FluidAudio
+      - package: MLXSwiftExamples
+        product: MLXLLM
+      - package: MLXSwiftExamples
+        product: MLXLMCommon
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.flowtranslate.app
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        GENERATE_INFOPLIST_FILE: NO
+        INFOPLIST_FILE: FlowTranslate/Info.plist
+        CODE_SIGN_ENTITLEMENTS: FlowTranslate/FlowTranslate.entitlements
+        SWIFT_VERSION: "5.0"
+        ENABLE_HARDENED_RUNTIME: YES
+        DEAD_CODE_STRIPPING: YES
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        COMBINE_HIDPI_IMAGES: YES

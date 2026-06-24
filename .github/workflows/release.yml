@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & publish DMG
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode_16.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build DMG
+        run: bash Packaging/build_dmg.sh
+
+      # Optional notarization — runs only when signing secrets are present.
+      - name: Notarize DMG
+        if: ${{ env.DEVELOPER_ID_APP != '' }}
+        env:
+          DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+          NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
+        run: bash Packaging/notarize.sh
+
+      - name: Publish to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Packaging/build/FlowTranslate.dmg
+          generate_release_notes: true
