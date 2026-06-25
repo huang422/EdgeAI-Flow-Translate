@@ -1,32 +1,38 @@
 import Foundation
 import FlowTranslateCore
-import MLXLLM
-import MLXLMCommon
 
-/// On-demand meeting summarizer backed by an MLX 4-bit LLM
-/// (`mlx-community/Qwen3-1.7B-4bit`) on the Apple Silicon GPU.
+/// On-demand content summarizer backed by the shared MLX 4-bit Qwen model
+/// (`QwenModelHost`, `mlx-community/Qwen3-4B-Instruct-2507-4bit`) on the Apple
+/// Silicon GPU.
 ///
-/// Produces **separate** English and Traditional Chinese summaries in a single
-/// generation. The model is only loaded for this post-meeting step and released
-/// afterwards, keeping the real-time (ANE) loop's memory headroom intact.
+/// The transcript is **content-agnostic**: it may be a meeting, a lecture, a
+/// video, a podcast, an interview or a casual conversation — the prompts adapt to
+/// whatever the audio actually is instead of assuming "meeting minutes".
 ///
-/// The final summary step runs in Qwen3's **thinking** mode for better quality
-/// (the fast map step uses `/no_think`). Long transcripts use a **map-reduce**
-/// strategy. Any failure (offline, parse error, OOM) is thrown so the caller can
-/// fall back to `ExtractiveSummarizer`.
+/// Design for a small (4-bit, 4B) model:
+/// * **Map-reduce** — long transcripts are condensed chunk-by-chunk first.
+/// * **One language per call** — English and Traditional Chinese are produced by
+///   two separate generations. A single, focused task gives a small model far
+///   better language adherence and structure than asking for both at once.
+/// * **Tolerant parsing** — the model is asked for JSON, but the output is parsed
+///   with a balanced-brace extractor and, if that still fails, the prose is shown
+///   as the overview. A stray character (the old `Unexpected character '<'`
+///   crash) can no longer fail the whole summary.
+///
+/// It shares the one `QwenModelHost` with live translation, so the model is loaded
+/// at most once; the owner (`CaptureViewModel`) frees it after the summary.
 public final class MLXMeetingSummarizer: MeetingSummarizing {
-    private let modelId: String
+    private let host: QwenModelHost
     private let chunkCharBudget: Int
-    private let downloader: MLXModelDownloader
-    private var container: ModelContainer?
+    private var modelId: String { host.modelId }
 
-    public init(
-        modelId: String = "mlx-community/Qwen3-1.7B-4bit",
-        chunkCharBudget: Int = 6000
-    ) {
-        self.modelId = modelId
+    init(host: QwenModelHost, chunkCharBudget: Int = 5000) {
+        self.host = host
         self.chunkCharBudget = chunkCharBudget
-        self.downloader = MLXModelDownloader(repoId: modelId)
+    }
+
+    private enum Lang {
+        case english, chinese
     }
 
     public func summarizeBilingual(
@@ -37,97 +43,84 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
         let lines = transcriptLines(segments)
         guard !lines.isEmpty else {
             let en = Summary(sessionId: session.id, overview: "No content to summarize.", modelName: modelId)
-            let zh = Summary(sessionId: session.id, overview: "本次會議沒有可摘要的內容。", modelName: modelId)
+            let zh = Summary(sessionId: session.id, overview: "沒有可摘要的內容。", modelName: modelId)
             return (en, zh)
         }
 
         progress?(0.05)
-        let container = try await loadContainer(progress: progress)
-        defer { releaseModel() }
+        // Load (or reuse) the shared Qwen model. Its memory is freed by the owner
+        // (CaptureViewModel) after the summary — translation may already have it.
+        try await host.ensureLoaded { p in progress?(0.05 + 0.1 * p) }
 
-        // ---- Map: condense each chunk (only needed for long transcripts) ----
-        let chunks = chunked(lines, budget: chunkCharBudget)
-        let condensed: String
-        if chunks.count == 1 {
-            condensed = chunks[0]
-        } else {
-            var notes: [String] = []
-            for (i, chunk) in chunks.enumerated() {
-                let note = try await complete(system: Self.mapSystemPrompt, user: chunk,
-                                              container: container, maxTokens: 600, think: false)
-                notes.append(note)
-                progress?(0.2 + 0.5 * Double(i + 1) / Double(chunks.count))
-            }
-            condensed = notes.joined(separator: "\n")
-        }
+        // ---- Map: condense the transcript into compact English notes ----
+        let condensed = try await condense(lines) { p in progress?(0.15 + 0.45 * p) }
+        progress?(0.6)
 
-        // ---- Reduce: one structured JSON summary with both languages ----
-        // Thinking mode on for a higher-quality summary; larger token budget so
-        // the reasoning block plus the JSON answer both fit.
-        progress?(0.75)
-        // Repeat the language rule in the user turn — a small model weights the
-        // latest turn most, which curbs the drift to Simplified Chinese.
-        let reduceUser = condensed + "\n\n———\n輸出要求（務必遵守）：回傳 JSON 中 "
-            + "\"zh\" 區塊的每個文字都必須是繁體中文（台灣正體字），絕對不可出現任何簡體字；"
-            + "\"en\" 區塊必須全部是英文。"
-        let json = try await complete(system: Self.reduceSystemPrompt, user: reduceUser,
-                                      container: container, maxTokens: 4000, think: true)
-        progress?(0.95)
-
-        let result = try parseBilingual(json, sessionId: session.id)
+        // ---- Reduce: one structured summary per language ----
+        let english = try await summarizeOne(condensed, language: .english, sessionId: session.id)
+        progress?(0.8)
+        let chinese = try await summarizeOne(condensed, language: .chinese, sessionId: session.id)
         progress?(1.0)
-        return result
+        return (english, chinese)
     }
 
-    // MARK: - Model lifecycle
+    // MARK: - Map (condense)
 
-    private func loadContainer(progress: ((Double) -> Void)?) async throws -> ModelContainer {
-        if let container { return container }
-        if !downloader.isComplete {
-            try await downloader.download { p in progress?(0.05 + 0.15 * p) }
+    /// Collapse the transcript to compact English working notes. Short transcripts
+    /// pass through untouched; long ones are summarized chunk-by-chunk so the final
+    /// reduce step always fits the model's context.
+    private func condense(_ lines: [String], progress: (Double) -> Void) async throws -> String {
+        let chunks = chunked(lines, budget: chunkCharBudget)
+        guard chunks.count > 1 else { progress(1); return chunks[0] }
+
+        var notes: [String] = []
+        for (i, chunk) in chunks.enumerated() {
+            // On a per-chunk failure keep the raw chunk rather than aborting the
+            // whole summary.
+            let note = await host.generate(
+                system: Self.mapSystemPrompt, user: chunk, maxTokens: 700, temperature: 0.3
+            )
+            notes.append(note?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty ?? chunk)
+            progress(Double(i + 1) / Double(chunks.count))
         }
-        let configuration = ModelConfiguration(directory: downloader.directory)
-        let loaded = try await LLMModelFactory.shared.loadContainer(configuration: configuration)
-        container = loaded
-        return loaded
+        return notes.joined(separator: "\n")
     }
 
-    private func releaseModel() { container = nil }
+    // MARK: - Reduce (one language)
 
-    // MARK: - Generation
-
-    /// Run one completion. `think` toggles Qwen3's reasoning mode: on for the
-    /// final summary (quality), off (`/no_think`) for the fast map step. Any
-    /// `<think>…</think>` block is stripped from the returned text.
-    private func complete(system: String, user: String, container: ModelContainer,
-                          maxTokens: Int, think: Bool) async throws -> String {
-        let userContent = think ? user : user + " /no_think"
-        let output = try await container.perform { context in
-            let messages: [[String: Any]] = [
-                ["role": "system", "content": system],
-                ["role": "user", "content": userContent],
-            ]
-            let input = try await context.processor.prepare(input: UserInput(messages: messages))
-            let params = GenerateParameters(temperature: 0.2)
-            let result = try MLXLMCommon.generate(input: input, parameters: params, context: context) { tokens in
-                tokens.count >= maxTokens ? .stop : .more
-            }
-            return result.output
+    /// Generate a structured summary for a single language, parse it tolerantly and
+    /// fall back to showing the prose if the model didn't return clean JSON.
+    private func summarizeOne(_ condensed: String, language: Lang, sessionId: UUID) async throws -> Summary {
+        let user = condensed + "\n\n———\n" + Self.reduceReminder(language)
+        guard let raw = await host.generate(
+            system: Self.reduceSystemPrompt(language), user: user,
+            maxTokens: 1600, temperature: 0.4
+        )?.trimmingCharacters(in: .whitespacesAndNewlines).nonEmpty else {
+            // The model produced nothing (load/OOM) — let the caller use the
+            // extractive fallback for both languages.
+            throw SummarizerError.invalidOutput
         }
-        return MLXThinking.strip(output)
+
+        if let dto = decodeSummary(from: raw), let summary = summary(from: dto, sessionId: sessionId),
+           !summary.overview.isEmpty || !summary.keyPoints.isEmpty {
+            return summary
+        }
+        // Graceful degradation: the model wrote prose (or imperfect JSON). Show it
+        // as the overview instead of failing the whole summary.
+        return Summary(sessionId: sessionId, overview: salvageProse(raw), modelName: modelId)
     }
 
     // MARK: - Transcript shaping
 
     private func transcriptLines(_ segments: [TranscriptSegment]) -> [String] {
         segments.compactMap { seg in
-            let en = seg.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !en.isEmpty else { return nil }
+            let src = seg.sourceText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !src.isEmpty else { return nil }
             let speaker = seg.speakerLabel.map { "\($0): " } ?? ""
-            if let zh = seg.translatedText?.trimmingCharacters(in: .whitespacesAndNewlines), !zh.isEmpty {
-                return "\(speaker)\(en) / \(zh)"
+            if let zh = seg.translatedText?.trimmingCharacters(in: .whitespacesAndNewlines), !zh.isEmpty, zh != src {
+                return "\(speaker)\(src) / \(zh)"
             }
-            return "\(speaker)\(en)"
+            return "\(speaker)\(src)"
         }
     }
 
@@ -144,10 +137,10 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
         return chunks.isEmpty ? [""] : chunks
     }
 
-    // MARK: - JSON parsing
+    // MARK: - JSON parsing (tolerant)
 
-    private struct BilingualDTO: Decodable { var en: SummaryDTO?; var zh: SummaryDTO? }
     private struct SummaryDTO: Decodable {
+        var title: String?
         var overview: String?
         var keyPoints: [String]?
         var decisions: [String]?
@@ -159,25 +152,84 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
     private struct QADTO: Decodable { var question: String; var answer: String }
     private struct GlossaryDTO: Decodable { var term: String; var definition: String }
 
-    private func parseBilingual(_ raw: String, sessionId: UUID) throws -> (english: Summary, chinese: Summary) {
-        guard let start = raw.firstIndex(of: "{"), let end = raw.lastIndex(of: "}") else {
-            throw SummarizerError.invalidOutput
+    /// Decode the best JSON object in the text: scan every top-level `{ … }`
+    /// (ignoring code fences and any prose/braces around them) and return the first
+    /// one that yields a summary with actual content. This is robust to the model
+    /// adding commentary, code fences, or trailing junk after the object.
+    private func decodeSummary(from raw: String) -> SummaryDTO? {
+        for json in Self.jsonObjects(in: raw) {
+            guard let data = json.data(using: .utf8),
+                  let dto = try? JSONDecoder().decode(SummaryDTO.self, from: data) else { continue }
+            let hasContent = !(dto.overview?.isEmpty ?? true)
+                || !(dto.keyPoints?.isEmpty ?? true)
+                || !(dto.title?.isEmpty ?? true)
+            if hasContent { return dto }
         }
-        guard let data = String(raw[start...end]).data(using: .utf8) else { throw SummarizerError.invalidOutput }
-        let dto = try JSONDecoder().decode(BilingualDTO.self, from: data)
-        guard dto.en != nil || dto.zh != nil else { throw SummarizerError.invalidOutput }
-        return (summary(from: dto.en, sessionId: sessionId), summary(from: dto.zh, sessionId: sessionId))
+        return nil
     }
 
-    private func summary(from dto: SummaryDTO?, sessionId: UUID) -> Summary {
-        Summary(
+    /// Every top-level `{ … }` slice in the text, in order. Braces inside string
+    /// literals are skipped so trailing content (`}…<…`) can't corrupt a slice the
+    /// way a naive first-`{`/last-`}` search did (the old `Unexpected '<'` crash).
+    static func jsonObjects(in raw: String) -> [String] {
+        var objects: [String] = []
+        var depth = 0, inString = false, escaped = false
+        var start: String.Index?
+        var i = raw.startIndex
+        while i < raw.endIndex {
+            let c = raw[i]
+            if inString {
+                if escaped { escaped = false }
+                else if c == "\\" { escaped = true }
+                else if c == "\"" { inString = false }
+            } else if c == "\"" {
+                inString = true
+            } else if c == "{" {
+                if depth == 0 { start = i }
+                depth += 1
+            } else if c == "}", depth > 0 {
+                depth -= 1
+                if depth == 0, let s = start { objects.append(String(raw[s...i])); start = nil }
+            }
+            i = raw.index(after: i)
+        }
+        return objects
+    }
+
+    /// Turn non-JSON (or unparseable) model output into a readable overview: drop
+    /// code fences and trim. Never empty.
+    private func salvageProse(_ raw: String) -> String {
+        var s = raw
+        for fence in ["```json", "```JSON", "```"] {
+            s = s.replacingOccurrences(of: fence, with: "")
+        }
+        let cleaned = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned.isEmpty ? raw : cleaned
+    }
+
+    private func summary(from dto: SummaryDTO, sessionId: UUID) -> Summary? {
+        var overview = dto.overview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if let title = dto.title?.trimmingCharacters(in: .whitespacesAndNewlines), !title.isEmpty {
+            overview = overview.isEmpty ? title : "【\(title)】\n\(overview)"
+        }
+        return Summary(
             sessionId: sessionId,
-            overview: dto?.overview?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
-            keyPoints: dto?.keyPoints ?? [],
-            decisions: dto?.decisions ?? [],
-            actionItems: (dto?.actionItems ?? []).map { ActionItem(text: $0.text, owner: $0.owner, due: $0.due) },
-            qa: (dto?.qa ?? []).map { QAPair(question: $0.question, answer: $0.answer) },
-            glossary: (dto?.glossary ?? []).map { GlossaryTerm(term: $0.term, definition: $0.definition) },
+            overview: overview,
+            keyPoints: (dto.keyPoints ?? []).cleaned,
+            decisions: (dto.decisions ?? []).cleaned,
+            actionItems: (dto.actionItems ?? []).compactMap {
+                let t = $0.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : ActionItem(text: t, owner: $0.owner?.nilIfBlank, due: $0.due?.nilIfBlank)
+            },
+            qa: (dto.qa ?? []).compactMap {
+                let q = $0.question.trimmingCharacters(in: .whitespacesAndNewlines)
+                let a = $0.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+                return (q.isEmpty && a.isEmpty) ? nil : QAPair(question: q, answer: a)
+            },
+            glossary: (dto.glossary ?? []).compactMap {
+                let term = $0.term.trimmingCharacters(in: .whitespacesAndNewlines)
+                return term.isEmpty ? nil : GlossaryTerm(term: term, definition: $0.definition.trimmingCharacters(in: .whitespacesAndNewlines))
+            },
             modelName: modelId
         )
     }
@@ -187,39 +239,70 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
     // MARK: - Prompts
 
     private static let mapSystemPrompt = """
-    You are a meeting-notes assistant. Below is part of a meeting transcript \
-    (English / Traditional Chinese). Condense it into concise English bullet notes, \
-    preserving decisions, action items, names and numbers. Output only the notes.
+    You are an expert note-taker. Below is part of a transcript of spoken audio — it \
+    may be a meeting, lecture, video, podcast, interview or casual conversation. Write \
+    concise, factual bullet notes in English that capture the topics, key information, \
+    names, numbers, decisions and any action items. Keep every concrete detail and drop \
+    filler. Output only the notes.
     """
 
-    private static let reduceSystemPrompt = """
-    You are a meeting-notes assistant. From the meeting notes below, produce a \
-    detailed meeting summary in BOTH languages as SEPARATE versions: "en" written \
-    in English, and "zh" written in Traditional Chinese (Taiwan, 正體字). Do not \
-    mix the two languages within a field.
+    private static func reduceSystemPrompt(_ language: Lang) -> String {
+        let languageRule: String
+        switch language {
+        case .english:
+            languageRule = "Write every value in English."
+        case .chinese:
+            languageRule = "Write every value in Traditional Chinese only (繁體中文／台灣正體字). "
+                + "You MUST use Traditional Chinese characters and must NEVER output any Simplified Chinese character."
+        }
+        return """
+        You are an expert at summarizing transcribed audio. The content may be a meeting, \
+        lecture, video, podcast, interview or conversation — adapt to whatever it actually \
+        is rather than assuming a meeting.
 
-    Output ONLY one JSON object, no extra text or markdown code fences, in this shape:
-    {
-      "en": {
-        "overview": "concise English overview",
-        "keyPoints": ["..."],
-        "decisions": ["..."],
-        "actionItems": [{"text": "...", "owner": "name or null", "due": "deadline or null"}],
-        "qa": [{"question": "...", "answer": "..."}],
-        "glossary": [{"term": "...", "definition": "..."}]
-      },
-      "zh": {
-        "overview": "繁體中文概述",
-        "keyPoints": ["..."],
-        "decisions": ["..."],
-        "actionItems": [{"text": "...", "owner": "負責人或null", "due": "期限或null"}],
-        "qa": [{"question": "...", "answer": "..."}],
-        "glossary": [{"term": "...", "definition": "..."}]
-      }
+        Return ONLY a single JSON object — no markdown, no code fences, no commentary before \
+        or after — in exactly this shape:
+        {
+          "title": "a short descriptive title for the content",
+          "overview": "a clear 2-5 sentence summary of what the content is about and its main takeaways",
+          "keyPoints": ["the most important points, topics or facts, one per item"],
+          "decisions": ["concrete decisions or conclusions reached, if any"],
+          "actionItems": [{"text": "a task or next step", "owner": "who or null", "due": "when or null"}],
+          "qa": [{"question": "a notable question raised", "answer": "the answer given"}],
+          "glossary": [{"term": "a key term, name or acronym", "definition": "a brief explanation"}]
+        }
+        Use an empty array [] for any section that does not apply to this content. Base \
+        everything strictly on the transcript and do not invent facts. \(languageRule)
+        """
     }
-    Use empty arrays for empty fields. STRICT language rules: every value under \
-    "en" must be in English only; every value under "zh" must be in Traditional \
-    Chinese only (繁體中文／台灣正體字) — you MUST use Traditional Chinese \
-    characters and NEVER output any Simplified Chinese characters.
-    """
+
+    private static func reduceReminder(_ language: Lang) -> String {
+        switch language {
+        case .english:
+            return "Now output ONLY the JSON object described above, with all values in English."
+        case .chinese:
+            return "現在只輸出上述 JSON 物件，所有文字值必須是繁體中文（台灣正體字），"
+                + "絕對不可出現任何簡體字，也不要加上任何說明或程式碼框。"
+        }
+    }
+}
+
+private extension String {
+    var nonEmpty: String? { isEmpty ? nil : self }
+    var nilIfBlank: String? {
+        let t = trimmingCharacters(in: .whitespacesAndNewlines)
+        return (t.isEmpty || t.lowercased() == "null") ? nil : t
+    }
+}
+
+private extension Array where Element == String {
+    /// Trim, drop blanks and de-duplicate while preserving order.
+    var cleaned: [String] {
+        var seen = Set<String>()
+        return compactMap { s -> String? in
+            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !t.isEmpty, seen.insert(t).inserted else { return nil }
+            return t
+        }
+    }
 }

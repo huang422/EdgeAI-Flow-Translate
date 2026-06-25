@@ -11,6 +11,10 @@ struct CaptionLine: Identifiable, Equatable {
     let id: UUID
     var english: String
     var chinese: String?
+    /// Which audio source produced this line (drives the leading source-colour dot).
+    var source: AudioSourceType = .system
+    /// Wall-clock time the line was finalized (shown as a transcript timestamp).
+    var timestamp: Date = Date()
 }
 
 /// Wires audio capture → Nemotron ASR → translation → bilingual captions /
@@ -33,7 +37,15 @@ final class CaptureViewModel: ObservableObject {
     @Published var statusMessage = "Idle"
 
     // Meeting / summary / overlay
-    @Published var overlayOn = false
+    /// Single source of truth for overlay visibility. Both the UI switch and the
+    /// ⌃⌥C hotkey set this; `didSet` shows/hides the (single, reused) panel — so the
+    /// switch and hotkey can never desync or stack two overlays.
+    @Published var overlayOn = false {
+        didSet {
+            guard oldValue != overlayOn else { return }
+            if overlayOn { overlay.show() } else { overlay.hide() }
+        }
+    }
     @Published var summaryText = ""
     @Published var isSummarizing = false
 
@@ -45,7 +57,14 @@ final class CaptureViewModel: ObservableObject {
 
     enum TranslationMethod { case none, apple, mlx }
     private var translationMethod: TranslationMethod = .apple
-    private var mlxTranslator: MLXTranslator?
+    /// Single shared Qwen model, reused by live translation and the post-meeting
+    /// summary — loaded into memory at most once.
+    private let qwenHost = QwenModelHost()
+    private lazy var mlxTranslator = MLXTranslator(host: qwenHost)
+    /// Rolling source-sentence context for the on-device Qwen translator so the
+    /// second caption stays coherent across lines (pronouns, recurring terms).
+    /// Reset at the start of each session and when the language pair changes.
+    private let mlxContext = ContextBuffer(capacity: 3)
 
     // Echo suppression: when system audio is playing through speakers, the mic
     // mostly hears that same audio → skip mic input to avoid garbled double
@@ -69,7 +88,7 @@ final class CaptureViewModel: ObservableObject {
     /// prefetch is intentionally left running — the summary needs those files even
     /// after translation switches to Apple or the meeting ends.
     private func unloadQwen() {
-        mlxTranslator?.unload()
+        qwenHost.unload()         // frees the container + returns the MLX cache to the OS
         qwenLoadTask?.cancel(); qwenLoadTask = nil
     }
 
@@ -79,16 +98,14 @@ final class CaptureViewModel: ObservableObject {
     /// The translator and summarizer share the same model id, so this one download
     /// serves both. Download-only — no memory is used until something loads it.
     private func prefetchQwen() {
-        let translator = mlxTranslator ?? MLXTranslator()
-        mlxTranslator = translator
-        guard !translator.isLoaded, qwenPrefetchTask == nil else { return }
+        guard !qwenHost.isComplete, qwenPrefetchTask == nil else { return }
         qwenPrefetchTask = Task { @MainActor [weak self] in
             guard let self else { return }
             // Clear the handle when done so a later Start can resume an incomplete
             // download (the downloader skips files already fetched at full size).
             defer { self.qwenPrefetchTask = nil }
             do {
-                try await translator.prefetch { p in
+                try await self.qwenHost.prefetch { p in
                     Task { @MainActor in
                         self.modelStatus = "下載 Qwen 模型（翻譯／摘要用）… \(Int(p * 100))%"
                     }
@@ -104,29 +121,29 @@ final class CaptureViewModel: ObservableObject {
     /// Load the Qwen model into memory on demand (guarded so it loads exactly
     /// once), showing live progress. Files are normally already on disk (fetched
     /// at Start), so this is just a memory load. Returns whether the model is ready.
-    private func ensureQwenReady(_ translator: MLXTranslator, srcName: String, tgtName: String) async -> Bool {
-        if translator.isLoaded { return true }
+    private func ensureQwenReady(srcName: String, tgtName: String) async -> Bool {
+        if qwenHost.isLoaded { return true }
         if qwenLoadTask == nil {
             qwenLoadTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.translationStatus = "第二字幕：\(srcName) → \(tgtName) · Qwen 模型載入中…"
+                self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型載入中…"
                 // Wait for the at-Start disk prefetch (if any) so we don't download twice.
                 await self.qwenPrefetchTask?.value
                 do {
-                    try await translator.ensureLoaded { p in
+                    try await self.qwenHost.ensureLoaded { p in
                         Task { @MainActor in
-                            self.translationStatus = "第二字幕：\(srcName) → \(tgtName) · Qwen 模型載入中… \(Int(p * 100))%"
+                            self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型載入中… \(Int(p * 100))%"
                         }
                     }
-                    self.translationStatus = "第二字幕：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
+                    self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
                 } catch {
                     Self.log.error("Qwen load failed: \(String(reflecting: error), privacy: .public)")
-                    self.translationStatus = "第二字幕：Qwen 載入失敗（\(String(describing: error))），第一字幕正常"
+                    self.translationStatus = "翻譯語言：Qwen 載入失敗（\(String(describing: error))），輸入語言正常"
                 }
             }
         }
         await qwenLoadTask?.value
-        return translator.isLoaded
+        return qwenHost.isLoaded
     }
 
     // User settings (persisted). Applied to the live pipeline on change.
@@ -143,9 +160,9 @@ final class CaptureViewModel: ObservableObject {
     let overlay = OverlayController()
     private let store: TranscriptStoring
     private let cleaner = BasicTextCleaner()
-    // MLX Qwen3-1.7B summarizer (on-demand), with the pure-Swift extractive
+    // MLX Qwen3-4B summarizer (on-demand), with the pure-Swift extractive
     // summarizer as an offline / failure fallback.
-    private let mlxSummarizer = MLXMeetingSummarizer()
+    private lazy var mlxSummarizer = MLXMeetingSummarizer(host: qwenHost)
     private let fallbackSummarizer = ExtractiveSummarizer()
     private var segmentIndex = 0
     private var lastSummaryEN: Summary?
@@ -162,11 +179,16 @@ final class CaptureViewModel: ObservableObject {
     private var interimThrottleTask: Task<Void, Never>?
     private var interimInFlight = false
     private let interimTranslateInterval: TimeInterval = 0.2
-
-    /// System-wide shortcut (⌃⌥C) to toggle the floating overlay from any app.
-    private var overlayHotKey: GlobalHotKey?
+    /// Audio source of the current interim line (drives the overlay source dot).
+    private var currentInterimSource: AudioSourceType = .system
+    /// Read-only accessor for the UI (updates alongside the published `interimText`).
+    var currentInterimSourceForUI: AudioSourceType { currentInterimSource }
 
     init() {
+        // Bound the MLX Metal cache up front so freed Qwen weights / KV caches are
+        // returned to the OS instead of lingering (the main memory-bloat fix).
+        MLXMemory.configureAtLaunch()
+
         // Persist the transcript to Application Support so an unexpected close
         // does not lose accumulated segments (FR-008).
         let dir = FileManager.default
@@ -210,15 +232,48 @@ final class CaptureViewModel: ObservableObject {
             self?.applyTranslation(id: id, chinese: zh)
         }
         translation.onUnavailable = { [weak self] in
-            self?.statusMessage = "第二字幕翻譯語言包未安裝，請在彈出視窗允許下載 (System Settings > Translation Languages)"
+            self?.statusMessage = "翻譯語言包未安裝，請在彈出視窗允許下載 (System Settings > Translation Languages)"
+        }
+        // Persist a dragged overlay position / font step made from the overlay's own
+        // hover controls.
+        overlay.onPositionChanged = { [weak self] origin in
+            self?.settings.overlayPosition = origin
+        }
+        overlay.onFontStep = { [weak self] delta in
+            self?.stepOverlayFont(delta)
+        }
+        overlay.onReset = { [weak self] in
+            self?.resetOverlaySettings()
         }
         applySettings()
+        registerGlobalShortcuts()
+    }
 
-        // Global shortcut ⌃⌥C → toggle the floating caption overlay (works even
-        // while another app like Zoom is focused). kVK_ANSI_C == 8.
-        overlayHotKey = GlobalHotKey(keyCode: 8, modifiers: UInt32(controlKey | optionKey)) { [weak self] in
+    /// Global shortcuts (work even while another app like Zoom is focused).
+    /// ⌃⌥C overlay · ⌃⌥= / ⌃⌥- font size · ⌃⌥P pin (spec §2.8).
+    private func registerGlobalShortcuts() {
+        let mod = controlKey | optionKey
+        let center = GlobalHotKeyCenter.shared
+        center.register(keyCode: kVK_ANSI_C, modifiers: mod) { [weak self] in
             Task { @MainActor in self?.toggleOverlay() }
         }
+        center.register(keyCode: kVK_ANSI_Equal, modifiers: mod) { [weak self] in
+            Task { @MainActor in self?.stepOverlayFont(1) }
+        }
+        center.register(keyCode: kVK_ANSI_Minus, modifiers: mod) { [weak self] in
+            Task { @MainActor in self?.stepOverlayFont(-1) }
+        }
+        center.register(keyCode: kVK_ANSI_P, modifiers: mod) { [weak self] in
+            Task { @MainActor in self?.overlay.togglePin() }
+        }
+    }
+
+    /// Step the overlay font size by ±2pt (clamped), persisting via settings.
+    func stepOverlayFont(_ delta: Int) {
+        let next = (settings.overlayFontSize + Double(delta) * 2)
+        let clamped = min(max(next, CaptionTheme.Metric.fontMin), CaptionTheme.Metric.fontMax)
+        guard clamped != settings.overlayFontSize else { return }
+        settings.overlayFontSize = clamped
     }
 
     // MARK: - Settings
@@ -229,10 +284,7 @@ final class CaptureViewModel: ObservableObject {
         translation.sourceLanguage = settings.firstLanguage == "auto"
             ? "" : String(settings.firstLanguage.prefix(2))
         translation.targetLanguage = settings.secondLanguage.rawValue
-        overlay.model.showSecondLine = settings.secondCaptionEnabled
-        overlay.model.fontSize = settings.fontSize
-        overlay.updateLayout()   // resize the box stack for one/two captions
-        overlay.setClickThrough(settings.clickThrough)
+        overlay.applySettings(settings)
         SettingsStore.save(settings)
         availabilityTask?.cancel()
         availabilityTask = Task { await updateTranslationAvailability() }
@@ -248,12 +300,12 @@ final class CaptureViewModel: ObservableObject {
         // Off vs. same-language: distinct, clear messages (was a confusing "關閉").
         guard settings.secondCaptionEnabled else {
             translationMethod = .none; translation.enabled = false; unloadQwen()
-            translationStatus = "第二字幕：已關閉"
+            translationStatus = "翻譯語言：已關閉"
             return
         }
         guard settings.needsTranslation else {
             translationMethod = .none; translation.enabled = false; unloadQwen()
-            translationStatus = "第二字幕：來源與目標同為「\(tgtName)」，無需翻譯（請改選不同的目標語言）"
+            translationStatus = "翻譯語言：來源與目標同為「\(tgtName)」，無需翻譯（請改選不同的目標語言）"
             return
         }
 
@@ -277,7 +329,7 @@ final class CaptureViewModel: ObservableObject {
             translationMethod = .apple
             translation.enabled = true
             unloadQwen()
-            translationStatus = "第二字幕：\(srcName) → \(tgtName) · Apple 系統翻譯（即時）"
+            translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Apple 系統翻譯（即時）"
             return
         }
 
@@ -285,12 +337,10 @@ final class CaptureViewModel: ObservableObject {
         // when the first sentence actually needs translating (files are fetched to
         // disk at meeting Start). Never loaded at app launch / while idle.
         translation.enabled = false
-        let translator = mlxTranslator ?? MLXTranslator()
-        mlxTranslator = translator
         translationMethod = .mlx
-        translationStatus = translator.isLoaded
-            ? "第二字幕：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
-            : "第二字幕：\(srcName) → \(tgtName) · Qwen 模型翻譯（首次翻譯時載入）"
+        translationStatus = qwenHost.isLoaded
+            ? "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
+            : "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（首次翻譯時載入）"
     }
 
     /// Route one finalized sentence to the active translation backend.
@@ -299,15 +349,18 @@ final class CaptureViewModel: ObservableObject {
         case .apple:
             translation.translate(id: id, text: text)
         case .mlx:
-            guard let translator = mlxTranslator else { return }
             let target = settings.secondLanguage.modelTargetName   // exactly the selected language
             let srcName = settings.firstLanguage == "auto" ? "自動偵測" : settings.firstLanguage
             let tgtName = settings.secondLanguage.displayName
+            // Snapshot the preceding sentences as context, then record this one for
+            // the next translation (keeps the second caption coherent across lines).
+            let context = mlxContext.recent
+            mlxContext.append(text)
             Task { [weak self] in
                 guard let self else { return }
                 // Load the model into memory on first use (already on disk from Start).
-                guard await self.ensureQwenReady(translator, srcName: srcName, tgtName: tgtName) else { return }
-                guard let translated = await translator.translate(text, target: target) else { return }
+                guard await self.ensureQwenReady(srcName: srcName, tgtName: tgtName) else { return }
+                guard let translated = await self.mlxTranslator.translate(text, target: target, context: context) else { return }
                 self.applyTranslation(id: id, chinese: translated)
             }
         case .none:
@@ -319,9 +372,10 @@ final class CaptureViewModel: ObservableObject {
 
     private func handle(_ event: TranscriptEvent) {
         switch event {
-        case .interim(let text, _, _):
+        case .interim(let text, let source, _):
             // Live partial of the sentence being spoken right now.
             interimText = text
+            currentInterimSource = source
             // A new sentence started after a finalize → drop the stale interim
             // translation.
             if currentOverlayId != nil { interimChinese = "" }
@@ -348,7 +402,8 @@ final class CaptureViewModel: ObservableObject {
             for sentence in sentences {
                 let id = UUID()
                 lastId = id
-                lines.append(CaptionLine(id: id, english: sentence, chinese: nil))
+                lines.append(CaptionLine(id: id, english: sentence, chinese: nil,
+                                         source: segment.source, timestamp: Date()))
                 let seg = TranscriptSegment(
                     id: id,
                     sessionId: currentSessionId,
@@ -370,11 +425,16 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    /// Mirror the latest lines + interim into the floating overlay box.
+    /// Mirror the latest lines + interim into the floating overlay. The overlay's
+    /// interim line is English-only by design (translation appears only once final).
+    /// Only runs while listening, so a late translation arriving after the meeting
+    /// ended can't repopulate the overlay with the previous session's captions.
     private func syncOverlay() {
+        guard asrState == .listening else { return }
         overlay.model.lines = Array(lines.suffix(10))
-        overlay.model.interimEnglish = interimText
-        overlay.model.interimChinese = interimChinese
+        overlay.model.interim = interimText
+        overlay.model.interimChinese = interimChinese   // live second caption in the overlay
+        overlay.model.interimSource = currentInterimSource
     }
 
     private func applyTranslation(id: UUID, chinese: String) {
@@ -463,6 +523,7 @@ final class CaptureViewModel: ObservableObject {
         interimInFlight = false
         lastInterimTranslateAt = .distantPast
         interimChinese = ""
+        mlxContext.reset()
     }
 
     // MARK: - Recognition / meeting lifecycle
@@ -501,17 +562,34 @@ final class CaptureViewModel: ObservableObject {
 
     func endMeeting() async {
         asr.stopStream()
-        asr.releaseModels()       // free ASR memory before loading the summary LLM (MLX)
-        unloadQwen()              // free the live translator's model too
+        asr.releaseModels()       // free ASR memory
+        qwenLoadTask?.cancel(); qwenLoadTask = nil   // stop any pending translation load
+        unloadQwen()              // free the translation model now — summary is on-demand
         store.endSession()
         asrState = .idle
         interimText = ""
         interimChinese = ""
         resetLiveCaptionState()
         overlay.model.clear()
-        statusMessage = "Meeting ended, generating summary…"
+        // Keep `lines` (the transcript) so it can be summarized / exported on demand.
+        statusMessage = "已結束 Done · 可按「摘要 Summary」產生摘要"
+    }
+
+    /// Whether a finished-meeting transcript is available to summarize on demand
+    /// (drives the Summary button: only after a meeting has ended, with content).
+    var canSummarize: Bool {
+        asrState == .idle && !isSummarizing && currentSession != nil && !lines.isEmpty
+    }
+
+    /// Manually generate the bilingual summary for the just-ended meeting. Loads the
+    /// Qwen model on demand and frees it afterwards, so the heavy summary never runs
+    /// (and never slows a new real-time session) unless the user asks for it.
+    func generateSummary() async {
+        guard canSummarize else { return }
+        statusMessage = "產生摘要中… Generating summary…"
         await summarize()
-        statusMessage = "Meeting ended"
+        unloadQwen()              // free the shared Qwen model + MLX cache after the summary
+        statusMessage = "摘要完成 Summary ready"
     }
 
     private func summarize() async {
@@ -524,7 +602,7 @@ final class CaptureViewModel: ObservableObject {
             // Make sure the at-Start disk prefetch finished so the summarizer loads
             // from cache instead of starting its own concurrent download.
             await qwenPrefetchTask?.value
-            statusMessage = "Generating summary with MLX (Qwen3-1.7B, thinking)…"
+            statusMessage = "產生摘要中 Generating summary (Qwen3-4B)…"
             pair = try await mlxSummarizer.summarizeBilingual(session: session, segments: store.segments) { p in
                 Task { @MainActor in self.statusMessage = "Summarizing… \(Int(p * 100))%" }
             }
@@ -532,8 +610,8 @@ final class CaptureViewModel: ObservableObject {
             // MLX unavailable (offline / first-run download failed / low memory):
             // fall back to the on-device extractive summary so the user still gets one.
             Self.log.error("Qwen summary failed: \(String(reflecting: error), privacy: .public)")
-            modelStatus = "Qwen 摘要載入失敗：\(String(describing: error))"
-            statusMessage = "MLX summary unavailable, using extractive fallback…"
+            modelStatus = "Qwen 摘要無法產生，改用內建摘要（Qwen summary unavailable, using built-in fallback）"
+            statusMessage = "改用內建摘要 Using built-in summary…"
             pair = try? await fallbackSummarizer.summarizeBilingual(session: session, segments: store.segments, progress: nil)
         }
 
@@ -549,25 +627,72 @@ final class CaptureViewModel: ObservableObject {
     private static func renderSummary(_ s: Summary) -> String {
         var text = s.overview
         if !s.keyPoints.isEmpty {
-            text += "\n\n• " + s.keyPoints.joined(separator: "\n• ")
+            text += "\n\n重點 Key Points:\n• " + s.keyPoints.joined(separator: "\n• ")
         }
         if !s.decisions.isEmpty {
-            text += "\n\nDecisions / 決議:\n• " + s.decisions.joined(separator: "\n• ")
+            text += "\n\n決議／結論 Decisions:\n• " + s.decisions.joined(separator: "\n• ")
         }
         if !s.actionItems.isEmpty {
-            text += "\n\nAction Items / 待辦:\n• " + s.actionItems.map(\.text).joined(separator: "\n• ")
+            text += "\n\n待辦／後續 Action Items:\n• " + s.actionItems.map { item -> String in
+                var line = item.text
+                if let o = item.owner { line += "（\(o)）" }
+                if let d = item.due { line += "［\(d)］" }
+                return line
+            }.joined(separator: "\n• ")
         }
         if !s.qa.isEmpty {
             text += "\n\nQ&A:\n" + s.qa.map { "• Q: \($0.question)\n  A: \($0.answer)" }.joined(separator: "\n")
+        }
+        if !s.glossary.isEmpty {
+            text += "\n\n名詞 Glossary:\n• " + s.glossary.map { "\($0.term): \($0.definition)" }.joined(separator: "\n• ")
         }
         return text
     }
 
     // MARK: - Overlay
 
-    func toggleOverlay() {
-        overlayOn.toggle()
-        if overlayOn { overlay.show() } else { overlay.hide() }
+    func toggleOverlay() { overlayOn.toggle() }   // didSet on overlayOn shows/hides
+
+    // MARK: - Window lifecycle
+
+    private weak var boundWindow: NSWindow?
+    private var windowCloseObserver: NSObjectProtocol?
+
+    /// Observe the main control window's close so that closing it stops capturing and
+    /// hides the overlay (the app stays running for a quick reopen). Filtered to the
+    /// exact window, so closing the Settings sheet doesn't trigger it.
+    func bindMainWindow(_ window: NSWindow?) {
+        guard let window, boundWindow !== window else { return }
+        boundWindow = window
+        if let old = windowCloseObserver { NotificationCenter.default.removeObserver(old) }
+        windowCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: window, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.handleWindowClosed() }
+        }
+    }
+
+    /// Closing the control window stops the meeting and hides the floating overlay, so
+    /// the app never keeps capturing audio (or floating captions) with no visible UI.
+    private func handleWindowClosed() {
+        overlayOn = false                              // didSet → overlay.hide()
+        if asrState == .listening { Task { await endMeeting() } }
+    }
+
+    /// Reset all overlay-related preferences to defaults (font, opacity, line count,
+    /// primary line, interim style, click-through, position) — the overlay's ↺.
+    /// One assignment → one `applySettings`, and a nil position re-centres it.
+    func resetOverlaySettings() {
+        var s = settings
+        let d = CaptionSettings.default
+        s.overlayFontSize = d.overlayFontSize
+        s.overlayOpacity = d.overlayOpacity
+        s.historyLineCount = d.historyLineCount
+        s.primaryLineOnTop = d.primaryLineOnTop
+        s.interimStyle = d.interimStyle
+        s.clickThrough = d.clickThrough
+        s.overlayPosition = nil
+        settings = s
     }
 
     // MARK: - Export

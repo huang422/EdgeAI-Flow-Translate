@@ -43,8 +43,14 @@ public final class SystemAudioTap: NSObject, AudioCapturing, SCStreamOutput, @un
         config.minimumFrameInterval = CMTime(value: 1, timescale: 1)
 
         let stream = SCStream(filter: filter, configuration: config, delegate: nil)
-        try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
-        try await stream.startCapture()
+        do {
+            try stream.addStreamOutput(self, type: .audio, sampleHandlerQueue: sampleQueue)
+            try await stream.startCapture()
+        } catch {
+            // Tear down a partially-started stream so a retry starts clean.
+            try? await stream.stopCapture()
+            throw error
+        }
 
         self.stream = stream
         isCapturing = true

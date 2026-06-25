@@ -42,14 +42,35 @@ final class MLXModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked
             .appending(component: repoId.replacingOccurrences(of: "/", with: "_"))
     }
 
-    /// Core files present (config + tokenizer + at least one weights shard).
+    /// Core files present (config + tokenizer + at least one weights shard) AND a
+    /// usable chat template. The chat template is REQUIRED for instruct models:
+    /// without it MLX/swift-transformers silently falls back to raw text completion
+    /// (no `<|im_start|>`/`<|im_end|>` turn markers, no assistant cue), so the model
+    /// never stops — it rambles, repeats, ignores the target language and corrupts
+    /// JSON output. Requiring it here means a model fetched before this fix (missing
+    /// `chat_template.jinja`) reports incomplete and self-repairs by downloading just
+    /// that one small file on the next Start.
     var isComplete: Bool {
         let fm = FileManager.default
         guard fm.fileExists(atPath: file("config.json").path),
               fm.fileExists(atPath: file("tokenizer.json").path),
+              hasChatTemplate,
               let items = try? fm.contentsOfDirectory(atPath: directory.path)
         else { return false }
         return items.contains { $0.hasSuffix(".safetensors") }
+    }
+
+    /// Whether a chat template is on disk — either a standalone `chat_template.jinja`
+    /// (the newer Qwen3 / HF layout) or a `chat_template` key embedded in
+    /// `tokenizer_config.json` (older layout). swift-transformers reads the `.jinja`
+    /// file from the model folder when loading a directory-based config.
+    private var hasChatTemplate: Bool {
+        let fm = FileManager.default
+        if fm.fileExists(atPath: file("chat_template.jinja").path) { return true }
+        guard let data = try? Data(contentsOf: file("tokenizer_config.json")),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return false }
+        return obj["chat_template"] != nil
     }
 
     private func file(_ n: String) -> URL { directory.appending(component: n) }
@@ -90,7 +111,11 @@ final class MLXModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked
 
     private static func isNeeded(_ name: String) -> Bool {
         if name.contains("/") { return false }   // top-level files only
+        // `.jinja` is essential: Qwen3-2507 ships its chat template as a separate
+        // `chat_template.jinja` file (not embedded in tokenizer_config.json). Missing
+        // it is what breaks generation, so it must be fetched like the other configs.
         return name.hasSuffix(".json") || name.hasSuffix(".safetensors")
+            || name.hasSuffix(".jinja")
             || name == "merges.txt" || name.hasSuffix(".model") || name == "vocab.txt"
     }
 

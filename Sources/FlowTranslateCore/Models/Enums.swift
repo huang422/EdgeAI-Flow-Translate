@@ -6,14 +6,6 @@ public enum AudioSourceType: String, Codable, Sendable, CaseIterable {
     case microphone
 }
 
-/// Caption position on screen.
-public enum CaptionPosition: Codable, Sendable, Equatable {
-    case top
-    case center
-    case bottom
-    case custom(x: Double, y: Double)
-}
-
 /// Transcript export format.
 public enum ExportFormat: String, Codable, Sendable, CaseIterable {
     case markdown

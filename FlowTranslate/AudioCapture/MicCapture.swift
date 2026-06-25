@@ -34,7 +34,14 @@ public final class MicCapture: AudioCapturing, @unchecked Sendable {
         }
 
         engine.prepare()
-        try engine.start()
+        do {
+            try engine.start()
+        } catch {
+            // Don't leave the tap installed on a failed start — a later retry would
+            // try to install a second tap on the same bus.
+            input.removeTap(onBus: 0)
+            throw error
+        }
         isCapturing = true
     }
 

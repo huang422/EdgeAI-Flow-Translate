@@ -65,7 +65,7 @@ public struct TranscriptExporter: TranscriptExporting {
         out += "- Languages: \(session.firstLanguage) → \(session.secondLanguage)\n\n"
         out += "## Transcript\n\n"
         for seg in segments {
-            out += "**\(timestamp(seg.startTime)) \(speakerPrefix(seg))(\(seg.source.rawValue))**\n\n"
+            out += "**\(clockTime(seg.createdAt)) \(speakerPrefix(seg))(\(seg.source.rawValue))**\n\n"
             out += "- \(seg.sourceText)\n"
             if let t = seg.translatedText { out += "- \(t)\n" }
             out += "\n"
@@ -109,7 +109,7 @@ public struct TranscriptExporter: TranscriptExporting {
     private func renderPlainText(session: Session, segments: [TranscriptSegment], chinese: Summary?, english: Summary?) -> String {
         var out = "\(session.title ?? "Meeting Transcript")\n\n"
         for seg in segments {
-            out += "\(timestamp(seg.startTime)) \(speakerPrefix(seg))(\(seg.source.rawValue))\n"
+            out += "\(clockTime(seg.createdAt)) \(speakerPrefix(seg))(\(seg.source.rawValue))\n"
             out += "  \(seg.source == .microphone ? "MIC" : "SYS") | \(seg.sourceText)\n"
             if let t = seg.translatedText { out += "  ZH: \(t)\n" }
             out += "\n"
@@ -163,9 +163,11 @@ public struct TranscriptExporter: TranscriptExporting {
         ISO8601DateFormatter().string(from: date)
     }
 
-    private func timestamp(_ t: TimeInterval) -> String {
-        let total = Int(t)
-        return String(format: "%02d:%02d:%02d", total / 3600, (total % 3600) / 60, total % 60)
+    /// Wall-clock time of day (local system timezone) for the readable transcript.
+    private func clockTime(_ date: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f.string(from: date)
     }
 
     /// SRT uses a comma before milliseconds: HH:MM:SS,mmm

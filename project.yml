@@ -16,6 +16,11 @@ packages:
   MLXSwiftExamples:
     url: https://github.com/ml-explore/mlx-swift-examples.git
     minorVersion: 2.29.1
+  # MLX core (Metal GPU memory control: cacheLimit / clearCache). Pinned to the
+  # exact version mlx-swift-examples 2.29.1 already resolves, so no extra download.
+  mlx-swift:
+    url: https://github.com/ml-explore/mlx-swift.git
+    exactVersion: 0.29.1
 
 targets:
   FlowTranslate:
@@ -33,6 +38,8 @@ targets:
         product: MLXLLM
       - package: MLXSwiftExamples
         product: MLXLMCommon
+      - package: mlx-swift
+        product: MLX
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.flowtranslate.app

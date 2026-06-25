@@ -3,10 +3,13 @@
 ![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-blue?logo=apple)
 ![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift)
 ![On-device](https://img.shields.io/badge/ASR-Nemotron%203.5%20·%20ANE-5E5CE6)
+[![Download](https://img.shields.io/badge/⬇%20Download-FlowTranslate.dmg-0A84FF?logo=apple&logoColor=white)](../../releases/latest/download/FlowTranslate.dmg)
 [![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Donate-orange.svg?logo=buymeacoffee&logoColor=white)](https://www.buymeacoffee.com/huang422)
 
 
 **Local, real-time bilingual captions, transcripts & meeting summaries for macOS (Apple Silicon).**
+
+> **⬇️ [Download the latest FlowTranslate.dmg](../../releases/latest/download/FlowTranslate.dmg)** — macOS on Apple Silicon. Open the DMG and drag **Flow Translate** to **Applications**.
 
 Flow Translate turns the audio of online meetings (Zoom / Teams / Google Meet) and
 English videos into a floating, two-line caption overlay — the first line is the
@@ -15,11 +18,11 @@ bilingual transcript and an end-of-meeting summary. **Everything runs on-device*
 the only network access is a one-time model download.
 
 - **Speech recognition** with NVIDIA **Nemotron‑3.5 Streaming ASR — Multilingual (0.6B)** on the Apple Neural Engine (via [FluidAudio](https://github.com/FluidInference/FluidAudio)). Pick a language or use **Auto** for per-sentence detection / mixed-language audio.
-- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A specific source language Apple supports uses Apple's on-device **Translation** framework; **auto-detect** and Apple-unsupported pairs use the on-device **MLX Qwen3-1.7B** model (`/no_think` mode for speed).
-- **Two-box floating, click-through caption overlay** — top box = first caption, bottom box = translation (hidden when the second caption is off) — auto-scrolling and staying on top of full-screen meetings/videos without blocking clicks.
+- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A specific source language Apple supports uses Apple's on-device **Translation** framework; **auto-detect** and Apple-unsupported pairs use the on-device **MLX Qwen3-4B-Instruct-2507** model (non-thinking, for speed).
+- **Floating, click-through caption overlay** — a stacked list of caption units (English original on top, translation below, with a source-colour dot), the in-progress line shown live with a blinking caret; newest line brightest, older ones dimmed. Hover reveals a control bar (drag, pin/pause, copy, font size, reset). It stays on top of full-screen meetings/videos and only the control bar is interactive, so clicks pass straight through to the app behind.
 - **System audio _and_ microphone**, captured separately and tagged per source. While system audio is playing, mic echo is suppressed so the same speech isn't transcribed twice.
 - **Full bilingual transcript**, persisted to disk (crash-safe) and exportable to Markdown / TXT / SRT / VTT / JSON.
-- **Post-meeting summary** via an on-demand **MLX Qwen3-1.7B (4-bit)** LLM on the GPU, run in **thinking mode** for quality — overview, key points, decisions, action items, Q&A, glossary, produced in **separate English and Traditional Chinese versions** (with a pure-Swift extractive fallback when offline / on load failure).
+- **Post-meeting summary** via an on-demand **MLX Qwen3-4B-Instruct-2507 (4-bit)** LLM on the GPU — overview, key points, decisions, action items, Q&A, glossary, produced in **separate English and Traditional Chinese versions** (with a pure-Swift extractive fallback when offline / on load failure).
 - **Global shortcut ⌃⌥C** toggles the overlay from any app (e.g. while Zoom is focused).
 - **Private by design** — audio and text never leave your Mac.
 
@@ -61,7 +64,7 @@ the only network access is a one-time model download.
 3. Launch it. On first run, grant the prompts:
    - **Microphone** — to caption your own voice.
    - **Screen Recording** — required by macOS to capture *system* audio (the other side of a call, or a video). Toggle it on in **System Settings → Privacy & Security → Screen Recording**, then relaunch.
-4. The first time you start a meeting the app downloads its models to disk — the ASR model (~600 MB) and, in parallel, the Qwen model (~1 GB, used by auto/unsupported-language translation and the summary). **Let them finish** (progress is shown); they're cached under `~/Library/Application Support/FlowTranslate/` and later runs work fully offline. Interrupted downloads resume on the next Start — already-downloaded files are skipped (verified by size).
+4. The first time you start a meeting the app downloads its models to disk — the ASR model (~600 MB) and, in parallel, the Qwen model (~2.5 GB, used by auto/unsupported-language translation and the summary). **Let them finish** (progress is shown); they're cached under `~/Library/Application Support/FlowTranslate/` and later runs work fully offline. Interrupted downloads resume on the next Start — already-downloaded files are skipped (verified by size).
 5. Choose an audio source (**System** for meetings/videos, **Mic** for your voice, or both), press **Start**, and toggle **Overlay** to float the captions on screen.
 
 No terminal required.
@@ -178,7 +181,7 @@ The diagram below reflects the **current implementation**:
 ├──────────────────────────────────────────────────────────────────────────┤
 │    OverlayCaptionWindow (NSPanel, click-through, always-on-top)          │
 │    FileTranscriptStore (crash-safe JSON)  -->  TranscriptExporter        │
-│    Summary: MLX Qwen3-1.7B-4bit (on-demand on GPU, thinking, then freed) │
+│    Summary: MLX Qwen3-4B-Instruct-2507 (on-demand GPU, then freed)       │
 │        fallback --> ExtractiveSummarizer (pure Swift, offline)           │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -213,7 +216,7 @@ flowchart TB
     subgraph UX["4 · Presentation & Records"]
         OVERLAY["OverlayCaptionWindow<br/>(NSPanel, click-through)"]
         STORE["FileTranscriptStore<br/>(crash-safe JSON)"]
-        SUM["MLX Qwen3-1.7B summarizer<br/>(thinking · extractive fallback)"]
+        SUM["MLX Qwen3-4B-Instruct summarizer<br/>(extractive fallback)"]
         EXPORT["TranscriptExporter<br/>MD/TXT/SRT/VTT/JSON"]
     end
 
@@ -267,9 +270,9 @@ translation.
 |-------|------|----------------|
 | `AudioCapture/` | App | Capture mic + system audio, resample, route with source tags |
 | `ASR/` | App | FluidAudio Nemotron streaming wrapper + energy VAD |
-| `Translation/` | App | Queue finalized text → Apple on-device translation, or MLX Qwen for auto / unsupported pairs |
+| `Translation/` | App | Queue finalized text → Apple translation or the shared MLX Qwen (`QwenModelHost`) for auto / unsupported pairs |
 | `UI/` | App | Control panel, settings, click-through `NSPanel` overlay |
-| `Support/` | App | Permissions, settings persistence |
+| `Support/` | App | Permissions, settings persistence, global hotkeys, MLX memory governance |
 | `FlowTranslateCore` | Package | Models, protocols, transcript store, exporter, summarizer, text utils — pure & unit-tested |
 
 ### Model runtimes — why ASR uses the ANE and only the summarizer uses MLX
@@ -281,8 +284,8 @@ per task rather than putting everything on MLX:
 |------|-------|-----------------------|-----------|
 | Real-time ASR | Nemotron‑3.5 Streaming 0.6B | **CoreML on the ANE** (FluidAudio) | Always-on streaming wants low **power** + low **memory** and must **leave the GPU free** for the meeting app and (later) the summarizer. The ANE delivers that. |
 | Translation (supported pair) | Apple Translation | System framework (on-device) | Zero model management, no extra memory. |
-| Translation (auto / unsupported) | **Qwen3-1.7B (4-bit)** | **MLX on the GPU**, `/no_think` | Apple needs a known source; auto-detect and unsupported pairs use the small Qwen model so the second caption still works in real time. |
-| Meeting summary | **Qwen3-1.7B (4-bit)** | **MLX on the GPU**, thinking mode, loaded on demand, freed after | A one-shot, non-real-time batch job — exactly where MLX/GPU throughput (and reasoning) pays off. |
+| Translation (auto / unsupported) | **Qwen3-4B-Instruct-2507 (4-bit)** | **MLX on the GPU**, non-thinking | Apple needs a known source; auto-detect and unsupported pairs use the on-device Qwen model so the second caption still works in real time. |
+| Meeting summary | **Qwen3-4B-Instruct-2507 (4-bit)** | **MLX on the GPU**, non-thinking, loaded on demand, freed after | A one-shot, non-real-time batch job — exactly where MLX/GPU throughput pays off. |
 
 > **Is the `mlx-community` Nemotron faster?** That model is the *same* NVIDIA
 > weights in MLX format. Published MLX numbers (≈112× realtime) are **batch**
@@ -292,12 +295,19 @@ per task rather than putting everything on MLX:
 > ANE path is the better-optimized choice — so the ASR stays on CoreML/ANE while
 > MLX is reserved for the summarizer, where it actually helps.
 
-The MLX summarizer (`FlowTranslate/Summarization/MLXMeetingSummarizer.swift`) loads
-`mlx-community/Qwen3-1.7B-4bit` only when you end a meeting, runs a **map-reduce**
-over the transcript (final step in **thinking mode**), parses the model's
-structured JSON into a `Summary`, then releases the model. If it can't run (offline
+The MLX summarizer (`FlowTranslate/Summarization/MLXMeetingSummarizer.swift`) runs the
+shared `mlx-community/Qwen3-4B-Instruct-2507-4bit` only when you end a meeting, does a **map-reduce**
+over the transcript (non-thinking), parses the model's
+structured JSON into a `Summary`, then the model is released. If it can't run (offline
 / first-run download failed / low memory) it transparently falls back to the
 pure-Swift extractive summarizer.
+
+**One shared Qwen, bounded GPU cache.** Live translation and the summary both run
+through a single `QwenModelHost`, so the 4-bit model is loaded into memory **at most
+once** (never duplicated across consumers). MLX's Metal buffer cache is bounded at
+launch and cleared at lifecycle boundaries (`FlowTranslate/Support/MLXMemory.swift`),
+so freed weights / KV-caches are returned to the OS instead of leaving the app sitting
+at many GB after a meeting or a translation-backend switch.
 
 ---
 
@@ -308,7 +318,7 @@ Open the **gear icon** in the top-right. Preferences are persisted automatically
 - **First caption (recognition) language** — any of Nemotron's 32 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`.
 - **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (more accurate).
 - **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**. A status line shows the active source → target and whether it's using Apple or the Qwen model (with live load progress).
-- **Presentation** — font size (12–22), click-through overlay. The overlay is **two fixed boxes** (top = first caption, bottom = translation; the bottom box hides when the second caption is off), auto-scrolling so the newest line stays visible, and can be toggled anywhere with **⌃⌥C**.
+- **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through. The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
 
 Defaults match the primary use case: **English → Traditional Chinese**, most real-time.
 
@@ -322,7 +332,7 @@ Defaults match the primary use case: **English → Traditional Chinese**, most r
 | Translation after finalize | < 1 s |
 | ASR runtime | ANE-accelerated, RTFx ≫ 1× on M1 Pro |
 | Overlay | 60 fps, no stutter |
-| Memory | Real-time loop stays light; summarization LLM loaded on demand then released |
+| Memory | Real-time loop stays light; one shared Qwen (loaded on demand, freed after) + bounded MLX cache so memory returns near idle after a meeting |
 
 ---
 
@@ -342,7 +352,7 @@ Flow-Translate/
 │   └── Summarization/            # ExtractiveSummarizer (pure-Swift fallback)
 ├── FlowTranslate/                # macOS app (SwiftUI + AppKit)
 │   ├── AudioCapture/  ASR/  Translation/  UI/  Support/
-│   ├── Summarization/            # MLXMeetingSummarizer (MLX Qwen3-1.7B)
+│   ├── Summarization/            # MLXMeetingSummarizer (MLX Qwen3-4B-Instruct)
 │   ├── Info.plist  FlowTranslate.entitlements
 ├── Scripts/                      # bootstrap.sh, run-tests.sh
 ├── Packaging/                    # build_dmg.sh, notarize.sh

@@ -24,6 +24,7 @@ Packaging/build/
 # ---- Internal / not needed by open-source consumers ----
 # Chinese design docs, spec-kit internals, tests and local agent instructions.
 specs/
+Flow-Translate-Redesign/
 Tests/
 .specify/
 .vscode/

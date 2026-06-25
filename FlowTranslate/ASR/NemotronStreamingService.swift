@@ -275,6 +275,8 @@ private final class SourceASR: @unchecked Sendable {
     private var utteranceStart: TimeInterval = 0
     private var lastVoiceTime: TimeInterval = 0
     private var hasSpeech = false
+    /// Most recent partial text, used to finalize early at a sentence boundary.
+    private var lastPartial = ""
 
     init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager) {
         self.source = source
@@ -288,6 +290,7 @@ private final class SourceASR: @unchecked Sendable {
             guard let self else { return }
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
+            self.lastPartial = trimmed
             self.onEvent?(.interim(text: trimmed, source: self.source, at: self.lastTimestamp))
         }
         launchConsumer()
@@ -329,6 +332,14 @@ private final class SourceASR: @unchecked Sendable {
         utteranceStart = 0
         lastVoiceTime = 0
         hasSpeech = false
+        lastPartial = ""
+    }
+
+    /// Whether the live partial already ends a sentence (terminal punctuation), so the
+    /// utterance can be finalized early instead of waiting for a silence gap.
+    private static func endsSentence(_ s: String) -> Bool {
+        guard let last = s.last else { return false }
+        return ".?!。！？…".contains(last)
     }
 
     private func launchConsumer() {
@@ -351,9 +362,14 @@ private final class SourceASR: @unchecked Sendable {
 
             _ = try? await manager.process(samples: chunk.samples)
 
-            if hasSpeech,
-               (chunk.timestamp - lastVoiceTime) >= finalizeSilence,
-               (lastVoiceTime - utteranceStart) >= minUtterance {
+            // Finalize on a natural pause, OR as soon as the live partial reaches a
+            // sentence boundary (terminal punctuation) — the latter lets translation
+            // start without waiting out the full silence gap (lower latency).
+            let pausedDone = (chunk.timestamp - lastVoiceTime) >= finalizeSilence
+                && (lastVoiceTime - utteranceStart) >= minUtterance
+            let sentenceDone = Self.endsSentence(lastPartial)
+                && (chunk.timestamp - utteranceStart) >= minUtterance
+            if hasSpeech, pausedDone || sentenceDone {
                 await finalizeUtterance(at: chunk.timestamp)
             }
         }
