@@ -30,7 +30,9 @@ final class CaptureViewModel: ObservableObject {
     @Published var systemLevel: Float = 0
 
     // Recognition / captions
-    @Published var asrState: ASRState = .idle
+    @Published var asrState: ASRState = .idle {
+        didSet { overlay.model.listenState = asrState.overlayListenState }
+    }
     @Published var interimText = ""
     @Published var interimChinese = ""
     @Published var lines: [CaptionLine] = []
@@ -66,6 +68,14 @@ final class CaptureViewModel: ObservableObject {
     /// Reset at the start of each session and when the language pair changes.
     private let mlxContext = ContextBuffer(capacity: 3)
 
+    // In-flight on-device (Qwen/MLX) translations, keyed by sentence id. Tracked so
+    // `endMeeting()` can wait for any running GPU generation to finish BEFORE the
+    // shared Qwen model is unloaded — otherwise `MLXMemory.reclaim()` would call
+    // `GPU.clearCache()` mid-generation (a documented crash hazard). `accepting-
+    // Translations` gates new ones so none can start once the meeting is stopping.
+    private var inflightTranslations: [UUID: Task<Void, Never>] = [:]
+    private var acceptingTranslations = true
+
     // Echo suppression: when system audio is playing through speakers, the mic
     // mostly hears that same audio → skip mic input to avoid garbled double
     // captions. (Accessed from the audio threads, so lock-protected.)
@@ -90,6 +100,15 @@ final class CaptureViewModel: ObservableObject {
     private func unloadQwen() {
         qwenHost.unload()         // frees the container + returns the MLX cache to the OS
         qwenLoadTask?.cancel(); qwenLoadTask = nil
+    }
+
+    /// Cancel and await every in-flight on-device translation so no GPU generation
+    /// is still running when the Qwen model is unloaded and its MLX cache cleared.
+    private func drainInflightTranslations() async {
+        let tasks = Array(inflightTranslations.values)
+        inflightTranslations.removeAll()
+        for t in tasks { t.cancel() }
+        for t in tasks { await t.value }
     }
 
     /// At meeting Start, download the Qwen model files to disk in the background
@@ -151,7 +170,19 @@ final class CaptureViewModel: ObservableObject {
         didSet { applySettings() }
     }
 
-    enum ASRState: Equatable { case idle, loading, listening }
+    enum ASRState: Equatable {
+        case idle, loading, listening
+
+        /// Map to the overlay's status so the idle pill reflects reality instead of
+        /// always claiming "Listening".
+        var overlayListenState: OverlayListenState {
+            switch self {
+            case .idle:      return .idle
+            case .loading:   return .loading
+            case .listening: return .listening
+            }
+        }
+    }
 
     // Dependencies
     private let router = AudioRouter()
@@ -349,6 +380,10 @@ final class CaptureViewModel: ObservableObject {
         case .apple:
             translation.translate(id: id, text: text)
         case .mlx:
+            // Don't start new GPU generations once the meeting is stopping — a late
+            // one could run while the model is being unloaded (clearCache crash) or
+            // reload the whole 2.5 GB model after we just freed it.
+            guard acceptingTranslations else { return }
             let target = settings.secondLanguage.modelTargetName   // exactly the selected language
             let srcName = settings.firstLanguage == "auto" ? "自動偵測" : settings.firstLanguage
             let tgtName = settings.secondLanguage.displayName
@@ -356,13 +391,17 @@ final class CaptureViewModel: ObservableObject {
             // the next translation (keeps the second caption coherent across lines).
             let context = mlxContext.recent
             mlxContext.append(text)
-            Task { [weak self] in
+            let task = Task { [weak self] in
                 guard let self else { return }
+                // Always deregister this task, even on early return / cancellation.
+                defer { self.inflightTranslations[id] = nil }
                 // Load the model into memory on first use (already on disk from Start).
                 guard await self.ensureQwenReady(srcName: srcName, tgtName: tgtName) else { return }
+                guard !Task.isCancelled else { return }
                 guard let translated = await self.mlxTranslator.translate(text, target: target, context: context) else { return }
                 self.applyTranslation(id: id, chinese: translated)
             }
+            inflightTranslations[id] = task
         case .none:
             break
         }
@@ -550,6 +589,7 @@ final class CaptureViewModel: ObservableObject {
             lastSummaryEN = nil
             lastSummaryZH = nil
             interimText = ""
+            acceptingTranslations = true
             resetLiveCaptionState()
             overlay.model.clear()
             asrState = .listening
@@ -563,7 +603,11 @@ final class CaptureViewModel: ObservableObject {
     func endMeeting() async {
         asr.stopStream()
         asr.releaseModels()       // free ASR memory
-        qwenLoadTask?.cancel(); qwenLoadTask = nil   // stop any pending translation load
+        // Stop accepting new translations, then wait for any in-flight GPU
+        // generation to finish BEFORE unloading the model — otherwise
+        // `unloadQwen()` → `GPU.clearCache()` could fire mid-generation (crash).
+        acceptingTranslations = false
+        await drainInflightTranslations()
         unloadQwen()              // free the translation model now — summary is on-demand
         store.endSession()
         asrState = .idle
@@ -571,6 +615,7 @@ final class CaptureViewModel: ObservableObject {
         interimChinese = ""
         resetLiveCaptionState()
         overlay.model.clear()
+        if settings.autoCloseOverlayOnStop { overlayOn = false }   // opt-in (Settings)
         // Keep `lines` (the transcript) so it can be summarized / exported on demand.
         statusMessage = "已結束 Done · 可按「摘要 Summary」產生摘要"
     }
@@ -680,7 +725,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     /// Reset all overlay-related preferences to defaults (font, opacity, line count,
-    /// primary line, interim style, click-through, position) — the overlay's ↺.
+    /// primary line, interim style, click-through, auto-close, position) — the overlay's ↺.
     /// One assignment → one `applySettings`, and a nil position re-centres it.
     func resetOverlaySettings() {
         var s = settings
@@ -691,6 +736,7 @@ final class CaptureViewModel: ObservableObject {
         s.primaryLineOnTop = d.primaryLineOnTop
         s.interimStyle = d.interimStyle
         s.clickThrough = d.clickThrough
+        s.autoCloseOverlayOnStop = d.autoCloseOverlayOnStop
         s.overlayPosition = nil
         settings = s
     }

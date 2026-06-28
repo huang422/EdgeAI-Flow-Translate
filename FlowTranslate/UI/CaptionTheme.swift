@@ -45,6 +45,12 @@ enum CaptionTheme {
         static let chipCorner: CGFloat = 8
 
         static let overlayMaxWidth: CGFloat = 600
+        /// Horizontal scrim padding on either side of the caption text block.
+        static let overlayScrimHPadding: CGFloat = 22
+        /// Full overlay panel width (caption block + both scrim paddings). The idle
+        /// pill is laid out at this same width so the centre-anchored window never
+        /// shifts horizontally when content changes idle ↔ caption.
+        static let overlayTotalWidth: CGFloat = overlayMaxWidth + overlayScrimHPadding * 2
         static let overlayBottomFraction: CGFloat = 0.16   // default: 16% up from the bottom (a bit higher)
 
         static let fontMin: Double = 12

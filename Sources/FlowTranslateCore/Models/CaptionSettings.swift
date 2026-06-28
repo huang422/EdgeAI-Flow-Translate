@@ -40,11 +40,16 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     public var interimStyle: InterimStyle
     /// Overlay scrim opacity (0.4...0.9).
     public var overlayOpacity: Double
-    /// Overlay text size in points (16...28).
+    /// Overlay text size in points (12...22).
     public var overlayFontSize: Double
-    /// Persisted overlay top-left position in screen coordinates; nil = default
-    /// (bottom-centre). Stored as a plain point so it survives relaunches.
+    /// Persisted overlay **top-centre anchor** in screen coordinates (the window's
+    /// top edge / horizontal centre); nil = default (bottom-centre). Stored as a
+    /// plain point so it survives relaunches; the overlay grows downward from it.
     public var overlayPosition: CGPoint?
+    /// When `true`, ending a meeting (Stop) also hides the floating overlay. Default
+    /// `false`: the overlay stays put and just reflects the idle state, so the user
+    /// keeps control of its visibility via the switch / ⌃⌥C.
+    public var autoCloseOverlayOnStop: Bool
 
     public init(
         firstLanguage: String = SupportedASRLanguages.default,
@@ -59,7 +64,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         interimStyle: InterimStyle = .dimmedWithCaret,
         overlayOpacity: Double = 0.66,
         overlayFontSize: Double = 16,
-        overlayPosition: CGPoint? = nil
+        overlayPosition: CGPoint? = nil,
+        autoCloseOverlayOnStop: Bool = false
     ) {
         self.firstLanguage = firstLanguage
         self.secondCaptionEnabled = secondCaptionEnabled
@@ -74,6 +80,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.overlayOpacity = overlayOpacity
         self.overlayFontSize = overlayFontSize
         self.overlayPosition = overlayPosition
+        self.autoCloseOverlayOnStop = autoCloseOverlayOnStop
     }
 
     /// Tolerant decode: every field falls back to its default when absent, so an
@@ -96,6 +103,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         overlayOpacity = try c.decodeIfPresent(Double.self, forKey: .overlayOpacity) ?? d.overlayOpacity
         overlayFontSize = try c.decodeIfPresent(Double.self, forKey: .overlayFontSize) ?? d.overlayFontSize
         overlayPosition = try c.decodeIfPresent(CGPoint.self, forKey: .overlayPosition) ?? d.overlayPosition
+        autoCloseOverlayOnStop = try c.decodeIfPresent(Bool.self, forKey: .autoCloseOverlayOnStop) ?? d.autoCloseOverlayOnStop
     }
 
     /// Whether translation is required (enabled and the target differs from the source).

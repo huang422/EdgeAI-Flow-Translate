@@ -8,7 +8,7 @@ on:
 
 jobs:
   core-build:
-    name: Core package build
+    name: Core package build & test
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
@@ -20,6 +20,9 @@ jobs:
 
       - name: Build core package
         run: swift build
+
+      - name: Run core tests
+        run: make test
 
   app-build:
     name: App build (Release)

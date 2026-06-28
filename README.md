@@ -1,6 +1,6 @@
 # EdgeAI Flow Translate
 
-![Platform](https://img.shields.io/badge/platform-macOS%2014%2B-blue?logo=apple)
+![Platform](https://img.shields.io/badge/platform-macOS%2015%2B-blue?logo=apple)
 ![Swift](https://img.shields.io/badge/Swift-6-orange?logo=swift)
 ![On-device](https://img.shields.io/badge/ASR-Nemotron%203.5%20·%20ANE-5E5CE6)
 [![Download](https://img.shields.io/badge/⬇%20Download-FlowTranslate.dmg-0A84FF?logo=apple&logoColor=white)](../../releases/latest/download/FlowTranslate.dmg)
@@ -26,7 +26,7 @@ the only network access is a one-time model download.
 - **Global shortcut ⌃⌥C** toggles the overlay from any app (e.g. while Zoom is focused).
 - **Private by design** — audio and text never leave your Mac.
 
-> Target hardware: **Apple M1 Pro / 16 GB**, macOS 14+ (Apple Silicon). The
+> Target hardware: **Apple M1 Pro / 16 GB**, macOS 15+ (Apple Silicon). The
 > real-time loop deliberately avoids loading any large LLM so it stays fast and
 > memory-light; the heavy summarization model is only loaded on demand, after the
 > meeting ends.
@@ -52,6 +52,7 @@ the only network access is a one-time model download.
   - [Deployment / release](#deployment--release)
   - [Troubleshooting](#troubleshooting)
   - [Privacy](#privacy)
+  - [Contributing](#contributing)
   - [License](#license)
   - [Contact](#contact)
 
@@ -73,7 +74,7 @@ No terminal required.
 
 ## Build from source (developers)
 
-**Requirements:** macOS 14+ on Apple Silicon, **Xcode 16+**, and [XcodeGen](https://github.com/yonghkim/XcodeGen) (`brew install xcodegen`).
+**Requirements:** macOS 15+ on Apple Silicon, **Xcode 16+**, and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
 ```bash
 git clone <this-repo> Flow-Translate
@@ -318,7 +319,7 @@ Open the **gear icon** in the top-right. Preferences are persisted automatically
 - **First caption (recognition) language** — any of Nemotron's 32 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`.
 - **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (more accurate).
 - **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**. A status line shows the active source → target and whether it's using Apple or the Qwen model (with live load progress).
-- **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through. The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
+- **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through, and **auto-close on stop** (off by default — the overlay stays put and just shows an idle state when a meeting ends). The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
 
 Defaults match the primary use case: **English → Traditional Chinese**, most real-time.
 
@@ -356,7 +357,7 @@ Flow-Translate/
 │   ├── Info.plist  FlowTranslate.entitlements
 ├── Scripts/                      # bootstrap.sh, run-tests.sh
 ├── Packaging/                    # build_dmg.sh, notarize.sh
-└── .github/workflows/            # ci.yml, release.yml
+└── .github/workflows/            # ci.yml, cla.yml, release.yml
 ```
 
 ---
@@ -370,7 +371,7 @@ Flow-Translate/
                                       |
                                       v
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  GitHub Actions: release.yml   (macos-15 runner, Xcode 16)               │
+│  GitHub Actions: release.yml   (macos-15 runner, latest Xcode)           │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
                                       v
@@ -435,11 +436,26 @@ are stored under `~/Library/Application Support/FlowTranslate/`.
 
 ---
 
+## Contributing
+
+Contributions are welcome! Please read **[CONTRIBUTING.md](.github/CONTRIBUTING.md)** to
+get set up, and note that your first pull request must agree to the
+**[Contributor License Agreement](.github/CLA.md)** (a quick one-time step). The CLA lets
+the project stay open while allowing the maintainer to offer future commercial
+versions.
+
 ## License
 
-Released under the [MIT License](LICENSE). Third-party components keep their own
-licenses — notably **FluidAudio** (Apache-2.0) and the **Nemotron ASR** model
-weights (see NVIDIA's model card for terms).
+Flow Translate's source code is released under the **[Apache License 2.0](LICENSE)**.
+
+Third-party components keep their own licenses — notably **FluidAudio**
+(Apache-2.0) and **MLX** (MIT). The AI models are downloaded at runtime (not
+bundled in this repo) and stay under their own terms — **Nemotron** (NVIDIA's
+model card) and **Qwen3-4B-Instruct** (Apache-2.0).
+
+**"Flow Translate" — the name and logo — is a trademark of Tom Huang** and is
+not covered by the code license: you're free to fork the code, but ship it under
+a different name.
 
 ## Contact
 

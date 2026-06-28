@@ -4,6 +4,11 @@ import FlowTranslateCore
 
 // MARK: - Overlay view model
 
+/// Listening state mirrored from the app's `ASRState` so the idle status pill can
+/// reflect reality (listening / loading / not listening) instead of always
+/// claiming "Listening" even when stopped.
+enum OverlayListenState { case idle, loading, listening }
+
 /// Observable content + presentation state for the floating caption overlay.
 /// `lines` are finalized caption units (English + translation, with source);
 /// `interim` is the in-progress recognition line (English only, no translation yet).
@@ -16,6 +21,10 @@ final class OverlayModel: ObservableObject {
     @Published var interim: String = ""
     @Published var interimChinese: String = ""   // live translation of the in-progress line
     @Published var interimSource: AudioSourceType = .system
+
+    /// Mirrors the app's ASR state so the idle pill reflects whether we are really
+    /// listening, loading, or stopped (idle) — never a stale "Listening".
+    @Published var listenState: OverlayListenState = .idle
 
     // Interaction state
     @Published var isPinned = false
@@ -296,17 +305,40 @@ private struct PinnedBanner: View {
     }
 }
 
-/// Minimal idle pill shown when there's no caption yet.
+/// Minimal status pill shown when there's no caption yet — reflects the real
+/// ASR state so it never claims "Listening" while loading or stopped (idle).
 private struct ListeningPill: View {
+    let state: OverlayListenState
+
     var body: some View {
         HStack(spacing: 9) {
-            BreathingDot(color: CaptionTheme.Palette.mic, size: 7).frame(width: 7, height: 7)
-            Text("聆聽中… Listening")
+            dot
+            Text(text)
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(Color(hex: 0xC9CDD4))
         }
         .padding(.horizontal, 15).padding(.vertical, 9)
         .scrim(opacity: 0.72)
+    }
+
+    @ViewBuilder
+    private var dot: some View {
+        switch state {
+        case .listening:
+            BreathingDot(color: CaptionTheme.Palette.mic, size: 7).frame(width: 7, height: 7)
+        case .loading:
+            BreathingDot(color: CaptionTheme.Palette.accentSystem, size: 7).frame(width: 7, height: 7)
+        case .idle:
+            Circle().fill(CaptionTheme.Palette.inkTertiary).frame(width: 7, height: 7)
+        }
+    }
+
+    private var text: String {
+        switch state {
+        case .listening: return "聆聽中… Listening"
+        case .loading:   return "載入中… Loading"
+        case .idle:      return "待命 Idle"
+        }
     }
 }
 
@@ -333,7 +365,7 @@ private struct OverlayControlBar: View {
                 .help("放大字級 ⌃⌥=")
             divider
             controlButton("↺", size: 14, color: Color(hex: 0xC9CDD4)) { actions.onReset() }
-                .help("回復預設（字級／位置／句數／透明度）Reset to defaults")
+                .help("回復所有懸浮字幕設定預設值 Reset all overlay settings")
         }
         .padding(4)
         .background(Color(hex: 0x26262B).opacity(0.96), in: RoundedRectangle(cornerRadius: 11))
@@ -394,11 +426,14 @@ private struct OverlayRootView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // The control bar is ALWAYS laid out (only faded on hover) so the overlay's
+            // resting width never changes when it appears. Otherwise a narrow idle pill
+            // would re-size + re-centre every time the wider bar faded in, making it
+            // impossible to grab and drag into place before a meeting starts.
             ZStack {
-                if model.showControls {
-                    OverlayControlBar(model: model, actions: actions)
-                        .transition(.move(edge: .top).combined(with: .opacity))
-                }
+                OverlayControlBar(model: model, actions: actions)
+                    .opacity(model.showControls ? 1 : 0)
+                    .allowsHitTesting(model.showControls)
             }
             .frame(height: bandHeight)
 
@@ -419,12 +454,16 @@ private struct OverlayRootView: View {
         if model.hasContent {
             captionStack
                 .frame(width: CaptionTheme.Metric.overlayMaxWidth, alignment: .leading)
-                .padding(.horizontal, 22)
+                .padding(.horizontal, CaptionTheme.Metric.overlayScrimHPadding)
                 .padding(.top, 16)
                 .padding(.bottom, 17)
                 .scrim(opacity: model.opacity, pinned: model.isPinned)
         } else {
-            ListeningPill()
+            // Lay the idle pill out at the full caption width (scrim stays pill-sized,
+            // centred) so the centre-anchored window keeps a constant width and never
+            // shifts horizontally when content toggles idle ↔ caption.
+            ListeningPill(state: model.listenState)
+                .frame(width: CaptionTheme.Metric.overlayTotalWidth, alignment: .center)
         }
     }
 
@@ -493,7 +532,7 @@ final class OverlayController {
 
     private var clickThroughEnabled = true
     private var isHovering = false
-    private var overlayOrigin: CGPoint?   // persisted bottom-left origin (nil = default)
+    private var overlayAnchor: CGPoint?   // persisted TOP-CENTRE anchor (nil = default)
     private var dragMouseStart: CGPoint?
     private var dragOriginStart: CGPoint?
     private var lastContentSize: CGSize = .zero
@@ -510,7 +549,7 @@ final class OverlayController {
             panel?.ignoresMouseEvents = false
             model.showControls = true
         }
-        applyContentSize(lastContentSize == .zero ? CGSize(width: 644, height: 120) : lastContentSize)
+        applyContentSize(lastContentSize == .zero ? CGSize(width: CaptionTheme.Metric.overlayTotalWidth, height: 120) : lastContentSize)
         installMonitors()
         panel?.orderFrontRegardless()
     }
@@ -533,7 +572,7 @@ final class OverlayController {
         model.interimStyle = s.interimStyle
         model.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         clickThroughEnabled = s.clickThrough
-        overlayOrigin = s.overlayPosition
+        overlayAnchor = s.overlayPosition
         if !clickThroughEnabled {
             // Always interactive: never swallow the app below, controls available.
             panel?.ignoresMouseEvents = false
@@ -556,7 +595,7 @@ final class OverlayController {
         self.hostingView = hosting
 
         let panel = NSPanel(
-            contentRect: NSRect(x: 0, y: 0, width: 644, height: 120),
+            contentRect: NSRect(x: 0, y: 0, width: CaptionTheme.Metric.overlayTotalWidth, height: 120),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered, defer: false
         )
@@ -585,26 +624,38 @@ final class OverlayController {
         )
     }
 
-    /// Resize the panel to fit its content, keeping the BOTTOM edge anchored (so it
-    /// grows upward) and horizontally centred (or at the dragged position).
+    /// Resize the panel to fit its content while keeping the user's **top-centre
+    /// anchor** fixed: the box grows downward and stays put horizontally no matter
+    /// how the content width/height change (new line, idle pill ↔ caption, pin
+    /// banner). Falls back to the default bottom-centre placement when un-dragged.
     private func applyContentSize(_ size: CGSize) {
         guard let panel, size.width > 1, size.height > 1 else { return }
         lastContentSize = size
         guard let screen = panel.screen ?? NSScreen.main else { return }
         let vf = screen.visibleFrame
-        let origin: CGPoint
-        if let saved = overlayOrigin, isOnScreen(saved) {
-            origin = CGPoint(x: saved.x, y: saved.y)
-        } else {
-            let x = vf.midX - size.width / 2
-            let y = vf.minY + vf.height * CaptionTheme.Metric.overlayBottomFraction
-            origin = CGPoint(x: x, y: y)
-        }
+        let anchor = clampAnchor(overlayAnchor ?? defaultAnchor(size: size, in: vf),
+                                 size: size, in: vf)
+        // `anchor` is the TOP-CENTRE of the window; derive the bottom-left origin.
+        let origin = CGPoint(x: anchor.x - size.width / 2, y: anchor.y - size.height)
         panel.setFrame(NSRect(origin: origin, size: size), display: true)
     }
 
-    private func isOnScreen(_ origin: CGPoint) -> Bool {
-        NSScreen.screens.contains { $0.frame.insetBy(dx: -200, dy: -200).contains(origin) }
+    /// Default placement as a top-centre anchor: horizontally centred, sitting
+    /// `overlayBottomFraction` up from the bottom of the visible frame.
+    private func defaultAnchor(size: CGSize, in vf: NSRect) -> CGPoint {
+        let bottomY = vf.minY + vf.height * CaptionTheme.Metric.overlayBottomFraction
+        return CGPoint(x: vf.midX, y: bottomY + size.height)
+    }
+
+    /// Keep a saved top-centre anchor inside the visible frame — **nudged back in,
+    /// never discarded** — so the overlay can't drift off-screen or snap back to the
+    /// centre after a resolution / display / Space change.
+    private func clampAnchor(_ anchor: CGPoint, size: CGSize, in vf: NSRect) -> CGPoint {
+        let halfW = size.width / 2
+        let x = min(max(anchor.x, vf.minX + halfW), vf.maxX - halfW)
+        // y is the window's top edge; keep the whole height within the visible frame.
+        let y = min(max(anchor.y, vf.minY + size.height), vf.maxY)
+        return CGPoint(x: x, y: y)
     }
 
     // MARK: Drag
@@ -622,16 +673,20 @@ final class OverlayController {
         guard let ms = dragMouseStart, let os = dragOriginStart else { return }
         let newOrigin = CGPoint(x: os.x + (mouse.x - ms.x), y: os.y + (mouse.y - ms.y))
         panel.setFrameOrigin(newOrigin)
-        overlayOrigin = newOrigin   // keep size updates anchored to the live position
+        // Track the live position as a top-centre anchor so content-size updates
+        // mid-drag stay pinned to where the user is dragging.
+        let size = panel.frame.size
+        overlayAnchor = CGPoint(x: newOrigin.x + size.width / 2, y: newOrigin.y + size.height)
     }
 
     private func dragEnded() {
         guard let panel else { return }
         dragMouseStart = nil
         dragOriginStart = nil
-        let origin = panel.frame.origin
-        overlayOrigin = origin
-        onPositionChanged?(origin)
+        let f = panel.frame
+        let anchor = CGPoint(x: f.midX, y: f.maxY)   // persist the top-centre anchor
+        overlayAnchor = anchor
+        onPositionChanged?(anchor)
     }
 
     // MARK: Copy

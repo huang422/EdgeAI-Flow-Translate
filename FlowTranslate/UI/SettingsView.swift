@@ -2,8 +2,7 @@ import SwiftUI
 import FlowTranslateCore
 
 /// Caption / language settings (US3) + overlay presentation (redesign §4). Bound to
-/// the live `CaptionSettings`, applied immediately and persisted. New overlay rows
-/// (primary line, visible lines, interim style, opacity) are marked 「新」.
+/// the live `CaptionSettings`, applied immediately and persisted.
 struct SettingsView: View {
     @Binding var settings: CaptionSettings
     @Environment(\.dismiss) private var dismiss
@@ -44,18 +43,18 @@ struct SettingsView: View {
                 Picker(selection: $settings.primaryLineOnTop) {
                     Text("Original").tag(PrimaryLine.original)
                     Text("Translation").tag(PrimaryLine.translation)
-                } label: { newRow("哪個語言在上面 Primary line") }
+                } label: { Text("哪個語言在上面 Primary line") }
                 .pickerStyle(.segmented)
 
                 Picker(selection: visibleLines) {
                     Text("1").tag(1); Text("2").tag(2); Text("3").tag(3)
-                } label: { newRow("同時顯示句數 Visible lines") }
+                } label: { Text("同時顯示句數 Visible lines") }
                 .pickerStyle(.segmented)
 
                 Picker(selection: $settings.interimStyle) {
                     Text("Dim + caret").tag(InterimStyle.dimmedWithCaret)
                     Text("Hidden").tag(InterimStyle.hidden)
-                } label: { newRow("辨識中的文字 Interim text") }
+                } label: { Text("辨識中的文字 Interim text") }
                 .pickerStyle(.segmented)
 
                 HStack {
@@ -66,7 +65,7 @@ struct SettingsView: View {
                 }
 
                 HStack {
-                    newRow("背景透明度 Opacity")
+                    Text("背景透明度 Opacity")
                     Slider(value: $settings.overlayOpacity,
                            in: CaptionTheme.Metric.opacityMin...CaptionTheme.Metric.opacityMax)
                     Text("\(Int(settings.overlayOpacity * 100))%").monospacedDigit().foregroundStyle(.secondary)
@@ -79,11 +78,19 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+
+                Toggle(isOn: $settings.autoCloseOverlayOnStop) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("停止後自動關閉 Auto-close on stop")
+                        Text("Hides the floating captions when you stop a meeting")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Section {
                 Label {
-                    Text("完全在裝置上運作。聲音與文字不會離開你的 Mac，僅模型首次下載需要網路。")
+                    Text("Runs entirely on-device. Audio and text never leave your Mac — only the first-time model download needs the internet.")
                         .font(.caption).foregroundStyle(.secondary)
                 } icon: {
                     Image(systemName: "lock.fill").foregroundStyle(CaptionTheme.Palette.privacy)
@@ -96,17 +103,6 @@ struct SettingsView: View {
             ToolbarItem(placement: .confirmationAction) {
                 Button("完成 Done") { dismiss() }
             }
-        }
-    }
-
-    /// A row title with a small green 「新」 badge for redesign-introduced options.
-    private func newRow(_ title: String) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-            Text("新").font(.system(size: 9.5, weight: .bold))
-                .padding(.horizontal, 5).padding(.vertical, 1.5)
-                .background(CaptionTheme.Palette.mic.opacity(0.16), in: RoundedRectangle(cornerRadius: 4))
-                .foregroundStyle(CaptionTheme.Palette.mic)
         }
     }
 }
