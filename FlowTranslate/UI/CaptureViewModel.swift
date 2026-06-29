@@ -57,6 +57,12 @@ final class CaptureViewModel: ObservableObject {
     /// Model download/prefetch status (e.g. the Qwen model fetched at Start).
     @Published var modelStatus = ""
 
+    /// True when a required model is missing at launch — the UI shows a one-time
+    /// download prompt so the first meeting isn't blocked by a surprise download.
+    @Published var showModelDownloadPrompt = false
+    /// True while the launch-time bulk download runs.
+    @Published var isDownloadingModels = false
+
     enum TranslationMethod { case none, apple, mlx }
     private var translationMethod: TranslationMethod = .apple
     /// Single shared Qwen model, reused by live translation and the post-meeting
@@ -258,6 +264,9 @@ final class CaptureViewModel: ObservableObject {
                     ? "辨識模型載入中…（首次較久，請開始說話）"
                     : "辨識中 Listening"
             }
+        }
+        asr.onVadUnavailable = { [weak self] msg in
+            Task { @MainActor in self?.statusMessage = "⚠️ " + msg }
         }
         translation.onResult = { [weak self] id, zh in
             self?.applyTranslation(id: id, chinese: zh)
@@ -598,6 +607,53 @@ final class CaptureViewModel: ObservableObject {
             asrState = .idle
             statusMessage = "ASR load failed: \(error)"
         }
+    }
+
+    // MARK: - Model preflight / uninstall
+
+    /// Whether all on-disk models (ASR + Silero VAD + Qwen) are present.
+    var modelsPresent: Bool {
+        NemotronStreamingService.asrModelPresent
+            && NemotronStreamingService.vadModelPresent
+            && qwenHost.isComplete
+    }
+
+    /// At launch: if any model is missing, prompt the user to download up front
+    /// (instead of stalling the first meeting). No-op once everything is cached.
+    func preflightModels() {
+        if !modelsPresent { showModelDownloadPrompt = true }
+    }
+
+    /// Download every model now (ASR variant, Silero VAD, Qwen), with progress.
+    func downloadAllModels() async {
+        guard !isDownloadingModels else { return }
+        isDownloadingModels = true
+        showModelDownloadPrompt = false
+        statusMessage = "Downloading models…"
+        prefetchQwen()
+        asr.currentLanguage = settings.firstLanguage
+        asr.onLoadProgress = { [weak self] p in
+            Task { @MainActor in self?.statusMessage = "Downloading ASR model… \(Int(p * 100))%" }
+        }
+        do { try await asr.loadModels(tier: settings.asrTier) } catch {
+            statusMessage = "ASR download failed: \(error)"
+        }
+        _ = await asr.prefetchVAD()
+        await qwenPrefetchTask?.value
+        isDownloadingModels = false
+        statusMessage = modelsPresent ? "Models ready" : "Some models still missing"
+    }
+
+    /// Delete every downloaded model + app data, move the app to the Trash, and quit.
+    func uninstall() {
+        let fm = FileManager.default
+        let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        for dir in ["FluidAudio", "FlowTranslate"] {
+            try? fm.removeItem(at: appSupport.appendingPathComponent(dir, isDirectory: true))
+        }
+        UserDefaults.standard.removeObject(forKey: "FlowTranslate.CaptionSettings")
+        try? fm.trashItem(at: Bundle.main.bundleURL, resultingItemURL: nil)
+        NSApplication.shared.terminate(nil)
     }
 
     func endMeeting() async {

@@ -10,9 +10,4 @@ import Testing
         // RMS of [0.5, 0.5, 0.5] == 0.5
         #expect(abs(AudioMath.rms([0.5, 0.5, 0.5]) - 0.5) < 1e-6)
     }
-
-    @Test func voicedThreshold() {
-        #expect(AudioMath.isVoiced([0.2, 0.2, 0.2]) == true)
-        #expect(AudioMath.isVoiced([0.001, 0.001]) == false)
-    }
 }

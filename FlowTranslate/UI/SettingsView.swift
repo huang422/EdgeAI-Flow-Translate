@@ -5,7 +5,9 @@ import FlowTranslateCore
 /// the live `CaptionSettings`, applied immediately and persisted.
 struct SettingsView: View {
     @Binding var settings: CaptionSettings
+    @ObservedObject var vm: CaptureViewModel
     @Environment(\.dismiss) private var dismiss
+    @State private var confirmUninstall = false
 
     /// Segmented "visible lines" (1/2/3) maps to `historyLineCount` (0/1/2 = now + N).
     private var visibleLines: Binding<Int> {
@@ -96,9 +98,18 @@ struct SettingsView: View {
                     Image(systemName: "lock.fill").foregroundStyle(CaptionTheme.Palette.privacy)
                 }
             }
+            Section("維護 Maintenance") {
+                Button("解除安裝 Uninstall") { confirmUninstall = true }
+            }
         }
         .formStyle(.grouped)
         .frame(width: 480, height: 560)
+        .confirmationDialog("解除安裝 FlowTranslate？", isPresented: $confirmUninstall, titleVisibility: .visible) {
+            Button("移到垃圾桶並刪除模型 Uninstall") { vm.uninstall() }
+            Button("取消 Cancel", role: .cancel) {}
+        } message: {
+            Text("移除下載的模型、逐字稿與設定，並把 App 移到垃圾桶後結束。")
+        }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("完成 Done") { dismiss() }

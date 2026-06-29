@@ -1,0 +1,72 @@
+name: Release Please
+
+# Automated releases driven by Conventional Commits.
+#
+# How it works:
+#  1. On every push to main, release-please looks at the commit messages since the
+#     last release and maintains an open "release PR" that bumps the version
+#     (version.txt + MARKETING_VERSION in project.yml) and updates CHANGELOG.md.
+#  2. When YOU merge that release PR, release-please tags `vX.Y.Z` and creates the
+#     GitHub Release — and the build-dmg job below builds the signed DMG and
+#     uploads it to that release.
+#
+# So "publishing" = merging the release PR. No manual tagging needed.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    name: Maintain release PR / create release
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          # config + manifest live at the repo root.
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  build-dmg:
+    name: Build & upload DMG
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: macos-15
+    # Job-level env so the notarize step's `if` can actually see it (a step's `if`
+    # cannot read that same step's own env block).
+    env:
+      DEVELOPER_ID_APP: ${{ secrets.DEVELOPER_ID_APP }}
+      NOTARY_PROFILE: ${{ secrets.NOTARY_PROFILE }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build DMG
+        run: bash Packaging/build_dmg.sh
+
+      # Optional notarization — runs only when signing secrets are present.
+      - name: Notarize DMG
+        if: ${{ env.DEVELOPER_ID_APP != '' }}
+        run: bash Packaging/notarize.sh
+
+      - name: Upload DMG to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ needs.release-please.outputs.tag_name }}" \
+            Packaging/build/FlowTranslate.dmg --clobber

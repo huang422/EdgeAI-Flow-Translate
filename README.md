@@ -65,8 +65,8 @@ the only network access is a one-time model download.
 3. Launch it. On first run, grant the prompts:
    - **Microphone** — to caption your own voice.
    - **Screen Recording** — required by macOS to capture *system* audio (the other side of a call, or a video). Toggle it on in **System Settings → Privacy & Security → Screen Recording**, then relaunch.
-4. The first time you start a meeting the app downloads its models to disk — the ASR model (~600 MB) and, in parallel, the Qwen model (~2.5 GB, used by auto/unsupported-language translation and the summary). **Let them finish** (progress is shown); they're cached under `~/Library/Application Support/FlowTranslate/` and later runs work fully offline. Interrupted downloads resume on the next Start — already-downloaded files are skipped (verified by size).
-5. Choose an audio source (**System** for meetings/videos, **Mic** for your voice, or both), press **Start**, and toggle **Overlay** to float the captions on screen.
+4. On first launch FlowTranslate checks for its models and, if any are missing, offers to **download them up front** — the ASR model (~600 MB), the Silero VAD model (~1 MB, neural speech endpointing) and the Qwen model (~2.5 GB, for auto/unsupported-language translation and the summary). **Let them finish** (progress is shown); the ASR + VAD models cache under `~/Library/Application Support/FluidAudio/` and Qwen under `~/Library/Application Support/FlowTranslate/`, so later runs work fully offline. Interrupted downloads resume — already-fetched files are skipped (verified by size).
+5. Choose an audio source (**System** for meetings/videos, **Mic** for your voice, or both), press **Start**, and toggle **Overlay** to float the captions on screen. To remove everything later, open **Settings → Maintenance → Uninstall**.
 
 No terminal required.
 
@@ -125,7 +125,7 @@ open Packaging/build/FlowTranslate.dmg     # then drag Flow Translate → Applic
 ```
 
 On first launch macOS will ask for **Microphone** and **Screen Recording**
-permission, and the first meeting downloads the ASR model (cached afterwards).
+permission, and FlowTranslate offers to download its models once (cached afterwards).
 
 ### The core package
 
@@ -164,7 +164,7 @@ The diagram below reflects the **current implementation**:
 │  LAYER 2 . REAL-TIME ASR      (runs on the Apple Neural Engine)          │
 ├──────────────────────────────────────────────────────────────────────────┤
 │    NemotronStreamingService  --  FluidAudio . CoreML / ANE               │
-│    energy VAD (AudioMath.isVoiced) --> utterance segmentation            │
+│    Silero VAD (CoreML / ANE) --> utterance segmentation                 │
 │    interim text -------------------------------> overlay line 1 (now)    │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
@@ -203,7 +203,7 @@ flowchart TB
 
     subgraph ASR["2 · Real-time ASR"]
         NEMO["NemotronStreamingService<br/>(FluidAudio · CoreML/ANE)"]
-        VAD["Energy VAD<br/>(AudioMath.isVoiced)"]
+        VAD["Silero VAD<br/>(CoreML/ANE)"]
         ROUTER --> NEMO
         NEMO -. uses .-> VAD
     end
@@ -249,9 +249,9 @@ sequenceDiagram
     A->>R: PCM buffer
     R->>R: convert → 16kHz mono Float32, tag source
     R->>S: AudioChunk
-    S->>S: energy VAD + append/process
+    S->>S: Silero VAD + append/process
     S-->>O: interim text (line 1, immediate)
-    Note over S: silence > 0.8s ⇒ end of utterance
+    Note over S: silence > 0.35s / sentence end ⇒ finalize
     S->>C: finalized segment
     C->>O: cleaned text (line 1)
     C->>D: append TranscriptSegment (persisted)
@@ -270,7 +270,7 @@ translation.
 | Layer | Type | Responsibility |
 |-------|------|----------------|
 | `AudioCapture/` | App | Capture mic + system audio, resample, route with source tags |
-| `ASR/` | App | FluidAudio Nemotron streaming wrapper + energy VAD |
+| `ASR/` | App | FluidAudio Nemotron streaming wrapper + Silero VAD endpointing |
 | `Translation/` | App | Queue finalized text → Apple translation or the shared MLX Qwen (`QwenModelHost`) for auto / unsupported pairs |
 | `UI/` | App | Control panel, settings, click-through `NSPanel` overlay |
 | `Support/` | App | Permissions, settings persistence, global hotkeys, MLX memory governance |
@@ -347,7 +347,8 @@ Flow-Translate/
 ├── Sources/FlowTranslateCore/    # pure logic (no platform deps)
 │   ├── Models/                   # Session, TranscriptSegment, Summary, CaptionSettings, …
 │   ├── Contracts/Protocols.swift # layer interfaces
-│   ├── Audio/AudioMath.swift     # rms / energy VAD
+│   ├── Audio/AudioMath.swift     # rms / level helpers
+│   ├── Audio/Endpointer.swift    # utterance boundaries (Silero-driven)
 │   ├── Translation/              # ContextBuffer, BasicTextCleaner, BasicS2TWPConverter
 │   ├── Transcript/               # In-memory + file (crash-safe) stores, exporter
 │   └── Summarization/            # ExtractiveSummarizer (pure-Swift fallback)
@@ -357,7 +358,7 @@ Flow-Translate/
 │   ├── Info.plist  FlowTranslate.entitlements
 ├── Scripts/                      # bootstrap.sh, run-tests.sh
 ├── Packaging/                    # build_dmg.sh, notarize.sh
-└── .github/workflows/            # ci.yml, cla.yml, release.yml
+└── .github/workflows/            # ci.yml, cla.yml, release-please.yml
 ```
 
 ---
@@ -366,27 +367,23 @@ Flow-Translate/
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  Developer  ->  git tag vX.Y.Z  &&  git push --tags                      │
+│  Developer  ->  Conventional-Commit pushes to main (feat: / fix: …)      │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
                                       v
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  GitHub Actions: release.yml   (macos-15 runner, latest Xcode)           │
+│  release-please  ->  opens/updates a "release PR" (bumps version + log)  │
+└──────────────────────────────────────────────────────────────────────────┘
+                                      |   merge the release PR  =  publish
+                                      v
+┌──────────────────────────────────────────────────────────────────────────┐
+│  release-please  ->  tag vX.Y.Z  +  GitHub Release                       │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
                                       v
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  xcodegen generate  ->  xcodebuild Release  ->  FlowTranslate.app        │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      |
-                                      v
-┌──────────────────────────────────────────────────────────────────────────┐
-│  Packaging/build_dmg.sh   ->   FlowTranslate.dmg                         │
-└──────────────────────────────────────────────────────────────────────────┘
-                                      |
-                                      v  (optional: notarize.sh if signing secrets present)
-┌──────────────────────────────────────────────────────────────────────────┐
-│  softprops/action-gh-release  ->  GitHub Release asset                   │
+│  build-dmg job (macos-15): xcodegen -> xcodebuild Release -> build_dmg.sh│
+│  (optional notarize.sh)  ->  gh release upload FlowTranslate.dmg         │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
                                       v
@@ -395,8 +392,13 @@ Flow-Translate/
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-Releases are produced by [`.github/workflows/release.yml`](.github/workflows/release.yml)
-when you push a `v*` tag, or locally:
+Releases are automated by
+[`.github/workflows/release-please.yml`](.github/workflows/release-please.yml).
+Push [Conventional-Commit](https://www.conventionalcommits.org/) messages to
+`main`; [release-please](https://github.com/googleapis/release-please) keeps an
+open release PR that bumps the version and updates `CHANGELOG.md`. **Merging that
+PR** tags the version, creates the GitHub Release, and builds + uploads the DMG.
+You can still build locally:
 
 ```bash
 make dmg                          # builds Release .app → FlowTranslate.dmg
@@ -409,8 +411,9 @@ To notarize for distribution outside the App Store (optional), set
 bash Packaging/notarize.sh
 ```
 
-The release workflow uploads the DMG to a GitHub Release; if signing secrets
-(`DEVELOPER_ID_APP`, `NOTARY_PROFILE`) are configured it also notarizes.
+The release workflow uploads the DMG to the GitHub Release that release-please
+created; if signing secrets (`DEVELOPER_ID_APP`, `NOTARY_PROFILE`) are configured
+it also notarizes.
 
 ---
 
@@ -422,7 +425,7 @@ The release workflow uploads the DMG to a GitHub Release; if signing secrets
 | No microphone captions | Grant **Microphone** permission. |
 | First start sits on "Loading model…" | First run downloads the ~600 MB ASR model — wait for the progress to finish (needs network once). If interrupted, the app detects the partial download and re-fetches it automatically. |
 | Translation line empty | Apple pairs download a one-time language pack on first use. For **auto-detect** / Apple-unsupported pairs the status line shows the Qwen model loading — the second caption appears once it's ready. |
-| Captions look garbled in noise | Energy VAD filters silence; heavy background music still reduces ASR quality. |
+| Captions look garbled in noise | Silero VAD gates non-speech well, but heavy background music still reduces ASR quality. |
 | Overlay blocks clicks | Click-through is on by default; check the **Click-through** toggle in Settings. |
 
 ---

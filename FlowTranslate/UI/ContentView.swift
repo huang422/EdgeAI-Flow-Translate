@@ -31,7 +31,14 @@ struct ContentView: View {
         // Bind the main window so closing it stops the meeting + hides the overlay.
         .background(WindowAccessor { vm.bindMainWindow($0) })
         .sheet(isPresented: $showSettings) {
-            SettingsView(settings: $vm.settings)
+            SettingsView(settings: $vm.settings, vm: vm)
+        }
+        .task { vm.preflightModels() }
+        .alert("Download models?", isPresented: $vm.showModelDownloadPrompt) {
+            Button("Download") { Task { await vm.downloadAllModels() } }
+            Button("Later", role: .cancel) {}
+        } message: {
+            Text("FlowTranslate needs to download its on-device models (ASR, Silero VAD, and Qwen for translation/summary). This runs once and works offline afterwards.")
         }
     }
 

@@ -8,7 +8,7 @@ import FlowTranslateCore
 /// - **One independent pipeline per audio source.** A streaming ASR keeps
 ///   continuous acoustic state, so feeding system audio and microphone audio into
 ///   a single model corrupts it (slow / garbled / no output). Each source gets its
-///   own `StreamingNemotronMultilingualAsrManager` + VAD + utterance state.
+///   own `StreamingNemotronMultilingualAsrManager` + Silero VAD + utterance state.
 /// - **Model reuse.** The downloaded variant is cached on disk (no re-download)
 ///   and the in-memory models are kept alive across Start/Stop, so pressing Start
 ///   again does not reload them.
@@ -23,6 +23,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
     /// Reports model load/download progress (0…1) during `loadModels`.
     public var onLoadProgress: ((Double) -> Void)?
+
+    /// Called with an error message if the Silero VAD model fails to load. The
+    /// pipeline still runs (max-speech flush only) but the caller should warn.
+    public var onVadUnavailable: ((String) -> Void)?
 
     /// Called true when a model starts loading lazily, false when it's ready.
     public var onModelLoading: ((Bool) -> Void)?
@@ -119,6 +123,34 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         return size > 50_000_000   // full encoder ~538 MB; a stub is < 4 KB
     }
 
+    /// FluidAudio's on-disk model root (ASR variants + Silero VAD live here).
+    private static var fluidModels: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("FluidAudio/Models", isDirectory: true)
+    }
+
+    /// True if at least one full ASR variant is cached (so launch needs no download).
+    /// Variants live two levels deep: nemotron-multilingual/<ship>/<chunkMs>.
+    public static var asrModelPresent: Bool {
+        let base = fluidModels.appendingPathComponent("nemotron-multilingual")
+        let fm = FileManager.default
+        guard let ships = try? fm.contentsOfDirectory(at: base, includingPropertiesForKeys: nil)
+        else { return false }
+        return ships.contains { ship in
+            (try? fm.contentsOfDirectory(at: ship, includingPropertiesForKeys: nil))?
+                .contains { variantComplete($0) } ?? false
+        }
+    }
+
+    /// True if the Silero VAD CoreML model is cached.
+    public static var vadModelPresent: Bool {
+        FileManager.default.fileExists(atPath: fluidModels
+            .appendingPathComponent("silero-vad/silero-vad-unified-256ms-v6.0.0.mlmodelc").path)
+    }
+
+    /// Download the Silero VAD model now (no-op if cached). `false` on failure.
+    public func prefetchVAD() async -> Bool { await SileroEndpointer() != nil }
+
     public func startStream() async throws {
         running = true
         // Resume any models kept alive from a previous meeting (no reload).
@@ -192,6 +224,7 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
             let pipeline = SourceASR(source: source, manager: manager)
             pipeline.onEvent = { [weak self] event in self?.onEvent?(event) }
+            pipeline.onVadUnavailable = { [weak self] msg in self?.onVadUnavailable?(msg) }
             await pipeline.start()
 
             // Replay audio buffered during setup, then publish the pipeline
@@ -253,11 +286,12 @@ public enum ASRServiceError: Error {
 // MARK: - SourceASR (one streaming pipeline for a single audio source)
 
 /// Independent streaming ASR for one audio source: owns a manager, a feed stream,
-/// a consumer task, and energy-VAD utterance segmentation. Emits interim while
+/// a consumer task, and Silero-VAD utterance segmentation. Emits interim while
 /// speaking and finalized when an utterance ends.
 private final class SourceASR: @unchecked Sendable {
     let source: AudioSourceType
     var onEvent: ((TranscriptEvent) -> Void)?
+    var onVadUnavailable: ((String) -> Void)?
 
     private let manager: StreamingNemotronMultilingualAsrManager
     private var continuation: AsyncStream<AudioChunk>.Continuation?
@@ -266,17 +300,16 @@ private final class SourceASR: @unchecked Sendable {
     /// written on the main thread (`launchConsumer` / `pause` / `stop`).
     private let lock = NSLock()
 
-    // Energy-based VAD / utterance segmentation.
-    private let voiceThreshold: Float = 0.012
-    private let finalizeSilence: TimeInterval = 0.4   // finalize sooner on a pause
-    private let minUtterance: TimeInterval = 0.3
+    // Utterance segmentation: Silero VAD drives starts/endpoints; the pure
+    // Endpointer only drops sub-minSpeech blips and force-flushes at maxSpeech.
+    private var endpointer = Endpointer()
+    private var silero: SileroEndpointer?
+    private var vadWarned = false
 
     private var lastTimestamp: TimeInterval = 0
     private var utteranceStart: TimeInterval = 0
-    private var lastVoiceTime: TimeInterval = 0
     private var hasSpeech = false
-    /// Most recent partial text, used to finalize early at a sentence boundary.
-    private var lastPartial = ""
+    private var lastPartial = ""   // live partial, for terminal-punctuation close
 
     init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager) {
         self.source = source
@@ -285,6 +318,7 @@ private final class SourceASR: @unchecked Sendable {
 
     func start() async {
         await manager.reset()   // clean streaming state before the first utterance
+        await ensureSilero()
         resetState()
         await manager.setPartialCallback { [weak self] text in
             guard let self else { return }
@@ -299,6 +333,8 @@ private final class SourceASR: @unchecked Sendable {
     /// Reuse the already-loaded model for a new meeting (no reload).
     func resume() async {
         await manager.reset()
+        await ensureSilero()
+        await silero?.reset()
         resetState()
         launchConsumer()
     }
@@ -330,16 +366,20 @@ private final class SourceASR: @unchecked Sendable {
 
     private func resetState() {
         utteranceStart = 0
-        lastVoiceTime = 0
         hasSpeech = false
         lastPartial = ""
+        endpointer.reset()
     }
 
-    /// Whether the live partial already ends a sentence (terminal punctuation), so the
-    /// utterance can be finalized early instead of waiting for a silence gap.
-    private static func endsSentence(_ s: String) -> Bool {
-        guard let last = s.last else { return false }
-        return ".?!。！？…".contains(last)
+    /// Load the Silero VAD once. Fail loud: on failure warn the caller (no silent
+    /// energy fallback); the pipeline then finalizes only on the maxSpeech cap.
+    private func ensureSilero() async {
+        guard silero == nil else { return }
+        silero = await SileroEndpointer()
+        if silero == nil, !vadWarned {
+            vadWarned = true
+            onVadUnavailable?("Silero VAD unavailable — captions run in degraded mode.")
+        }
     }
 
     private func launchConsumer() {
@@ -354,23 +394,35 @@ private final class SourceASR: @unchecked Sendable {
             if Task.isCancelled { break }
             lastTimestamp = chunk.timestamp
 
-            if AudioMath.isVoiced(chunk.samples, threshold: voiceThreshold) {
-                if !hasSpeech { utteranceStart = chunk.timestamp }
-                hasSpeech = true
-                lastVoiceTime = chunk.timestamp
-            }
-
             _ = try? await manager.process(samples: chunk.samples)
 
-            // Finalize on a natural pause, OR as soon as the live partial reaches a
-            // sentence boundary (terminal punctuation) — the latter lets translation
-            // start without waiting out the full silence gap (lower latency).
-            let pausedDone = (chunk.timestamp - lastVoiceTime) >= finalizeSilence
-                && (lastVoiceTime - utteranceStart) >= minUtterance
-            let sentenceDone = Self.endsSentence(lastPartial)
-                && (chunk.timestamp - utteranceStart) >= minUtterance
-            if hasSpeech, pausedDone || sentenceDone {
-                await finalizeUtterance(at: chunk.timestamp)
+            // Silero VAD start/end events for this chunk drive segmentation. We open
+            // an utterance on a Silero start OR as soon as the ASR emits partial text
+            // (lastPartial is non-empty only within an active, unfinalized utterance).
+            // The partial-text trigger keeps the wall-clock maxSpeech firing — so
+            // captions still split — even when Silero emits no start (degraded /
+            // VAD-unavailable mode), WITHOUT opening an empty utterance during silence
+            // (which used to backdate the segment's start time). VAD end splits earlier.
+            var sawStart = false, ended = false
+            if let silero {
+                for e in await silero.events(for: chunk.samples) {
+                    if e.isStart { sawStart = true } else if e.isEnd { ended = true }
+                }
+            }
+            let started = sawStart || !lastPartial.isEmpty
+
+            let dt = Double(chunk.samples.count) / 16_000.0
+            let sentenceEnded = Endpointer.endsSentence(lastPartial)
+            for event in endpointer.process(
+                speechStarted: started, speechEnded: ended, sentenceEnded: sentenceEnded, dt: dt
+            ) {
+                switch event {
+                case .start:
+                    utteranceStart = chunk.timestamp
+                    hasSpeech = true
+                case .finalize:
+                    await finalizeUtterance(at: chunk.timestamp)
+                }
             }
         }
         await finalizeUtterance(at: lastTimestamp)
