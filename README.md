@@ -164,7 +164,7 @@ The diagram below reflects the **current implementation**:
 │  LAYER 2 . REAL-TIME ASR      (runs on the Apple Neural Engine)          │
 ├──────────────────────────────────────────────────────────────────────────┤
 │    NemotronStreamingService  --  FluidAudio . CoreML / ANE               │
-│    Silero VAD (CoreML / ANE) --> utterance segmentation                 │
+│    Silero VAD (CoreML / ANE) --> utterance segmentation                  │
 │    interim text -------------------------------> overlay line 1 (now)    │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |

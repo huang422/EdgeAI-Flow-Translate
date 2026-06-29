@@ -21,8 +21,12 @@ jobs:
       - name: Build core package
         run: swift build
 
+      # Use xcodebuild (full Xcode toolchain) rather than `swift test`: on the CI
+      # runner `swift test` loads the OLDER Command Line Tools Testing.framework at
+      # runtime and crashes with "Symbol not found … Testing". xcodebuild uses
+      # Xcode's matching swift-testing. (`make test` / swift test still works locally.)
       - name: Run core tests
-        run: make test
+        run: xcodebuild test -scheme FlowTranslateCore -destination 'platform=macOS'
 
   app-build:
     name: App build (Release)
