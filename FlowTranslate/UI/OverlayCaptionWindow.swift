@@ -687,6 +687,7 @@ final class OverlayController {
         dragMouseStart = nil
         dragOriginStart = nil
         let f = panel.frame
+        lastContentSize = f.size
         let anchor = CGPoint(x: f.midX, y: f.maxY)   // persist the top-centre anchor
         overlayAnchor = anchor
         onPositionChanged?(anchor)
