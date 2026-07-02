@@ -124,7 +124,10 @@ private extension View {
                 .inset(by: 0.5)
                 .stroke(border, lineWidth: pinned ? 1.5 : 1)
         )
-        .shadow(color: .black.opacity(0.5), radius: 22, x: 0, y: 16)
+        .shadow(color: .black.opacity(0.5), radius: 11, x: 2, y: 4)
+        .padding(.horizontal, 24)
+        .padding(.top, 8)
+        .padding(.bottom, 30)
     }
 }
 
