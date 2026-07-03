@@ -8,6 +8,25 @@ public enum PrimaryLine: String, Codable, Sendable, CaseIterable {
     case original, translation
 }
 
+/// Which backend translates the second caption when the first-caption language is
+/// a specific (non-auto) one. With `auto` first caption the app always uses the
+/// on-device Qwen model regardless of this setting (Apple can't auto-detect).
+public enum TranslationEngine: String, Codable, Sendable, CaseIterable, Identifiable {
+    /// Apple's on-device Translation framework when it supports the pair,
+    /// falling back to the Qwen model otherwise (the historical behavior).
+    case system
+    /// Always the on-device MLX Qwen model.
+    case qwen
+
+    public var id: String { rawValue }
+    public var displayName: String {
+        switch self {
+        case .system: return "Apple 系統翻譯"
+        case .qwen: return "Qwen 模型"
+        }
+    }
+}
+
 /// How the in-progress (interim) recognition line is drawn in the overlay.
 public enum InterimStyle: String, Codable, Sendable, CaseIterable {
     /// Dimmed text with a blinking caret + dotted underline (a "still typing" cue).
@@ -24,10 +43,15 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     public var secondCaptionEnabled: Bool
     /// Second caption (translation) target language: Traditional Chinese or English.
     public var secondLanguage: SecondCaptionLanguage
+    /// Which backend translates the second caption (see `TranslationEngine`).
+    public var translationEngine: TranslationEngine
     public var audioSources: Set<AudioSourceType>
     public var clickThrough: Bool
     public var asrTier: String
     public var diarizationEnabled: Bool
+    /// What the system audio is (video vs. live meeting speech) — drives the
+    /// utterance-segmentation timing (see `SegmentationTuning`).
+    public var scenario: CaptureScenario
 
     // MARK: Overlay presentation (redesign)
 
@@ -55,10 +79,12 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         firstLanguage: String = SupportedASRLanguages.default,
         secondCaptionEnabled: Bool = true,
         secondLanguage: SecondCaptionLanguage = .traditionalChinese,
+        translationEngine: TranslationEngine = .system,
         audioSources: Set<AudioSourceType> = [.system],
         clickThrough: Bool = true,
         asrTier: String = "560ms",
         diarizationEnabled: Bool = false,
+        scenario: CaptureScenario = .video,
         primaryLineOnTop: PrimaryLine = .original,
         historyLineCount: Int = 1,
         interimStyle: InterimStyle = .dimmedWithCaret,
@@ -70,10 +96,12 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.firstLanguage = firstLanguage
         self.secondCaptionEnabled = secondCaptionEnabled
         self.secondLanguage = secondLanguage
+        self.translationEngine = translationEngine
         self.audioSources = audioSources
         self.clickThrough = clickThrough
         self.asrTier = asrTier
         self.diarizationEnabled = diarizationEnabled
+        self.scenario = scenario
         self.primaryLineOnTop = primaryLineOnTop
         self.historyLineCount = max(0, min(2, historyLineCount))
         self.interimStyle = interimStyle
@@ -93,10 +121,12 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         firstLanguage = try c.decodeIfPresent(String.self, forKey: .firstLanguage) ?? d.firstLanguage
         secondCaptionEnabled = try c.decodeIfPresent(Bool.self, forKey: .secondCaptionEnabled) ?? d.secondCaptionEnabled
         secondLanguage = try c.decodeIfPresent(SecondCaptionLanguage.self, forKey: .secondLanguage) ?? d.secondLanguage
+        translationEngine = try c.decodeIfPresent(TranslationEngine.self, forKey: .translationEngine) ?? d.translationEngine
         audioSources = try c.decodeIfPresent(Set<AudioSourceType>.self, forKey: .audioSources) ?? d.audioSources
         clickThrough = try c.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? d.clickThrough
         asrTier = try c.decodeIfPresent(String.self, forKey: .asrTier) ?? d.asrTier
         diarizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? d.diarizationEnabled
+        scenario = try c.decodeIfPresent(CaptureScenario.self, forKey: .scenario) ?? d.scenario
         primaryLineOnTop = try c.decodeIfPresent(PrimaryLine.self, forKey: .primaryLineOnTop) ?? d.primaryLineOnTop
         historyLineCount = max(0, min(2, try c.decodeIfPresent(Int.self, forKey: .historyLineCount) ?? d.historyLineCount))
         interimStyle = try c.decodeIfPresent(InterimStyle.self, forKey: .interimStyle) ?? d.interimStyle

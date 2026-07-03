@@ -48,4 +48,23 @@ import Foundation
             CaptionSettings.self, from: JSONEncoder().encode(s))
         #expect(back.autoCloseOverlayOnStop == true)
     }
+
+    @Test func translationEngineDefaultsToSystem() {
+        #expect(CaptionSettings.default.translationEngine == .system)
+    }
+
+    @Test func tolerantDecodeMissingEngineDefaultsToSystem() throws {
+        // Older persisted JSON (no engine key) upgrades cleanly to the system engine.
+        let json = Data(#"{"firstLanguage":"en-US"}"#.utf8)
+        let s = try JSONDecoder().decode(CaptionSettings.self, from: json)
+        #expect(s.translationEngine == .system)
+    }
+
+    @Test func roundTripPreservesQwenEngine() throws {
+        var s = CaptionSettings.default
+        s.translationEngine = .qwen
+        let back = try JSONDecoder().decode(
+            CaptionSettings.self, from: JSONEncoder().encode(s))
+        #expect(back.translationEngine == .qwen)
+    }
 }

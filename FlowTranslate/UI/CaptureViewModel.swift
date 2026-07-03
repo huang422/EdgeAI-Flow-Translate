@@ -69,10 +69,13 @@ final class CaptureViewModel: ObservableObject {
     /// summary — loaded into memory at most once.
     private let qwenHost = QwenModelHost()
     private lazy var mlxTranslator = MLXTranslator(host: qwenHost)
-    /// Rolling source-sentence context for the on-device Qwen translator so the
-    /// second caption stays coherent across lines (pronouns, recurring terms).
-    /// Reset at the start of each session and when the language pair changes.
-    private let mlxContext = ContextBuffer(capacity: 3)
+    /// Rolling bilingual context (source→translation pairs) for the on-device Qwen
+    /// translator so the second caption stays coherent across lines (pronouns,
+    /// recurring terms translated the same way). Reset at the start of each
+    /// session and when the language pair changes. Capacity covers the maximum
+    /// in-flight depth (1 running + 3 queued) so waiting sentences keep their
+    /// preceding pairs; the prompt itself only uses the last two entries.
+    private let mlxContext = BilingualContextBuffer(capacity: 5)
 
     // In-flight on-device (Qwen/MLX) translations, keyed by sentence id. Tracked so
     // `endMeeting()` can wait for any running GPU generation to finish BEFORE the
@@ -81,6 +84,17 @@ final class CaptureViewModel: ObservableObject {
     // Translations` gates new ones so none can start once the meeting is stopping.
     private var inflightTranslations: [UUID: Task<Void, Never>] = [:]
     private var acceptingTranslations = true
+
+    // Bounded Qwen translation queue: the model generates ONE sentence at a time,
+    // so during fast speech sentences would otherwise pile up and the second
+    // caption would drift ever further behind the audio. At most one sentence runs
+    // on the GPU and up to `mlxQueueLimit` wait; beyond that the OLDEST waiting
+    // sentence is dropped (its line simply keeps the source text — that caption
+    // has usually scrolled away anyway). Freshness beats completeness here.
+    private struct PendingMLXSentence { let id: UUID; let text: String }
+    private var mlxQueue: [PendingMLXSentence] = []
+    private var mlxRunning = false
+    private let mlxQueueLimit = 3
 
     // Echo suppression: when system audio is playing through speakers, the mic
     // mostly hears that same audio → skip mic input to avoid garbled double
@@ -102,8 +116,10 @@ final class CaptureViewModel: ObservableObject {
 
     /// Free the Qwen model from **memory** and reset its load state. The disk
     /// prefetch is intentionally left running — the summary needs those files even
-    /// after translation switches to Apple or the meeting ends.
+    /// after translation switches to Apple or the meeting ends. Waiting queued
+    /// sentences are dropped (they belonged to the previous backend/session).
     private func unloadQwen() {
+        mlxQueue.removeAll()
         qwenHost.unload()         // frees the container + returns the MLX cache to the OS
         qwenLoadTask?.cancel(); qwenLoadTask = nil
     }
@@ -111,6 +127,7 @@ final class CaptureViewModel: ObservableObject {
     /// Cancel and await every in-flight on-device translation so no GPU generation
     /// is still running when the Qwen model is unloaded and its MLX cache cleared.
     private func drainInflightTranslations() async {
+        mlxQueue.removeAll()
         let tasks = Array(inflightTranslations.values)
         inflightTranslations.removeAll()
         for t in tasks { t.cancel() }
@@ -350,13 +367,18 @@ final class CaptureViewModel: ObservableObject {
         }
 
         // Choose the backend. Apple needs a KNOWN source: for "auto" it can't,
-        // and pops up a system "choose a language" sheet, so auto always uses the
-        // on-device Qwen model. A specific language uses Apple when it supports the
-        // pair (covers most languages on macOS 26), else falls back to Qwen.
+        // and pops up a system "choose a language" sheet, so auto ALWAYS uses the
+        // on-device Qwen model (regardless of the engine setting). For a specific
+        // language the engine setting decides: `.qwen` forces the Qwen model;
+        // `.system` uses Apple when it supports the pair (covers most languages
+        // on macOS 26), else falls back to Qwen.
         let srcName: String
         let useQwen: Bool
         if settings.firstLanguage == "auto" {
             srcName = "自動偵測"
+            useQwen = true
+        } else if settings.translationEngine == .qwen {
+            srcName = settings.firstLanguage
             useQwen = true
         } else {
             srcName = settings.firstLanguage
@@ -378,9 +400,11 @@ final class CaptureViewModel: ObservableObject {
         // disk at meeting Start). Never loaded at app launch / while idle.
         translation.enabled = false
         translationMethod = .mlx
+        let engineNote = settings.translationEngine == .qwen && settings.firstLanguage != "auto"
+            ? "（手動指定）" : ""
         translationStatus = qwenHost.isLoaded
-            ? "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
-            : "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（首次翻譯時載入）"
+            ? "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯\(engineNote)（已載入）"
+            : "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯\(engineNote)（首次翻譯時載入）"
     }
 
     /// Route one finalized sentence to the active translation backend.
@@ -393,27 +417,64 @@ final class CaptureViewModel: ObservableObject {
             // one could run while the model is being unloaded (clearCache crash) or
             // reload the whole 2.5 GB model after we just freed it.
             guard acceptingTranslations else { return }
-            let target = settings.secondLanguage.modelTargetName   // exactly the selected language
-            let srcName = settings.firstLanguage == "auto" ? "自動偵測" : settings.firstLanguage
-            let tgtName = settings.secondLanguage.displayName
-            // Snapshot the preceding sentences as context, then record this one for
-            // the next translation (keeps the second caption coherent across lines).
-            let context = mlxContext.recent
-            mlxContext.append(text)
-            let task = Task { [weak self] in
-                guard let self else { return }
-                // Always deregister this task, even on early return / cancellation.
-                defer { self.inflightTranslations[id] = nil }
-                // Load the model into memory on first use (already on disk from Start).
-                guard await self.ensureQwenReady(srcName: srcName, tgtName: tgtName) else { return }
-                guard !Task.isCancelled else { return }
-                guard let translated = await self.mlxTranslator.translate(text, target: target, context: context) else { return }
-                self.applyTranslation(id: id, chinese: translated)
+            // Common short utterances ("Okay.", "Can you hear me?") are answered
+            // instantly from a lookup table — 0 ms, no GPU, no queue slot — and
+            // still recorded as context for the following sentences.
+            if let instant = InstantPhraseTranslations.lookup(text, target: settings.secondLanguage) {
+                mlxContext.append(id: id, source: text)
+                applyTranslation(id: id, chinese: instant)
+                return
             }
-            inflightTranslations[id] = task
+            // Record the sentence for future context, enqueue it, and bound the
+            // queue by dropping the oldest waiting sentence (freshness first).
+            mlxContext.append(id: id, source: text)
+            mlxQueue.append(PendingMLXSentence(id: id, text: text))
+            if mlxQueue.count > mlxQueueLimit {
+                mlxQueue.removeFirst(mlxQueue.count - mlxQueueLimit)
+            }
+            pumpMLXQueue()
         case .none:
             break
         }
+    }
+
+    /// Start the next queued Qwen translation if the GPU is free. Exactly one
+    /// generation runs at a time; each completion pumps the next, so the queue
+    /// drains in order and `drainInflightTranslations()` only ever has to await
+    /// a single running task.
+    private func pumpMLXQueue() {
+        guard !mlxRunning, acceptingTranslations, translationMethod == .mlx,
+              !mlxQueue.isEmpty else { return }
+        let next = mlxQueue.removeFirst()
+        mlxRunning = true
+        let target = settings.secondLanguage                   // the selected language
+        let srcName = settings.firstLanguage == "auto" ? "自動偵測" : settings.firstLanguage
+        let tgtName = settings.secondLanguage.displayName
+        // Context = the sentences BEFORE this one (with any translations that have
+        // already come back). Taken at dequeue time so it's as complete as possible.
+        let recent = mlxContext.recent
+        let context: [BilingualContextBuffer.Entry]
+        if let idx = recent.firstIndex(where: { $0.id == next.id }) {
+            context = Array(recent[..<idx])
+        } else {
+            context = []   // evicted from the buffer while waiting (rare)
+        }
+        let task = Task { [weak self] in
+            guard let self else { return }
+            // Always deregister and pump the next sentence, even on early return.
+            defer {
+                self.inflightTranslations[next.id] = nil
+                self.mlxRunning = false
+                self.pumpMLXQueue()
+            }
+            // Load the model into memory on first use (already on disk from Start).
+            guard await self.ensureQwenReady(srcName: srcName, tgtName: tgtName) else { return }
+            guard !Task.isCancelled else { return }
+            guard let translated = await self.mlxTranslator.translate(
+                next.text, target: target, context: context) else { return }
+            self.applyTranslation(id: next.id, chinese: translated)
+        }
+        inflightTranslations[next.id] = task
     }
 
     // MARK: - ASR events
@@ -502,6 +563,9 @@ final class CaptureViewModel: ObservableObject {
         if let i = lines.firstIndex(where: { $0.id == id }) {
             lines[i].chinese = chinese
         }
+        // Back-fill the bilingual context so the NEXT Qwen translation sees this
+        // source→translation pair (no-op for Apple-translated / evicted lines).
+        mlxContext.setTranslation(chinese, for: id)
         store.updateTranslation(segmentId: id, translated: chinese)
         syncOverlay()
     }
@@ -572,6 +636,7 @@ final class CaptureViewModel: ObservableObject {
         lastInterimTranslateAt = .distantPast
         interimChinese = ""
         mlxContext.reset()
+        mlxQueue.removeAll()
     }
 
     // MARK: - Recognition / meeting lifecycle
@@ -584,8 +649,10 @@ final class CaptureViewModel: ObservableObject {
             // Start the Qwen download now (in parallel with the ASR model download),
             // both triggered by the "Start meeting" button.
             prefetchQwen()
-            // Apply the selected first-caption language before loading the model.
+            // Apply the selected first-caption language and scenario (video vs.
+            // meeting segmentation timing) before loading the model.
             asr.currentLanguage = settings.firstLanguage
+            asr.scenario = settings.scenario
             asr.onLoadProgress = { [weak self] p in
                 Task { @MainActor in self?.statusMessage = "Loading model… \(Int(p * 100))%" }
             }
@@ -644,16 +711,37 @@ final class CaptureViewModel: ObservableObject {
         statusMessage = modelsPresent ? "Models ready" : "Some models still missing"
     }
 
-    /// Delete every downloaded model + app data, move the app to the Trash, and quit.
+    /// Delete every downloaded model + app data, remove the app's privacy (TCC)
+    /// entries so a reinstall prompts fresh instead of hitting a stale toggle,
+    /// move the app to the Trash, and quit.
     func uninstall() {
         let fm = FileManager.default
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         for dir in ["FluidAudio", "FlowTranslate"] {
             try? fm.removeItem(at: appSupport.appendingPathComponent(dir, isDirectory: true))
         }
-        UserDefaults.standard.removeObject(forKey: "FlowTranslate.CaptionSettings")
+        if let bundleId = Bundle.main.bundleIdentifier {
+            UserDefaults.standard.removePersistentDomain(forName: bundleId)
+        } else {
+            UserDefaults.standard.removeObject(forKey: "FlowTranslate.CaptionSettings")
+        }
+        Permissions.resetPrivacyPermissions()
         try? fm.trashItem(at: Bundle.main.bundleURL, resultingItemURL: nil)
         NSApplication.shared.terminate(nil)
+    }
+
+    /// Manually clear this app's Microphone / Screen Recording privacy entries
+    /// (Settings → Maintenance). Fixes the stale-permission state after replacing
+    /// the app with a new build: the Privacy toggle looks ON but capture fails
+    /// until the old entry is removed. Stops active sources first, since their
+    /// grants are being revoked.
+    func resetPrivacyPermissions() async {
+        if micEnabled { await toggleMic() }
+        if systemEnabled { await toggleSystem() }
+        let ok = Permissions.resetPrivacyPermissions()
+        statusMessage = ok
+            ? "已重設權限 Permissions reset · Relaunch the app; enabling a source will ask again"
+            : "重設失敗 Reset failed · Run manually: tccutil reset Microphone / ScreenCapture"
     }
 
     func endMeeting() async {
@@ -813,7 +901,8 @@ final class CaptureViewModel: ObservableObject {
         // Let the user choose where to save (NSSavePanel), defaulting to a
         // timestamped Markdown file.
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "FlowTranslate-\(Int(Date().timeIntervalSince1970)).md"
+        let stamp = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"; return f.string(from: Date()) }()
+        panel.nameFieldStringValue = "FlowTranslate-\(stamp).md"
         panel.canCreateDirectories = true
         panel.title = "匯出逐字稿 Export transcript"
         if let md = UTType(filenameExtension: "md") {
@@ -863,7 +952,12 @@ final class CaptureViewModel: ObservableObject {
             router.disable(.system); systemEnabled = false; systemSourceOn = false; systemLevel = 0
         } else {
             guard await Permissions.requestScreenRecording() else {
-                statusMessage = "Screen Recording permission needed (System Settings > Privacy)"; return
+                // Also covers a stale grant after reinstall (toggle ON but capture
+                // fails) — Settings → Maintenance → Reset permissions fixes that.
+                statusMessage = "需要螢幕錄製權限 Screen Recording permission needed · "
+                    + "If the toggle is already ON, use 設定 Settings → Reset permissions"
+                Permissions.openScreenRecordingSettings()
+                return
             }
             do { try await router.enable(.system); systemEnabled = true; systemSourceOn = true }
             catch { statusMessage = "Failed to start system audio: \(error)" }

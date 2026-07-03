@@ -9,7 +9,7 @@ import FlowTranslateCore
 /// events directly. Runs on the ANE; `nil` on load failure (caller fails loud).
 actor SileroEndpointer {
     private let vad: VadManager
-    private let segConfig: VadSegmentationConfig
+    private var segConfig: VadSegmentationConfig
     private var stream: VadStreamState
     private var buffer: [Float] = []
     private static let frame = VadManager.chunkSize   // 4096 samples (256 ms @16k)
@@ -19,8 +19,9 @@ actor SileroEndpointer {
     private(set) var inferenceFailures = 0
 
     /// Loads the VAD model (downloads on first run). `nil` on failure → fail loud.
-    /// Enter threshold 0.5, exit 0.35 (0.15 hysteresis), 250 ms trailing silence.
-    init?(progress: ((Double) -> Void)? = nil) async {
+    /// Enter threshold 0.5, exit 0.35 (0.15 hysteresis); trailing silence comes
+    /// from the scenario tuning (video 0.30 s / meeting 0.80 s).
+    init?(tuning: SegmentationTuning = .video, progress: ((Double) -> Void)? = nil) async {
         do {
             vad = try await VadManager(
                 config: VadConfig(defaultThreshold: 0.5, computeUnits: .cpuAndNeuralEngine),
@@ -28,9 +29,20 @@ actor SileroEndpointer {
         } catch {
             return nil
         }
-        segConfig = VadSegmentationConfig(
-            minSilenceDuration: 0.25, maxSpeechDuration: 8, negativeThresholdOffset: 0.15)
+        segConfig = Self.segmentationConfig(for: tuning)
         stream = await vad.makeStreamState()
+    }
+
+    private static func segmentationConfig(for tuning: SegmentationTuning) -> VadSegmentationConfig {
+        VadSegmentationConfig(
+            minSilenceDuration: tuning.minSilence,
+            maxSpeechDuration: tuning.maxSpeech,
+            negativeThresholdOffset: 0.15)
+    }
+
+    /// Swap the segmentation timing (scenario change between meetings).
+    func apply(tuning: SegmentationTuning) {
+        segConfig = Self.segmentationConfig(for: tuning)
     }
 
     /// Drop buffered audio + LSTM state between utterances/meetings.

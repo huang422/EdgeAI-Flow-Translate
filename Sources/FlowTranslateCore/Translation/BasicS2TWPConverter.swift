@@ -3,10 +3,11 @@ import Foundation
 /// Lightweight Simplified → Traditional Chinese converter with a small set of
 /// Taiwan-preferred phrase substitutions (an `s2twp`-style fallback).
 ///
-/// This is intentionally dependency-free and covers only common terms; it is a
-/// fallback for offline/edge cases. In the App the primary path uses Apple's
-/// on-device Translation framework, which already targets `zh-Hant` directly.
-/// A full OpenCC dictionary can be dropped in later behind the same protocol.
+/// Phrase substitutions (Taiwan vocabulary) run first, then the remaining text
+/// is converted with the system ICU `Hans-Hant` transliterator — dependency-free
+/// (Foundation) and context-aware for one-to-many characters (头发→頭髮,
+/// 干杯→乾杯, 里面→裡面). The small character table remains as a fallback in
+/// case the ICU transform is unavailable.
 public struct BasicS2TWPConverter: SimplifiedToTraditionalConverting {
     public init() {}
 
@@ -16,7 +17,11 @@ public struct BasicS2TWPConverter: SimplifiedToTraditionalConverting {
         for (simplified, traditional) in Self.phrases {
             result = result.replacingOccurrences(of: simplified, with: traditional)
         }
-        // Then character-level mapping for anything left.
+        // Then the ICU script conversion for everything left.
+        if let transformed = result.applyingTransform(StringTransform("Hans-Hant"), reverse: false) {
+            return transformed
+        }
+        // Fallback: character-level mapping.
         var out = String()
         out.reserveCapacity(result.count)
         for ch in result {

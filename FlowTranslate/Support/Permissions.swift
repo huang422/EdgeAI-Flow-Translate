@@ -45,4 +45,46 @@ public enum Permissions {
     public static func requestScreenRecording() async -> Bool {
         await screenRecordingAuthorized()
     }
+
+    /// Open System Settings → Privacy & Security → Screen Recording.
+    public static func openScreenRecordingSettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    // MARK: - TCC reset (stale entries after reinstall)
+
+    /// The TCC privacy services this app uses.
+    private static let tccServices = ["Microphone", "ScreenCapture"]
+
+    /// Remove this app's Microphone / Screen Recording privacy entries so the
+    /// next launch prompts fresh (`tccutil reset <service> <bundle-id>`).
+    ///
+    /// Why: macOS keys a TCC grant to the app's code signature. A rebuilt
+    /// unsigned/ad-hoc build no longer matches the old entry, so after a
+    /// reinstall the Privacy toggle looks ON but the permission silently fails,
+    /// and the user has to delete the entry by hand. Resetting at uninstall (and
+    /// on demand from Settings) means a fresh install just prompts again.
+    /// `tccutil` only deletes entries — it can never grant anything.
+    @discardableResult
+    public static func resetPrivacyPermissions() -> Bool {
+        guard let bundleId = Bundle.main.bundleIdentifier else { return false }
+        var allSucceeded = true
+        for service in tccServices {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+            process.arguments = ["reset", service, bundleId]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                process.waitUntilExit()
+                allSucceeded = allSucceeded && process.terminationStatus == 0
+            } catch {
+                allSucceeded = false
+            }
+        }
+        return allSucceeded
+    }
 }

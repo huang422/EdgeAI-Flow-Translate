@@ -21,6 +21,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// First-caption language hint (Nemotron locale, e.g. "en-US", or "auto").
     public var currentLanguage: String = SupportedASRLanguages.default
 
+    /// What the system audio is (video vs. live meeting speech). Applied to each
+    /// source pipeline at start/resume; the microphone always uses the meeting
+    /// profile (see `SegmentationTuning.forSource`).
+    public var scenario: CaptureScenario = .video
+
     /// Reports model load/download progress (0…1) during `loadModels`.
     public var onLoadProgress: ((Double) -> Void)?
 
@@ -153,9 +158,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
     public func startStream() async throws {
         running = true
-        // Resume any models kept alive from a previous meeting (no reload).
+        // Resume any models kept alive from a previous meeting (no reload),
+        // re-applying the current scenario's segmentation timing.
         let existing = lock.withLock { Array(pipelines.values) }
-        for p in existing { await p.resume() }
+        for p in existing { await p.resume(tuning: .forSource(p.source, scenario: scenario)) }
         // Otherwise preload one model in the background so it's ready by the
         // time the user speaks (reduces first-caption delay).
         if existing.isEmpty { startBackgroundPreload() }
@@ -222,7 +228,9 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
                 return
             }
 
-            let pipeline = SourceASR(source: source, manager: manager)
+            let pipeline = SourceASR(
+                source: source, manager: manager,
+                tuning: .forSource(source, scenario: self.scenario))
             pipeline.onEvent = { [weak self] event in self?.onEvent?(event) }
             pipeline.onVadUnavailable = { [weak self] msg in self?.onVadUnavailable?(msg) }
             await pipeline.start()
@@ -302,7 +310,9 @@ private final class SourceASR: @unchecked Sendable {
 
     // Utterance segmentation: Silero VAD drives starts/endpoints; the pure
     // Endpointer only drops sub-minSpeech blips and force-flushes at maxSpeech.
-    private var endpointer = Endpointer()
+    // Timing comes from the scenario tuning (video vs. meeting; mic = meeting).
+    private var tuning: SegmentationTuning
+    private var endpointer: Endpointer
     private var silero: SileroEndpointer?
     private var vadWarned = false
 
@@ -311,9 +321,13 @@ private final class SourceASR: @unchecked Sendable {
     private var hasSpeech = false
     private var lastPartial = ""   // live partial, for terminal-punctuation close
 
-    init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager) {
+    init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager,
+         tuning: SegmentationTuning) {
         self.source = source
         self.manager = manager
+        self.tuning = tuning
+        self.endpointer = Endpointer(
+            config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech))
     }
 
     func start() async {
@@ -330,10 +344,15 @@ private final class SourceASR: @unchecked Sendable {
         launchConsumer()
     }
 
-    /// Reuse the already-loaded model for a new meeting (no reload).
-    func resume() async {
+    /// Reuse the already-loaded model for a new meeting (no reload), applying the
+    /// segmentation timing for the (possibly changed) scenario.
+    func resume(tuning: SegmentationTuning) async {
+        self.tuning = tuning
+        endpointer = Endpointer(
+            config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech))
         await manager.reset()
         await ensureSilero()
+        await silero?.apply(tuning: tuning)
         await silero?.reset()
         resetState()
         launchConsumer()
@@ -375,7 +394,7 @@ private final class SourceASR: @unchecked Sendable {
     /// energy fallback); the pipeline then finalizes only on the maxSpeech cap.
     private func ensureSilero() async {
         guard silero == nil else { return }
-        silero = await SileroEndpointer()
+        silero = await SileroEndpointer(tuning: tuning)
         if silero == nil, !vadWarned {
             vadWarned = true
             onVadUnavailable?("Silero VAD unavailable — captions run in degraded mode.")

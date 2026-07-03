@@ -15,8 +15,47 @@ struct SettingsView: View {
                 set: { settings.historyLineCount = max(0, min(2, $0 - 1)) })
     }
 
+    /// Explains the active translation-engine behavior for the current settings.
+    private var engineHint: String {
+        if settings.firstLanguage == "auto" {
+            return "Auto-detect always uses the on-device Qwen model "
+                + "(Apple Translation can't auto-detect the source language)."
+        }
+        switch settings.translationEngine {
+        case .system:
+            return "Prefers Apple's on-device translation (fastest); unsupported "
+                + "language pairs automatically fall back to the Qwen model."
+        case .qwen:
+            return "Always uses the on-device Qwen model (context-aware quality; "
+                + "loads into memory on the first translation)."
+        }
+    }
+
+    /// Explains the segmentation trade-off of the selected scenario. The mic is
+    /// always live speech, so it always uses the meeting timing.
+    private var scenarioHint: String {
+        switch settings.scenario {
+        case .video:
+            return "Edited content (videos, courses): sentences split after a 0.3 s pause "
+                + "for snappier captions. Applies on the next Start; the mic always uses meeting timing."
+        case .meeting:
+            return "Live speakers: tolerates 0.8 s thinking pauses so sentences aren't cut in half. "
+                + "Applies on the next Start; the mic always uses meeting timing."
+        }
+    }
+
     var body: some View {
         Form {
+            Section("使用情境 Scenario") {
+                Picker(selection: $settings.scenario) {
+                    Text("🎬 Video").tag(CaptureScenario.video)
+                    Text("👥 Meeting").tag(CaptureScenario.meeting)
+                } label: { Text("系統聲的內容 System audio is") }
+                .pickerStyle(.segmented)
+                Text(scenarioHint)
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section("辨識 Recognition") {
                 Picker("第一字幕（Original）", selection: $settings.firstLanguage) {
                     Text("自動偵測 / 混合語言 Auto").tag("auto")
@@ -39,6 +78,14 @@ struct SettingsView: View {
                     }
                 }
                 .disabled(!settings.secondCaptionEnabled)
+                Picker("翻譯引擎 Engine", selection: $settings.translationEngine) {
+                    ForEach(TranslationEngine.allCases) { engine in
+                        Text(engine.displayName).tag(engine)
+                    }
+                }
+                .disabled(!settings.secondCaptionEnabled || settings.firstLanguage == "auto")
+                Text(engineHint)
+                    .font(.caption).foregroundStyle(.secondary)
             }
 
             Section("懸浮字幕 Overlay") {
@@ -99,16 +146,24 @@ struct SettingsView: View {
                 }
             }
             Section("維護 Maintenance") {
+                VStack(alignment: .leading, spacing: 3) {
+                    Button("重設權限 Reset permissions") {
+                        Task { await vm.resetPrivacyPermissions() }
+                        dismiss()
+                    }
+                    Text("Clears this app's Microphone / Screen Recording privacy entries. Use after replacing the app when the toggles look ON but capture fails.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Button("解除安裝 Uninstall") { confirmUninstall = true }
             }
         }
         .formStyle(.grouped)
-        .frame(width: 480, height: 560)
+        .frame(width: 480, height: 620)
         .confirmationDialog("解除安裝 FlowTranslate？", isPresented: $confirmUninstall, titleVisibility: .visible) {
             Button("移到垃圾桶並刪除模型 Uninstall") { vm.uninstall() }
             Button("取消 Cancel", role: .cancel) {}
         } message: {
-            Text("移除下載的模型、逐字稿與設定，並把 App 移到垃圾桶後結束。")
+            Text("移除下載的模型、逐字稿、設定與隱私權限記錄，並把 App 移到垃圾桶後結束。Removes downloaded models, transcripts, settings and the app's privacy-permission entries, then moves the app to the Trash.")
         }
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {

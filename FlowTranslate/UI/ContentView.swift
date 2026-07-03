@@ -162,6 +162,9 @@ struct ContentView: View {
     private var languageChip: some View {
         Button { showSettings = true } label: {
             HStack(spacing: 8) {
+                Text(vm.settings.scenario == .video ? "🎬 Video" : "👥 Meeting")
+                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)
+                Rectangle().fill(.white.opacity(0.12)).frame(width: 1, height: 12)
                 Text("翻譯").font(.system(size: 12)).foregroundStyle(CaptionTheme.Palette.inkSecondary)
                 Text(vm.settings.firstLanguage == "auto" ? "自動偵測" : vm.settings.firstLanguage)
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)

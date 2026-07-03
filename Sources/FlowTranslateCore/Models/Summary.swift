@@ -58,7 +58,7 @@ public struct Summary: Identifiable, Codable, Sendable, Equatable {
         qa: [QAPair] = [],
         glossary: [GlossaryTerm] = [],
         generatedAt: Date = Date(),
-        modelName: String = "qwen3.5-4b-4bit"
+        modelName: String = "on-device"
     ) {
         self.id = id
         self.sessionId = sessionId

@@ -40,6 +40,13 @@ sleep 1
 echo "==> Removing old version at $DEST (if any)"
 rm -rf "$DEST"
 
+# TCC keys privacy grants to the app's code signature. Each unsigned rebuild has
+# a new signature, so the old Microphone / Screen Recording entries go stale
+# (toggle looks ON but capture fails). Reset them so the new build prompts fresh.
+echo "==> Resetting stale privacy (TCC) entries"
+tccutil reset Microphone dev.flowtranslate.app 2>/dev/null || true
+tccutil reset ScreenCapture dev.flowtranslate.app 2>/dev/null || true
+
 echo "==> Installing new version"
 cp -R "$APP" "$DEST"
 

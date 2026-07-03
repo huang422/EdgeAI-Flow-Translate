@@ -18,7 +18,7 @@ bilingual transcript and an end-of-meeting summary. **Everything runs on-device*
 the only network access is a one-time model download.
 
 - **Speech recognition** with NVIDIA **Nemotron‑3.5 Streaming ASR — Multilingual (0.6B)** on the Apple Neural Engine (via [FluidAudio](https://github.com/FluidInference/FluidAudio)). Pick a language or use **Auto** for per-sentence detection / mixed-language audio.
-- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A specific source language Apple supports uses Apple's on-device **Translation** framework; **auto-detect** and Apple-unsupported pairs use the on-device **MLX Qwen3-4B-Instruct-2507** model (non-thinking, for speed).
+- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A selectable **translation engine**: **Apple 系統翻譯** (Apple's on-device **Translation** framework when it supports the pair, Qwen fallback otherwise — default) or **Qwen 模型** (always the on-device **MLX Qwen3-4B-Instruct-2507**, non-thinking, with bilingual rolling context for consistent terminology). **Auto-detect** first caption always uses Qwen (Apple can't auto-detect a source). The Qwen path is tuned for real time: a bounded queue keeps the newest sentences fresh, common short phrases ("Okay.", "Can you hear me?") translate instantly from a lookup table, and a Traditional-Chinese guard fixes rare Simplified-character leakage and Mainland-only terms (視頻→影片).
 - **Floating, click-through caption overlay** — a stacked list of caption units (English original on top, translation below, with a source-colour dot), the in-progress line shown live with a blinking caret; newest line brightest, older ones dimmed. Hover reveals a control bar (drag, pin/pause, copy, font size, reset). It stays on top of full-screen meetings/videos and only the control bar is interactive, so clicks pass straight through to the app behind.
 - **System audio _and_ microphone**, captured separately and tagged per source. While system audio is playing, mic echo is suppressed so the same speech isn't transcribed twice.
 - **Full bilingual transcript**, persisted to disk (crash-safe) and exportable to Markdown / TXT / SRT / VTT / JSON.
@@ -66,7 +66,7 @@ the only network access is a one-time model download.
    - **Microphone** — to caption your own voice.
    - **Screen Recording** — required by macOS to capture *system* audio (the other side of a call, or a video). Toggle it on in **System Settings → Privacy & Security → Screen Recording**, then relaunch.
 4. On first launch FlowTranslate checks for its models and, if any are missing, offers to **download them up front** — the ASR model (~600 MB), the Silero VAD model (~1 MB, neural speech endpointing) and the Qwen model (~2.5 GB, for auto/unsupported-language translation and the summary). **Let them finish** (progress is shown); the ASR + VAD models cache under `~/Library/Application Support/FluidAudio/` and Qwen under `~/Library/Application Support/FlowTranslate/`, so later runs work fully offline. Interrupted downloads resume — already-fetched files are skipped (verified by size).
-5. Choose an audio source (**System** for meetings/videos, **Mic** for your voice, or both), press **Start**, and toggle **Overlay** to float the captions on screen. To remove everything later, open **Settings → Maintenance → Uninstall**.
+5. Choose an audio source (**System** for meetings/videos, **Mic** for your voice, or both), press **Start**, and toggle **Overlay** to float the captions on screen. To remove everything later, open **Settings → Maintenance → Uninstall** — it also clears the app's Microphone / Screen Recording privacy entries, so a future reinstall prompts cleanly.
 
 No terminal required.
 
@@ -251,7 +251,7 @@ sequenceDiagram
     R->>S: AudioChunk
     S->>S: Silero VAD + append/process
     S-->>O: interim text (line 1, immediate)
-    Note over S: silence > 0.35s / sentence end ⇒ finalize
+    Note over S: silence > 0.3s (video) / 0.8s (meeting) or sentence end ⇒ finalize
     S->>C: finalized segment
     C->>O: cleaned text (line 1)
     C->>D: append TranscriptSegment (persisted)
@@ -284,8 +284,8 @@ per task rather than putting everything on MLX:
 | Task | Model | Runtime / accelerator | Rationale |
 |------|-------|-----------------------|-----------|
 | Real-time ASR | Nemotron‑3.5 Streaming 0.6B | **CoreML on the ANE** (FluidAudio) | Always-on streaming wants low **power** + low **memory** and must **leave the GPU free** for the meeting app and (later) the summarizer. The ANE delivers that. |
-| Translation (supported pair) | Apple Translation | System framework (on-device) | Zero model management, no extra memory. |
-| Translation (auto / unsupported) | **Qwen3-4B-Instruct-2507 (4-bit)** | **MLX on the GPU**, non-thinking | Apple needs a known source; auto-detect and unsupported pairs use the on-device Qwen model so the second caption still works in real time. |
+| Translation (system engine, supported pair) | Apple Translation | System framework (on-device) | Zero model management, no extra memory. |
+| Translation (auto / unsupported / Qwen engine) | **Qwen3-4B-Instruct-2507 (4-bit)** | **MLX on the GPU**, non-thinking | Apple needs a known source; auto-detect, unsupported pairs and the user-selected Qwen engine use the on-device model. Real-time is protected by a bounded queue (drop-oldest), an instant-phrase lookup table, and input-scaled decode caps; zh-Hant output gets a script/terminology guard (ICU `Hans-Hant` + Taiwan terms). |
 | Meeting summary | **Qwen3-4B-Instruct-2507 (4-bit)** | **MLX on the GPU**, non-thinking, loaded on demand, freed after | A one-shot, non-real-time batch job — exactly where MLX/GPU throughput pays off. |
 
 > **Is the `mlx-community` Nemotron faster?** That model is the *same* NVIDIA
@@ -316,9 +316,10 @@ at many GB after a meeting or a translation-backend switch.
 
 Open the **gear icon** in the top-right. Preferences are persisted automatically.
 
+- **Scenario** — what the *system audio* is: **🎬 Video** (edited content: sentences finalize after a 0.3 s pause, snappier captions) or **👥 Meeting** (live speakers: tolerates 0.8 s thinking pauses so sentences aren't cut in half; longer max turn). The microphone is always a live human, so it always uses the meeting timing. Values follow streaming-caption practice (Azure ~0.5 s segmentation default, AssemblyAI 0.7 s + longer for conversations, Deepgram ≥1 s utterance ends) and pause research: edited/read speech pauses 0.15–0.5 s at sentence boundaries only, while spontaneous speech hesitates 0.5–1.5 s mid-sentence. Applies on the next **Start**.
 - **First caption (recognition) language** — any of Nemotron's 32 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`.
 - **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (more accurate).
-- **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**. A status line shows the active source → target and whether it's using Apple or the Qwen model (with live load progress).
+- **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**; engine **Apple 系統翻譯** (fastest, Qwen fallback for unsupported pairs) or **Qwen 模型** (context-aware quality; fixed to Qwen when the first caption is **Auto**). A status line shows the active source → target and engine (with live load progress).
 - **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through, and **auto-close on stop** (off by default — the overlay stays put and just shows an idle state when a meeting ends). The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
 
 Defaults match the primary use case: **English → Traditional Chinese**, most real-time.
@@ -349,7 +350,7 @@ Flow-Translate/
 │   ├── Contracts/Protocols.swift # layer interfaces
 │   ├── Audio/AudioMath.swift     # rms / level helpers
 │   ├── Audio/Endpointer.swift    # utterance boundaries (Silero-driven)
-│   ├── Translation/              # ContextBuffer, BasicTextCleaner, BasicS2TWPConverter
+│   ├── Translation/              # ContextBuffer, BilingualContextBuffer, BasicTextCleaner, BasicS2TWPConverter, TraditionalChineseGuard, InstantPhraseTranslations
 │   ├── Transcript/               # In-memory + file (crash-safe) stores, exporter
 │   └── Summarization/            # ExtractiveSummarizer (pure-Swift fallback)
 ├── FlowTranslate/                # macOS app (SwiftUI + AppKit)
@@ -398,6 +399,36 @@ Push [Conventional-Commit](https://www.conventionalcommits.org/) messages to
 `main`; [release-please](https://github.com/googleapis/release-please) keeps an
 open release PR that bumps the version and updates `CHANGELOG.md`. **Merging that
 PR** tags the version, creates the GitHub Release, and builds + uploads the DMG.
+
+### Ship a change — step-by-step commands
+
+```bash
+# 0. Start from an up-to-date main
+git checkout main && git pull
+
+# 1. Verify locally (same checks CI runs)
+make test                                        # core unit tests
+make project                                     # regenerate the Xcode project (if project.yml changed)
+xcodebuild -project FlowTranslate.xcodeproj -scheme FlowTranslate \
+  -configuration Debug -destination 'platform=macOS' build
+
+# 2. Commit with a Conventional-Commit message — the type drives the next
+#    version: feat: → minor, fix: → patch, feat!: / BREAKING CHANGE → major
+git add -A
+git commit -m "feat: <summary of the change>"
+
+# 3. Push to main — release-please opens/updates the release PR
+git push origin main
+
+# 4. Review the release PR (version bump + changelog), then merge it to publish
+gh pr list --search "label:\"autorelease: pending\""
+gh pr merge <PR-number> --merge
+
+# 5. CI tags vX.Y.Z, creates the GitHub Release, builds and uploads the DMG
+gh run list --workflow=release-please.yml        # watch progress
+gh release view --web                            # confirm the published release
+```
+
 You can still build locally:
 
 ```bash
@@ -423,8 +454,9 @@ it also notarizes.
 |---------|-----|
 | No system audio captions | Grant **Screen Recording** in System Settings → Privacy & Security, then relaunch. |
 | No microphone captions | Grant **Microphone** permission. |
+| Permission toggle looks ON but capture still fails (after reinstalling/updating the app) | macOS keyed the old grant to the previous build's code signature. Open **Settings → Maintenance → Reset permissions** (or run `tccutil reset Microphone dev.flowtranslate.app` and `tccutil reset ScreenCapture dev.flowtranslate.app`), relaunch, and grant again. The in-app **Uninstall** now clears these entries automatically. |
 | First start sits on "Loading model…" | First run downloads the ~600 MB ASR model — wait for the progress to finish (needs network once). If interrupted, the app detects the partial download and re-fetches it automatically. |
-| Translation line empty | Apple pairs download a one-time language pack on first use. For **auto-detect** / Apple-unsupported pairs the status line shows the Qwen model loading — the second caption appears once it's ready. |
+| Translation line empty | Apple pairs download a one-time language pack on first use. For the **Qwen 模型** engine / **auto-detect** / Apple-unsupported pairs the status line shows the Qwen model loading — the second caption appears once it's ready. During very fast speech the Qwen engine keeps the newest sentences fresh and may skip the translation of an older line that has already scrolled away. |
 | Captions look garbled in noise | Silero VAD gates non-speech well, but heavy background music still reduces ASR quality. |
 | Overlay blocks clicks | Click-through is on by default; check the **Click-through** toggle in Settings. |
 

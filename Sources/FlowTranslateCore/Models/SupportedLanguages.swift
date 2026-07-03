@@ -81,14 +81,4 @@ public enum SecondCaptionLanguage: String, Codable, Sendable, CaseIterable, Iden
         case .english: return "English"
         }
     }
-
-    /// Target-language phrasing fed to the translation model so it outputs exactly
-    /// the selected second-caption language (with the strict script requirement
-    /// for Traditional Chinese).
-    public var modelTargetName: String {
-        switch self {
-        case .traditionalChinese: return "繁體中文（台灣正體字；必須使用繁體字，禁止使用任何簡體字）"
-        case .english: return "English"
-        }
-    }
 }
