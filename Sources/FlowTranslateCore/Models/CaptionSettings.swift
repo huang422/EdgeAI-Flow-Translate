@@ -49,6 +49,17 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     public var clickThrough: Bool
     public var asrTier: String
     public var diarizationEnabled: Bool
+
+    // MARK: Input gain (help a quiet meeting participant clear the level gates)
+
+    /// Fixed boost applied to the **system** audio input before the ASR, in dB
+    /// (0...30). 0 = off. Louder input lets soft speech pass the VAD / voiced gate.
+    public var systemInputGainDb: Double
+    /// Fixed boost applied to the **microphone** input before the ASR, in dB (0...30).
+    public var micInputGainDb: Double
+    /// When true, adaptively raise quiet speech toward a target loudness on top of
+    /// the manual gains (upward compression, rate-limited + noise-gated + limited).
+    public var autoGainEnabled: Bool
     /// What the system audio is (video vs. live meeting speech) — drives the
     /// utterance-segmentation timing (see `SegmentationTuning`).
     public var scenario: CaptureScenario
@@ -84,6 +95,9 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         clickThrough: Bool = true,
         asrTier: String = "560ms",
         diarizationEnabled: Bool = false,
+        systemInputGainDb: Double = 0,
+        micInputGainDb: Double = 0,
+        autoGainEnabled: Bool = false,
         scenario: CaptureScenario = .video,
         primaryLineOnTop: PrimaryLine = .original,
         historyLineCount: Int = 1,
@@ -101,6 +115,9 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.clickThrough = clickThrough
         self.asrTier = asrTier
         self.diarizationEnabled = diarizationEnabled
+        self.systemInputGainDb = CaptionSettings.clampGain(systemInputGainDb)
+        self.micInputGainDb = CaptionSettings.clampGain(micInputGainDb)
+        self.autoGainEnabled = autoGainEnabled
         self.scenario = scenario
         self.primaryLineOnTop = primaryLineOnTop
         self.historyLineCount = max(0, min(2, historyLineCount))
@@ -126,6 +143,9 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         clickThrough = try c.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? d.clickThrough
         asrTier = try c.decodeIfPresent(String.self, forKey: .asrTier) ?? d.asrTier
         diarizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? d.diarizationEnabled
+        systemInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .systemInputGainDb) ?? d.systemInputGainDb)
+        micInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .micInputGainDb) ?? d.micInputGainDb)
+        autoGainEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoGainEnabled) ?? d.autoGainEnabled
         scenario = try c.decodeIfPresent(CaptureScenario.self, forKey: .scenario) ?? d.scenario
         primaryLineOnTop = try c.decodeIfPresent(PrimaryLine.self, forKey: .primaryLineOnTop) ?? d.primaryLineOnTop
         historyLineCount = max(0, min(2, try c.decodeIfPresent(Int.self, forKey: .historyLineCount) ?? d.historyLineCount))
@@ -135,6 +155,12 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         overlayPosition = try c.decodeIfPresent(CGPoint.self, forKey: .overlayPosition) ?? d.overlayPosition
         autoCloseOverlayOnStop = try c.decodeIfPresent(Bool.self, forKey: .autoCloseOverlayOnStop) ?? d.autoCloseOverlayOnStop
     }
+
+    /// Upper bound for the input-gain sliders, matching the DSP cap (WebRTC `kMaxGainDb`).
+    public static let maxInputGainDb: Double = 30
+
+    /// Clamp a persisted/user gain into the valid `0...maxInputGainDb` range.
+    static func clampGain(_ db: Double) -> Double { min(max(db, 0), maxInputGainDb) }
 
     /// Whether translation is required (enabled and the target differs from the source).
     public var needsTranslation: Bool {

@@ -341,6 +341,14 @@ final class CaptureViewModel: ObservableObject {
         translation.sourceLanguage = settings.firstLanguage == "auto"
             ? "" : String(settings.firstLanguage.prefix(2))
         translation.targetLanguage = settings.secondLanguage.rawValue
+        // Push the live input-gain config so a quiet source is boosted before ASR.
+        router.setGain(
+            system: GainConfig(
+                manualGainDb: settings.systemInputGainDb,
+                autoEnabled: settings.autoGainEnabled),
+            mic: GainConfig(
+                manualGainDb: settings.micInputGainDb,
+                autoEnabled: settings.autoGainEnabled))
         overlay.applySettings(settings)
         SettingsStore.save(settings)
         availabilityTask?.cancel()

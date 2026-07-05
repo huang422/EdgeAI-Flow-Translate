@@ -18,9 +18,10 @@ bilingual transcript and an end-of-meeting summary. **Everything runs on-device*
 the only network access is a one-time model download.
 
 - **Speech recognition** with NVIDIA **Nemotron‑3.5 Streaming ASR — Multilingual (0.6B)** on the Apple Neural Engine (via [FluidAudio](https://github.com/FluidInference/FluidAudio)). Pick a language or use **Auto** for per-sentence detection / mixed-language audio.
-- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A selectable **translation engine**: **Apple 系統翻譯** (Apple's on-device **Translation** framework when it supports the pair, Qwen fallback otherwise — default) or **Qwen 模型** (always the on-device **MLX Qwen3-4B-Instruct-2507**, non-thinking, with bilingual rolling context for consistent terminology). **Auto-detect** first caption always uses Qwen (Apple can't auto-detect a source). The Qwen path is tuned for real time: a bounded queue keeps the newest sentences fresh, common short phrases ("Okay.", "Can you hear me?") translate instantly from a lookup table, and a Traditional-Chinese guard fixes rare Simplified-character leakage and Mainland-only terms (視頻→影片).
+- **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A selectable **translation engine**: **Apple** (Apple's on-device **Translation** framework when it supports the pair, Qwen fallback otherwise — default) or **Qwen** (always the on-device **MLX Qwen3-4B-Instruct-2507**, non-thinking, with bilingual rolling context for consistent terminology). **Auto-detect** first caption always uses Qwen (Apple can't auto-detect a source). The Qwen path is tuned for real time: a bounded queue keeps the newest sentences fresh, common short phrases ("Okay.", "Can you hear me?") translate instantly from a lookup table, and a Traditional-Chinese guard fixes rare Simplified-character leakage and Mainland-only terms.
 - **Floating, click-through caption overlay** — a stacked list of caption units (English original on top, translation below, with a source-colour dot), the in-progress line shown live with a blinking caret; newest line brightest, older ones dimmed. Hover reveals a control bar (drag, pin/pause, copy, font size, reset). It stays on top of full-screen meetings/videos and only the control bar is interactive, so clicks pass straight through to the app behind.
 - **System audio _and_ microphone**, captured separately and tagged per source. While system audio is playing, mic echo is suppressed so the same speech isn't transcribed twice.
+- **Adjustable input gain / auto-gain** — boost a quiet source (e.g. a soft-spoken meeting participant) *before* recognition so it still clears the voice-activity gate. A fixed per-source gain (**System** / **Mic**, 0–30 dB) plus an optional **auto-gain** that lifts quiet speech toward a target loudness (rate-limited + noise-gated), with a soft limiter so boosted peaks never clip.
 - **Full bilingual transcript**, persisted to disk (crash-safe) and exportable to Markdown / TXT / SRT / VTT / JSON.
 - **Post-meeting summary** via an on-demand **MLX Qwen3-4B-Instruct-2507 (4-bit)** LLM on the GPU — overview, key points, decisions, action items, Q&A, glossary, produced in **separate English and Traditional Chinese versions** (with a pure-Swift extractive fallback when offline / on load failure).
 - **Global shortcut ⌃⌥C** toggles the overlay from any app (e.g. while Zoom is focused).
@@ -50,6 +51,7 @@ the only network access is a one-time model download.
   - [Performance targets](#performance-targets)
   - [Project layout](#project-layout)
   - [Deployment / release](#deployment--release)
+    - [Ship a change — step-by-step commands](#ship-a-change--step-by-step-commands)
   - [Troubleshooting](#troubleshooting)
   - [Privacy](#privacy)
   - [Contributing](#contributing)
@@ -195,7 +197,7 @@ flowchart TB
         MIC["MicCapture<br/>(AVAudioEngine)"]
         SYS["SystemAudioTap<br/>(ScreenCaptureKit)"]
         CONV["AudioConverter<br/>→ 16kHz mono Float32"]
-        ROUTER["AudioRouter<br/>(source-tagged stream)"]
+        ROUTER["AudioRouter<br/>(source-tagged + input gain)"]
         MIC --> CONV
         SYS --> CONV
         CONV --> ROUTER
@@ -247,7 +249,7 @@ sequenceDiagram
     participant D as TranscriptStore
 
     A->>R: PCM buffer
-    R->>R: convert → 16kHz mono Float32, tag source
+    R->>R: convert → 16kHz mono Float32, tag source, apply input gain
     R->>S: AudioChunk
     S->>S: Silero VAD + append/process
     S-->>O: interim text (line 1, immediate)
@@ -269,7 +271,7 @@ translation.
 
 | Layer | Type | Responsibility |
 |-------|------|----------------|
-| `AudioCapture/` | App | Capture mic + system audio, resample, route with source tags |
+| `AudioCapture/` | App | Capture mic + system audio, resample, per-source input gain (AGC + limiter), route with source tags |
 | `ASR/` | App | FluidAudio Nemotron streaming wrapper + Silero VAD endpointing |
 | `Translation/` | App | Queue finalized text → Apple translation or the shared MLX Qwen (`QwenModelHost`) for auto / unsupported pairs |
 | `UI/` | App | Control panel, settings, click-through `NSPanel` overlay |
@@ -319,8 +321,9 @@ Open the **gear icon** in the top-right. Preferences are persisted automatically
 - **Scenario** — what the *system audio* is: **🎬 Video** (edited content: sentences finalize after a 0.3 s pause, snappier captions) or **👥 Meeting** (live speakers: tolerates 0.8 s thinking pauses so sentences aren't cut in half; longer max turn). The microphone is always a live human, so it always uses the meeting timing. Values follow streaming-caption practice (Azure ~0.5 s segmentation default, AssemblyAI 0.7 s + longer for conversations, Deepgram ≥1 s utterance ends) and pause research: edited/read speech pauses 0.15–0.5 s at sentence boundaries only, while spontaneous speech hesitates 0.5–1.5 s mid-sentence. Applies on the next **Start**.
 - **First caption (recognition) language** — any of Nemotron's 32 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`.
 - **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (more accurate).
-- **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**; engine **Apple 系統翻譯** (fastest, Qwen fallback for unsupported pairs) or **Qwen 模型** (context-aware quality; fixed to Qwen when the first caption is **Auto**). A status line shows the active source → target and engine (with live load progress).
+- **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**; engine **Apple** (fastest, Qwen fallback for unsupported pairs) or **Qwen** (context-aware quality; fixed to Qwen when the first caption is **Auto**). A status line shows the active source → target and engine (with live load progress).
 - **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through, and **auto-close on stop** (off by default — the overlay stays put and just shows an idle state when a meeting ends). The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
+- **Audio input** — a fixed **input gain** per source (**System gain** / **Mic gain**, 0–30 dB) to make a quiet speaker louder so they clear the voice-activity threshold, plus **Auto-gain** which adaptively raises quiet speech toward a target loudness (rate-limited, noise-gated, boost-only). A soft limiter keeps boosted peaks from clipping. Off by default (0 dB, auto-gain off) so capture is unchanged until you opt in.
 
 Defaults match the primary use case: **English → Traditional Chinese**, most real-time.
 

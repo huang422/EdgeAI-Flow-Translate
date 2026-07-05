@@ -137,6 +137,29 @@ struct SettingsView: View {
                 }
             }
 
+            Section("音訊輸入 Audio input") {
+                Toggle(isOn: $settings.autoGainEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("自動增益 Auto-gain")
+                        Text("Automatically boosts quiet speakers toward a target level")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                HStack {
+                    Text("系統聲增益 System gain")
+                    Slider(value: $settings.systemInputGainDb, in: 0...CaptionSettings.maxInputGainDb, step: 1)
+                    Text("+\(Int(settings.systemInputGainDb)) dB").monospacedDigit().foregroundStyle(.secondary)
+                }
+                HStack {
+                    Text("麥克風增益 Mic gain")
+                    Slider(value: $settings.micInputGainDb, in: 0...CaptionSettings.maxInputGainDb, step: 1)
+                    Text("+\(Int(settings.micInputGainDb)) dB").monospacedDigit().foregroundStyle(.secondary)
+                }
+                Text("Raise a quiet meeting participant so they clear the voice-detection "
+                    + "threshold. A soft limiter prevents clipping/distortion.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             Section {
                 Label {
                     Text("Runs entirely on-device. Audio and text never leave your Mac — only the first-time model download needs the internet.")

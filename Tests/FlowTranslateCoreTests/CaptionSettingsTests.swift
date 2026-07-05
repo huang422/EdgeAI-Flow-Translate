@@ -67,4 +67,38 @@ import Foundation
             CaptionSettings.self, from: JSONEncoder().encode(s))
         #expect(back.translationEngine == .qwen)
     }
+
+    @Test func inputGainDefaultsAreOff() {
+        let s = CaptionSettings.default
+        #expect(s.systemInputGainDb == 0)
+        #expect(s.micInputGainDb == 0)
+        #expect(s.autoGainEnabled == false)
+    }
+
+    @Test func inputGainIsClampedToRange() {
+        let hi = CaptionSettings(systemInputGainDb: 999, micInputGainDb: -5)
+        #expect(hi.systemInputGainDb == CaptionSettings.maxInputGainDb)
+        #expect(hi.micInputGainDb == 0)
+    }
+
+    @Test func tolerantDecodeMissingGainDefaultsOff() throws {
+        // Older persisted JSON (no gain keys) upgrades cleanly to off/unity.
+        let json = Data(#"{"firstLanguage":"en-US"}"#.utf8)
+        let s = try JSONDecoder().decode(CaptionSettings.self, from: json)
+        #expect(s.systemInputGainDb == 0)
+        #expect(s.micInputGainDb == 0)
+        #expect(s.autoGainEnabled == false)
+    }
+
+    @Test func roundTripPreservesGainSettings() throws {
+        var s = CaptionSettings.default
+        s.systemInputGainDb = 12
+        s.micInputGainDb = 6
+        s.autoGainEnabled = true
+        let back = try JSONDecoder().decode(
+            CaptionSettings.self, from: JSONEncoder().encode(s))
+        #expect(back.systemInputGainDb == 12)
+        #expect(back.micInputGainDb == 6)
+        #expect(back.autoGainEnabled == true)
+    }
 }
