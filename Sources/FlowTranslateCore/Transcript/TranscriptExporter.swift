@@ -124,7 +124,7 @@ public struct TranscriptExporter: TranscriptExporting {
         for (i, seg) in segments.enumerated() {
             out += "\(i + 1)\n"
             out += "\(srtTime(seg.startTime)) --> \(srtTime(seg.endTime))\n"
-            out += "\(seg.sourceText)\n"
+            out += "\(speakerPrefix(seg))\(seg.sourceText)\n"
             if let t = seg.translatedText { out += "\(t)\n" }
             out += "\n"
         }
@@ -136,7 +136,7 @@ public struct TranscriptExporter: TranscriptExporting {
         for (i, seg) in segments.enumerated() {
             out += "\(i + 1)\n"
             out += "\(vttTime(seg.startTime)) --> \(vttTime(seg.endTime))\n"
-            out += "\(seg.sourceText)\n"
+            out += "\(speakerPrefix(seg))\(seg.sourceText)\n"
             if let t = seg.translatedText { out += "\(t)\n" }
             out += "\n"
         }

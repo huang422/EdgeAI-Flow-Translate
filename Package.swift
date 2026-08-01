@@ -18,7 +18,8 @@ let package = Package(
         ),
         .testTarget(
             name: "FlowTranslateCoreTests",
-            dependencies: ["FlowTranslateCore"]
+            dependencies: ["FlowTranslateCore"],
+            path: "Tests/FlowTranslateCoreTests"
         )
     ]
 )

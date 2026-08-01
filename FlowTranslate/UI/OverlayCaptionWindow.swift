@@ -207,6 +207,11 @@ private struct CaptionUnit: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 SourceDot(color: CaptionTheme.Palette.sourceDot(line.source), glow: isLatest)
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+                if let speaker = line.speakerLabel {
+                    Text(speaker)
+                        .font(.system(size: max(10, fontSize - 5), weight: .bold))
+                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                }
                 Text(topText)
                     .font(CaptionTheme.primaryFont(fontSize))
                     .foregroundStyle(isLatest ? Color(hex: 0xF7F8FA) : CaptionTheme.Palette.inkPrimary)

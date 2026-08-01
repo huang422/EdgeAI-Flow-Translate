@@ -68,6 +68,13 @@ struct SettingsView: View {
                     Text("Balanced 1120ms").tag("1120ms")
                 }
                 .pickerStyle(.segmented)
+                Toggle(isOn: $settings.diarizationEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("講者辨識 Speaker diarization")
+                        Text("pyannote/speaker-diarization-3.1 labels speakers in microphone and system audio. Applies on the next Start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
             }
 
             Section("翻譯 Translation") {

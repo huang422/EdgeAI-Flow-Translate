@@ -25,6 +25,10 @@ Packaging/build/
 # Chinese design docs, spec-kit internals and local agent instructions.
 specs/
 Flow-Translate-Redesign/
+Tests/
+!Tests/
+!Tests/FlowTranslateCoreTests/
+!Tests/FlowTranslateCoreTests/**
 .specify/
 .vscode/
 .github/agents/

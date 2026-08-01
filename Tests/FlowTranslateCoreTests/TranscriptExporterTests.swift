@@ -38,6 +38,7 @@ import Foundation
         #expect(str.contains("Hello everyone"))
         #expect(str.contains("大家好"))
         #expect(str.contains("00:00:00,000 --> 00:00:02,500"))
+        #expect(str.contains("[Speaker A] Hello everyone"))
     }
 
     @Test func exportVTTHeader() throws {
@@ -47,6 +48,7 @@ import Foundation
                                        summary: nil, format: .vtt)
         let str = String(data: data, encoding: .utf8) ?? ""
         #expect(str.hasPrefix("WEBVTT"))
+        #expect(str.contains("[Speaker A] Hello everyone"))
     }
 
     @Test func exportMarkdownWithSummaryAndSpeaker() throws {
