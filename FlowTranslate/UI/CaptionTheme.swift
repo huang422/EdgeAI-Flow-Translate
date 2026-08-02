@@ -64,6 +64,26 @@ enum CaptionTheme {
 
         static let enterDuration: Double = 0.18   // 180ms ease-out fade + slide
         static let controlsDuration: Double = 0.16
+        /// In-place morph (interim → finalized) crossfade duration.
+        static let morphDuration: Double = 0.15
+        /// History-line fade-out duration on eviction.
+        static let evictDuration: Double = 0.25
+    }
+
+    // MARK: - Caption band geometry
+
+    /// Fixed content height of the floating caption band, derived ONLY from
+    /// settings (font size, history lines, second caption on/off) — never from
+    /// the live text. This is what keeps the overlay's frame constant while
+    /// captions stream (the anti-jump core): content is bottom-aligned inside
+    /// and clipped at the top when a long sentence wraps.
+    static func bandContentHeight(fontSize: Double, historyLines: Int, secondLine: Bool) -> CGFloat {
+        let en = ceil(fontSize * 1.4)                                // primary line height
+        let zh = secondLine ? ceil(fontSize * 0.82 * 1.45) + 4 : 0   // translation line + gap
+        let unit = en + zh
+        let slots = CGFloat(max(0, historyLines) + 1)                // history + current
+        let spacing = CGFloat(max(0, historyLines)) * 12             // inter-unit spacing
+        return slots * unit + spacing + en                           // +1 line wrap headroom
     }
 
     // MARK: - Type

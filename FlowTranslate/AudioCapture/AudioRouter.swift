@@ -69,15 +69,27 @@ public final class AudioRouter: AudioRouting, @unchecked Sendable {
     }
 
     /// Apply the source's gain in place, persisting the processor's adaptive state.
+    /// The lock only guards taking the processor out / putting it back — the DSP
+    /// itself runs outside, so the two capture threads (mic + system) never
+    /// serialize each other and `setGain` (UI) is never blocked behind DSP.
+    /// Per-source callbacks are serial, so checkout/checkin can't interleave for
+    /// the same source.
     private func boost(_ chunk: AudioChunk) -> AudioChunk {
-        gainLock.lock()
-        defer { gainLock.unlock() }
-        guard var proc = processors[chunk.source], !proc.config.isPassthrough else {
-            return chunk
+        let checkedOut: GainProcessor? = gainLock.withLock {
+            guard let p = processors[chunk.source], !p.config.isPassthrough else { return nil }
+            return p
         }
+        guard var proc = checkedOut else { return chunk }
         var samples = chunk.samples
         proc.process(&samples)
-        processors[chunk.source] = proc
+        gainLock.withLock {
+            // Don't resurrect a processor that was disabled (or replaced by a
+            // fresh enable) while this chunk was being processed.
+            guard processors[chunk.source] != nil else { return }
+            // Keep the freshest config (setGain may have run mid-processing).
+            if let latest = processors[chunk.source]?.config { proc.config = latest }
+            processors[chunk.source] = proc
+        }
         return AudioChunk(samples: samples, source: chunk.source, timestamp: chunk.timestamp)
     }
 }

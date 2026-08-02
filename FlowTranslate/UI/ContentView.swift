@@ -33,12 +33,30 @@ struct ContentView: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(settings: $vm.settings, vm: vm)
         }
-        .task { vm.preflightModels() }
-        .alert("Download models?", isPresented: $vm.showModelDownloadPrompt) {
-            Button("Download") { Task { await vm.downloadAllModels() } }
-            Button("Later", role: .cancel) {}
+        .task {
+            // Recovery first: its prompt defers the model-download prompt
+            // (two simultaneous alerts on one view drop one of them).
+            vm.checkForRecoverableSession()
+            vm.preflightModels()
+        }
+        .alert("恢復上次會議？ Recover last meeting?", isPresented: $vm.showRecoveryPrompt) {
+            Button("恢復 Recover") { vm.recoverIncompleteSession() }
+            Button("捨棄 Discard", role: .destructive) { vm.discardIncompleteSession() }
         } message: {
-            Text("FlowTranslate needs to download its on-device models (ASR, Silero VAD, and Qwen for translation/summary). This runs once and works offline afterwards.")
+            Text("上次會議未正常結束，仍保有 \(vm.recoverableCount) 句逐字稿。恢復後可匯出或產生摘要。")
+        }
+        .alert("下載模型？ Download models?", isPresented: $vm.showModelDownloadPrompt) {
+            Button("下載 Download") { Task { await vm.downloadAllModels() } }
+            Button("稍後 Later", role: .cancel) {}
+        } message: {
+            Text("""
+            FlowTranslate 需要下載本機模型（一次性，之後完全離線可用）：
+            • 語音辨識 ASR（所選語言）約 600 MB
+            • Silero VAD 約 2 MB
+            • Qwen 翻譯／摘要模型 約 2.3 GB
+            合計約 2.9 GB — 建議使用 Wi-Fi。
+            All processing stays on this Mac.
+            """)
         }
     }
 
@@ -71,7 +89,8 @@ struct ContentView: View {
         } else {
             switch vm.asrState {
             case .listening: pill("聆聽中 Listening", color: CaptionTheme.Palette.mic, breathing: true)
-            case .loading:   pill("載入中 Loading", color: CaptionTheme.Palette.accentSystem, spinner: true)
+            case .warming:   pill("模型載入中 Loading model", color: CaptionTheme.Palette.accentSystem, spinner: true)
+            case .loading:   pill("準備中 Preparing", color: CaptionTheme.Palette.accentSystem, spinner: true)
             case .idle:      pill("待命 Idle", color: CaptionTheme.Palette.inkTertiary)
             }
         }
@@ -141,12 +160,20 @@ struct ContentView: View {
                 Label("開始 Start", systemImage: "play.fill").fontWeight(.semibold).frame(minWidth: 96)
             }
             .buttonStyle(.borderedProminent).controlSize(.large).tint(CaptionTheme.Palette.accentSystem)
+            // Never start a meeting while a summary is generating (its model
+            // unload would race the new meeting's translations) or during the
+            // launch-time bulk download (duplicate ASR download).
+            .disabled(vm.isSummarizing || vm.isDownloadingModels)
+            .help(vm.isSummarizing ? "摘要產生中，完成後才能開始 Summary in progress"
+                  : vm.isDownloadingModels ? "模型下載中 Models downloading" : "")
         case .loading:
             Button {} label: {
                 HStack(spacing: 7) { ProgressView().controlSize(.small); Text("載入中 Loading") }.frame(minWidth: 96)
             }
             .buttonStyle(.borderedProminent).controlSize(.large).disabled(true)
-        case .listening:
+        case .warming, .listening:
+            // Warming counts as an active meeting (audio already buffers), so the
+            // user can stop it the same way.
             Button { Task { await vm.endMeeting() } } label: {
                 HStack(spacing: 7) {
                     RoundedRectangle(cornerRadius: 2).fill(.white).frame(width: 9, height: 9)
@@ -366,8 +393,16 @@ private struct TranscriptRow: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Shared cached formatter — building a DateFormatter is expensive and this
+    /// runs for every visible transcript row on every re-render (up to 500 rows).
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
     private static func clock(_ d: Date) -> String {
-        let f = DateFormatter(); f.dateFormat = "HH:mm"; return f.string(from: d)
+        clockFormatter.string(from: d)
     }
 }
 

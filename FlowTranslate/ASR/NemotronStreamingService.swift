@@ -9,9 +9,11 @@ import FlowTranslateCore
 ///   continuous acoustic state, so feeding system audio and microphone audio into
 ///   a single model corrupts it (slow / garbled / no output). Each source gets its
 ///   own `StreamingNemotronMultilingualAsrManager` + Silero VAD + utterance state.
-/// - **Model reuse.** The downloaded variant is cached on disk (no re-download)
-///   and the in-memory models are kept alive across Start/Stop, so pressing Start
-///   again does not reload them.
+/// - **Memory policy.** The downloaded variant is cached on disk (no re-download),
+///   but the in-memory models are RELEASED at meeting end (16 GB budget) and
+///   lazily reloaded on the next Start — incoming audio is ring-buffered during
+///   the load and replayed, so the opening words are never lost. `isWarm` +
+///   `onModelLoading` let the UI show an honest "model loading" state meanwhile.
 /// - **Language:** `setLanguage("en-US" / "sv-SE" / "auto" …)`. `en-US` (and other
 ///   Latin langs) use the lighter, faster "latin" ship; others/`auto` use the
 ///   "multilingual" ship. `auto` detects per sentence (mixed-language audio).
@@ -40,6 +42,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     private var loadedKey: String?        // "<language>|<tier>" currently downloaded
     private var pipelines: [AudioSourceType: SourceASR] = [:]
     private var creating: Set<AudioSourceType> = []
+    /// True once at least one streaming model is resident in memory (the warm
+    /// preload or a pipeline load finished). Drives the UI's "warming" state so
+    /// it can show an honest "model loading" instead of a premature "Listening".
+    private var warm = false
     /// Audio captured while a source's pipeline is still being created, replayed
     /// once it's ready so the opening words are never dropped (cold-start fix).
     private var pendingChunks: [AudioSourceType: [AudioChunk]] = [:]
@@ -51,6 +57,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     private let lock = NSLock()
 
     public init() {}
+
+    /// Whether at least one streaming model is loaded in memory. When `false`
+    /// right after `startStream()`, the first captions will lag behind by the
+    /// model-load time (incoming audio is buffered, so no words are lost).
+    public var isWarm: Bool { lock.withLock { warm } }
 
     // MARK: - ASRStreaming
 
@@ -83,8 +94,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     }
 
     /// Load + language-configure one streaming model from the cached variant.
+    /// Respects task cancellation (a cancelled warm preload stops early instead
+    /// of finishing a multi-second CoreML load whose result is discarded).
     private func loadManager() async -> StreamingNemotronMultilingualAsrManager? {
-        guard let dir = variantDir else { return nil }
+        guard let dir = variantDir, !Task.isCancelled else { return nil }
         onModelLoading?(true)
         defer { onModelLoading?(false) }
         let m = StreamingNemotronMultilingualAsrManager()
@@ -93,7 +106,9 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         } catch {
             return nil
         }
+        guard !Task.isCancelled else { return nil }
         await m.setLanguage(currentLanguage)
+        lock.withLock { warm = true }
         return m
     }
 
@@ -147,6 +162,27 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         }
     }
 
+    /// Whether the variant for a SPECIFIC language + tier is fully cached.
+    /// `asrModelPresent` only proves that *some* variant exists — after the user
+    /// switches the first-caption language or the ASR tier, the next Start may
+    /// still need a ~600 MB download; this is the check that predicts it.
+    public static func variantPresent(language: String, tier: String) -> Bool {
+        let ship = shipDirectory(for: language)
+        let dir = fluidModels
+            .appendingPathComponent("nemotron-multilingual", isDirectory: true)
+            .appendingPathComponent(ship, isDirectory: true)
+            .appendingPathComponent("\(chunkMs(for: tier))ms", isDirectory: true)
+        return variantComplete(dir)
+    }
+
+    /// Mirror of FluidAudio's ship-selection rule (latin vs. multilingual), kept
+    /// in sync with `StreamingNemotronMultilingualAsrManager.languageDirectory`.
+    static func shipDirectory(for languageCode: String) -> String {
+        let c = languageCode.lowercased()
+        let latinPrefixes = ["en", "es", "fr", "it", "pt", "de"]
+        return latinPrefixes.contains(where: { c.hasPrefix($0) }) ? "latin" : "multilingual"
+    }
+
     /// True if the Silero VAD CoreML model is cached.
     public static var vadModelPresent: Bool {
         FileManager.default.fileExists(atPath: fluidModels
@@ -154,17 +190,19 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     }
 
     /// Download the Silero VAD model now (no-op if cached). `false` on failure.
-    public func prefetchVAD() async -> Bool { await SileroEndpointer() != nil }
+    /// The presence check avoids loading the whole CoreML model into memory (and
+    /// immediately discarding it) just to prove the files are on disk.
+    public func prefetchVAD() async -> Bool {
+        if Self.vadModelPresent { return true }
+        return await SileroEndpointer() != nil
+    }
 
     public func startStream() async throws {
         running = true
-        // Resume any models kept alive from a previous meeting (no reload),
-        // re-applying the current scenario's segmentation timing.
-        let existing = lock.withLock { Array(pipelines.values) }
-        for p in existing { await p.resume(tuning: .forSource(p.source, scenario: scenario)) }
-        // Otherwise preload one model in the background so it's ready by the
-        // time the user speaks (reduces first-caption delay).
-        if existing.isEmpty { startBackgroundPreload() }
+        // Preload one model in the background so it's ready by the time the user
+        // speaks (overlaps the multi-second load with user prep). Pipelines are
+        // created lazily per source on the first audio chunk.
+        startBackgroundPreload()
     }
 
     public func feed(_ chunk: AudioChunk) {
@@ -194,13 +232,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
     public func stopStream() {
         running = false
-        // Keep the loaded models in memory; just stop consuming so the next
-        // Start reuses them without reloading.
-        let active = lock.withLock { () -> [SourceASR] in
-            pendingChunks.removeAll()
-            return Array(pipelines.values)
-        }
-        for p in active { p.pause() }
+        // Meetings always release models at Stop (endMeeting → releaseModels), so
+        // there is no keep-alive path: tear the pipelines down here as well. The
+        // consumers' trailing finalize still runs (stop() only cancels the loop),
+        // and the caller's drain window collects that last sentence.
+        teardownAll()
     }
 
     // MARK: - Pipelines
@@ -271,6 +307,7 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
             pendingChunks.removeAll()
             warmTask?.cancel()
             warmTask = nil
+            warm = false
             return v
         }
         for p in all { p.stop() }
@@ -344,34 +381,17 @@ private final class SourceASR: @unchecked Sendable {
         launchConsumer()
     }
 
-    /// Reuse the already-loaded model for a new meeting (no reload), applying the
-    /// segmentation timing for the (possibly changed) scenario.
-    func resume(tuning: SegmentationTuning) async {
-        self.tuning = tuning
-        endpointer = Endpointer(
-            config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech))
-        await manager.reset()
-        await ensureSilero()
-        await silero?.apply(tuning: tuning)
-        await silero?.reset()
-        resetState()
-        launchConsumer()
-    }
+    // (The old resume()/pause() keep-alive pair was removed: endMeeting always
+    // releases the models on a 16 GB budget, so the path was unreachable.)
 
     func feed(_ chunk: AudioChunk) {
         let cont = lock.withLock { continuation }
         cont?.yield(chunk)
     }
 
-    /// Stop consuming but keep the model in memory for reuse.
-    func pause() {
-        lock.withLock {
-            continuation?.finish()
-            continuation = nil
-        }
-    }
-
-    /// Permanently stop and release.
+    /// Permanently stop and release. The consumer task is cancelled (its loop
+    /// breaks at the next chunk) but the trailing finalize still emits, so the
+    /// sentence in flight when Stop was pressed reaches the transcript.
     func stop() {
         lock.withLock {
             continuation?.finish()

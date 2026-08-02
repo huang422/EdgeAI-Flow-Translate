@@ -5,80 +5,77 @@ import FlowTranslateCore
 // MARK: - Overlay view model
 
 /// Listening state mirrored from the app's `ASRState` so the idle status pill can
-/// reflect reality (listening / loading / not listening) instead of always
-/// claiming "Listening" even when stopped.
-enum OverlayListenState { case idle, loading, listening }
+/// reflect reality (listening / loading / warming / not listening) instead of
+/// always claiming "Listening" even when stopped or still loading the model.
+enum OverlayListenState { case idle, loading, warming, listening }
 
 /// Observable content + presentation state for the floating caption overlay.
-/// `lines` are finalized caption units (English + translation, with source);
-/// `interim` is the in-progress recognition line (English only, no translation yet).
+/// Content lives in `CaptionBandState` (pure, unit-tested core logic): a current
+/// utterance **slot** that morphs in place from interim to finalized (same view
+/// identity → no jump), plus rolled-up history lines. The band geometry is fixed
+/// from settings, so the panel frame never changes while captions stream.
 @MainActor
 final class OverlayModel: ObservableObject {
-    // Content
-    @Published var lines: [CaptionLine] = [] {
-        didSet { if isPinned { pendingCount = max(0, lines.count - pinnedSnapshot.count) } }
-    }
-    @Published var interim: String = ""
-    @Published var interimChinese: String = ""   // live translation of the in-progress line
-    @Published var interimSource: AudioSourceType = .system
+    // Content: the caption-band state machine (see FlowTranslateCore).
+    @Published private(set) var band = CaptionBandState()
 
     /// Mirrors the app's ASR state so the idle pill reflects whether we are really
-    /// listening, loading, or stopped (idle) — never a stale "Listening".
+    /// listening, warming (model loading), or stopped — never a stale "Listening".
     @Published var listenState: OverlayListenState = .idle
 
     // Interaction state
-    @Published var isPinned = false
-    @Published var pendingCount = 0
     @Published var showControls = false
-    private var pinnedSnapshot: [CaptionLine] = []
 
     // Presentation (mirrored from CaptionSettings)
     @Published var fontSize: Double = 16
     @Published var opacity: Double = 0.66
     @Published var showSecondLine = true
     @Published var primaryLineOnTop: PrimaryLine = .original
-    @Published var historyLineCount: Int = 1
+    @Published var historyLineCount: Int = 1 {
+        didSet { band.historyLimit = historyLineCount }
+    }
     @Published var interimStyle: InterimStyle = .dimmedWithCaret
     @Published var reduceMotion = false
 
-    /// Finalized units actually drawn: the latest plus `historyLineCount` of history
-    /// (or the frozen snapshot while pinned).
-    var visible: [CaptionLine] {
-        let source = isPinned ? pinnedSnapshot : lines
-        return Array(source.suffix(historyLineCount + 1))
+    var isPinned: Bool { band.isPinned }
+
+    // MARK: - Band events (called by CaptureViewModel)
+
+    /// Live partial for the displayed utterance (same id all utterance long).
+    func applyInterim(utteranceId: UUID, source: AudioSourceType,
+                      english: String, chinese: String?, expectsTranslation: Bool) {
+        band.interim(utteranceId: utteranceId, source: source, english: english,
+                     chinese: chinese, expectsTranslation: expectsTranslation)
     }
 
-    /// Whether to show the interim line right now.
-    var interimVisible: Bool {
-        interimStyle == .dimmedWithCaret && !isPinned
-            && !interim.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    /// Finalized utterance, cleaned + split; the last sentence morphs the slot.
+    func applyCommit(utteranceId: UUID?, source: AudioSourceType,
+                     sentences: [(key: UUID, english: String)], expectsTranslation: Bool) {
+        band.commit(utteranceId: utteranceId, source: source,
+                    sentences: sentences, expectsTranslation: expectsTranslation)
     }
 
-    /// Whether there is any caption to show (vs. the idle "listening" pill).
-    var hasContent: Bool { !visible.isEmpty || interimVisible || isPinned }
-
-    func togglePin() {
-        isPinned.toggle()
-        if isPinned {
-            pinnedSnapshot = lines
-            pendingCount = 0
-        } else {
-            pendingCount = 0
-            interim = ""
-        }
+    /// Accurate translation for a finalized sentence.
+    func applyTranslation(key: UUID, text: String) {
+        band.translation(key: key, text: text)
     }
 
-    func clear() {
-        lines = []
-        interim = ""
-        interimChinese = ""
-        isPinned = false
-        pendingCount = 0
-        pinnedSnapshot = []
+    /// Prefix-stable live translation for the in-progress slot.
+    func applyInterimTranslation(utteranceId: UUID, text: String) {
+        band.interimTranslation(utteranceId: utteranceId, text: text)
     }
 
-    /// Latest finalized unit (used by the copy action).
-    var latest: CaptionLine? { lines.last }
+    /// Drop an in-progress slot whose utterance produced nothing usable.
+    func applyDiscard(utteranceId: UUID) {
+        band.discard(utteranceId: utteranceId)
+    }
+
+    func togglePin() { band.togglePin() }
+
+    func clear() { band.clear() }
+
+    /// Latest finalized line (used by the copy action).
+    var latest: BandLine? { band.latestFinal }
 }
 
 /// Callbacks the SwiftUI overlay invokes back into the `OverlayController`.
@@ -176,95 +173,129 @@ private struct DottedUnderline: Shape {
     }
 }
 
-// MARK: - Caption units
+// MARK: - Caption band line
 
-/// One finalized caption unit: source dot + primary line (bright) + secondary line
-/// (dim, indented). Which language is primary depends on `primaryOnTop`.
-private struct CaptionUnit: View {
-    let line: CaptionLine
+/// One line of the caption band. The SAME view renders the line through its whole
+/// life: interim (dim, caret, breathing dot) → finalized (bright, source dot) —
+/// the text morphs in place via `contentTransition(.interpolate)` (new words fade
+/// in; cleanup edits crossfade) and the style animates, so nothing jumps.
+private struct BandLineView: View {
+    let line: BandLine
     let fontSize: Double
     let primaryOnTop: PrimaryLine
     let showSecond: Bool
-    var isLatest: Bool
+    let isLatest: Bool
+    let reduceMotion: Bool
 
-    private var original: String { line.english }
+    /// Non-empty translation text, if any.
     private var translation: String? {
-        guard let t = line.chinese?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty else { return nil }
+        guard let t = line.chinese?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !t.isEmpty else { return nil }
         return t
     }
 
-    private var topText: String {
-        if !showSecond || translation == nil { return original }
-        return primaryOnTop == .original ? original : translation!
+    /// Whether the reserved second row is rendered at all.
+    private var showSecondRow: Bool { showSecond && line.expectsTranslation }
+
+    /// Second-row display text: translation, "⋯" while a finalized line waits
+    /// for its translation, or a space placeholder holding the reserved height.
+    private var secondRowText: String {
+        translation ?? (line.isFinal ? "⋯" : " ")
     }
-    private var bottomText: String? {
-        guard showSecond, let t = translation else { return nil }
-        return primaryOnTop == .original ? t : original
-    }
+
+    /// Keep the row ORDER fixed by the primary-line setting (even while the
+    /// translation is still pending) so the finalize morph never swaps rows.
+    private var englishOnTop: Bool { !showSecondRow || primaryOnTop == .original }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
-                SourceDot(color: CaptionTheme.Palette.sourceDot(line.source), glow: isLatest)
+                dot
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
-                Text(topText)
-                    .font(CaptionTheme.primaryFont(fontSize))
-                    .foregroundStyle(isLatest ? Color(hex: 0xF7F8FA) : CaptionTheme.Palette.inkPrimary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            if let bottom = bottomText {
-                Text(bottom)
-                    .font(CaptionTheme.translationFont(fontSize))
-                    .foregroundStyle(CaptionTheme.Palette.inkTranslation)
-                    .padding(.leading, 14)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
-
-/// The in-progress recognition line: English only, dimmed, dotted underline,
-/// blinking caret, red breathing dot.
-private struct InterimLine: View {
-    let text: String
-    let chinese: String
-    let showSecond: Bool
-    let source: AudioSourceType
-    let fontSize: Double
-    let reduceMotion: Bool
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                BreathingDot(color: CaptionTheme.Palette.stopRec, animated: !reduceMotion, size: 6)
-                    .frame(width: 6, height: 6)
-                    .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
-                HStack(alignment: .firstTextBaseline, spacing: 3) {
-                    Text(text)
-                        .font(CaptionTheme.primaryFont(fontSize).weight(.medium))
-                        .overlay(alignment: .bottom) {
-                            DottedUnderline()
-                                .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [1.5, 2.5]))
-                                .foregroundStyle(Color(hex: 0xF5F5F7).opacity(0.3))
-                                .frame(height: 1.5)
-                                .offset(y: 3)
-                        }
-                    BlinkingCaret(height: fontSize * 0.95, animated: !reduceMotion)
+                if englishOnTop {
+                    englishRow(font: CaptionTheme.primaryFont(fontSize), color: topColor)
+                } else {
+                    Text(secondRowText)
+                        .font(CaptionTheme.primaryFont(fontSize)
+                            .weight(line.isFinal ? .semibold : .medium))
+                        .contentTransition(reduceMotion ? .identity : .interpolate)
+                        .foregroundStyle(translation == nil ? CaptionTheme.Palette.inkTertiary : topColor)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .foregroundStyle(Color(hex: 0xF5F5F7).opacity(CaptionTheme.Metric.interimOpacity))
-                .fixedSize(horizontal: false, vertical: true)
             }
-            // Live translation of the in-progress line (when the engine provides it).
-            if showSecond, !chinese.isEmpty {
-                Text(chinese)
-                    .font(CaptionTheme.translationFont(fontSize))
-                    .foregroundStyle(CaptionTheme.Palette.inkTranslation.opacity(0.72))
-                    .padding(.leading, 14)
-                    .fixedSize(horizontal: false, vertical: true)
+            if showSecondRow {
+                Group {
+                    if englishOnTop {
+                        Text(secondRowText)
+                            .font(CaptionTheme.translationFont(fontSize))
+                            .contentTransition(reduceMotion ? .identity : .interpolate)
+                            .foregroundStyle(bottomColor)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        englishRow(font: CaptionTheme.translationFont(fontSize),
+                                   color: bottomEnglishColor)
+                    }
+                }
+                .padding(.leading, 14)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// The recognition-text row: caret + dotted underline live HERE (wherever the
+    /// English sits), never on a possibly-empty translation row.
+    private func englishRow(font: Font, color: Color) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 3) {
+            Text(line.english)
+                .font(font.weight(line.isFinal ? .semibold : .medium))
+                .contentTransition(reduceMotion ? .identity : .interpolate)
+                .foregroundStyle(color)
+                .fixedSize(horizontal: false, vertical: true)
+                .overlay(alignment: .bottom) {
+                    if !line.isFinal {
+                        DottedUnderline()
+                            .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [1.5, 2.5]))
+                            .foregroundStyle(Color(hex: 0xF5F5F7).opacity(0.3))
+                            .frame(height: 1.5)
+                            .offset(y: 3)
+                    }
+                }
+            if !line.isFinal {
+                BlinkingCaret(height: fontSize * 0.95, animated: !reduceMotion)
+            }
+        }
+    }
+
+    // MARK: Styling
+
+    @ViewBuilder
+    private var dot: some View {
+        if line.isFinal {
+            SourceDot(color: CaptionTheme.Palette.sourceDot(line.source), glow: isLatest)
+        } else {
+            BreathingDot(color: CaptionTheme.Palette.stopRec, animated: !reduceMotion, size: 6)
+                .frame(width: 6, height: 6)
+        }
+    }
+
+    private var topColor: Color {
+        if !line.isFinal {
+            return Color(hex: 0xF5F5F7).opacity(CaptionTheme.Metric.interimOpacity)
+        }
+        return isLatest ? Color(hex: 0xF7F8FA) : CaptionTheme.Palette.inkPrimary
+    }
+
+    private var bottomColor: Color {
+        let base = CaptionTheme.Palette.inkTranslation
+        if translation == nil { return CaptionTheme.Palette.inkTertiary }   // ⋯ pending
+        return line.isFinal ? base : base.opacity(0.72)
+    }
+
+    /// English shown on the bottom row (translation-on-top layout).
+    private var bottomEnglishColor: Color {
+        line.isFinal
+            ? CaptionTheme.Palette.inkTranslation
+            : Color(hex: 0xF5F5F7).opacity(CaptionTheme.Metric.interimOpacity)
     }
 }
 
@@ -329,7 +360,7 @@ private struct ListeningPill: View {
         switch state {
         case .listening:
             BreathingDot(color: CaptionTheme.Palette.mic, size: 7).frame(width: 7, height: 7)
-        case .loading:
+        case .loading, .warming:
             BreathingDot(color: CaptionTheme.Palette.accentSystem, size: 7).frame(width: 7, height: 7)
         case .idle:
             Circle().fill(CaptionTheme.Palette.inkTertiary).frame(width: 7, height: 7)
@@ -339,7 +370,8 @@ private struct ListeningPill: View {
     private var text: String {
         switch state {
         case .listening: return "聆聽中… Listening"
-        case .loading:   return "載入中… Loading"
+        case .loading:   return "準備模型… Preparing"
+        case .warming:   return "模型載入中…可先說話 Loading model"
         case .idle:      return "待命 Idle"
         }
     }
@@ -420,12 +452,14 @@ private struct OverlaySizeKey: PreferenceKey {
 }
 
 /// Top-level SwiftUI content hosted inside the floating `NSPanel`: a reserved band
-/// for the hover control bar, then the caption scrim (or the idle pill).
+/// for the hover control bar, then the fixed-geometry caption band (or the idle
+/// pill). The caption band's frame comes ONLY from settings — while a meeting is
+/// active the panel never resizes, no matter what the text does.
 private struct OverlayRootView: View {
     @ObservedObject var model: OverlayModel
     let actions: OverlayActions
 
-    private let bandHeight: CGFloat = 32
+    private let controlBandHeight: CGFloat = 32
 
     var body: some View {
         VStack(spacing: 0) {
@@ -438,7 +472,7 @@ private struct OverlayRootView: View {
                     .opacity(model.showControls ? 1 : 0)
                     .allowsHitTesting(model.showControls)
             }
-            .frame(height: bandHeight)
+            .frame(height: controlBandHeight)
 
             content
         }
@@ -452,15 +486,18 @@ private struct OverlayRootView: View {
         .onPreferenceChange(OverlaySizeKey.self) { actions.onSize($0) }
     }
 
+    /// Show the caption band whenever a meeting is running (warming counts — the
+    /// band doubles as the "captions will appear here" affordance) or content
+    /// remains on screen (e.g. pinned for reading after the meeting ended).
+    private var showBand: Bool {
+        model.listenState == .listening || model.listenState == .warming
+            || model.band.hasContent
+    }
+
     @ViewBuilder
     private var content: some View {
-        if model.hasContent {
-            captionStack
-                .frame(width: CaptionTheme.Metric.overlayMaxWidth, alignment: .leading)
-                .padding(.horizontal, CaptionTheme.Metric.overlayScrimHPadding)
-                .padding(.top, 16)
-                .padding(.bottom, 17)
-                .scrim(opacity: model.opacity, pinned: model.isPinned)
+        if showBand {
+            captionBand
         } else {
             // Lay the idle pill out at the full caption width (scrim stays pill-sized,
             // centred) so the centre-anchored window keeps a constant width and never
@@ -470,27 +507,93 @@ private struct OverlayRootView: View {
         }
     }
 
-    private var captionStack: some View {
+    /// The lines actually drawn, in one continuous ForEach: history first, then
+    /// the current slot. Sharing ONE identity space means the roll-up (slot →
+    /// history) is a smooth position change of the SAME element — never a
+    /// remove/insert jump. The interim slot is hidden when the user chose
+    /// `interimStyle == .hidden`.
+    private var bandLines: [BandLine] {
+        var arr = model.band.visibleCommitted
+        if let slot = model.band.visibleSlot,
+           slot.isFinal || model.interimStyle == .dimmedWithCaret {
+            arr.append(slot)
+        }
+        return arr
+    }
+
+    private var captionBand: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Banner OUTSIDE the fixed content area: pinning is a deliberate act,
+            // the one-time height change is fine (and the banner never clips).
+            if model.band.isPinned {
+                PinnedBanner(pending: model.band.pendingWhilePinned)
+            }
+            bandContent
+                .frame(width: CaptionTheme.Metric.overlayMaxWidth,
+                       height: CaptionTheme.bandContentHeight(
+                           fontSize: model.fontSize,
+                           historyLines: model.historyLineCount,
+                           secondLine: model.showSecondLine),
+                       alignment: .bottomLeading)
+                .clipped()
+        }
+        .padding(.horizontal, CaptionTheme.Metric.overlayScrimHPadding)
+        .padding(.top, 14)
+        .padding(.bottom, 15)
+        .scrim(opacity: model.opacity, pinned: model.band.isPinned)
+    }
+
+    @ViewBuilder
+    private var bandContent: some View {
+        let lines = bandLines
         VStack(alignment: .leading, spacing: 12) {
-            if model.isPinned { PinnedBanner(pending: model.pendingCount) }
-            ForEach(Array(model.visible.enumerated()), id: \.element.id) { idx, line in
-                CaptionUnit(
+            if lines.isEmpty {
+                bandStatusRow
+            }
+            ForEach(lines) { line in
+                BandLineView(
                     line: line,
                     fontSize: model.fontSize,
                     primaryOnTop: model.primaryLineOnTop,
                     showSecond: model.showSecondLine,
-                    isLatest: idx == model.visible.count - 1
+                    isLatest: line.id == lines.last?.id,
+                    reduceMotion: model.reduceMotion
                 )
-                .opacity(idx == model.visible.count - 1 ? 1.0 : CaptionTheme.Metric.historyOpacity)
-                .transition(model.reduceMotion ? .identity : .opacity.combined(with: .move(edge: .bottom)))
-            }
-            if model.interimVisible {
-                InterimLine(text: model.interim, chinese: model.interimChinese,
-                            showSecond: model.showSecondLine, source: model.interimSource,
-                            fontSize: model.fontSize, reduceMotion: model.reduceMotion)
+                .opacity(line.id == lines.last?.id ? 1.0 : CaptionTheme.Metric.historyOpacity)
+                .transition(model.reduceMotion
+                            ? .identity
+                            : .opacity.animation(.easeOut(duration: CaptionTheme.Metric.evictDuration)))
             }
         }
-        .animation(model.reduceMotion ? nil : .easeOut(duration: CaptionTheme.Metric.enterDuration), value: model.lines)
+        .frame(maxWidth: .infinity, alignment: .bottomLeading)
+        .animation(model.reduceMotion ? nil : .easeOut(duration: CaptionTheme.Metric.enterDuration),
+                   value: model.band)
+    }
+
+    /// Small status row inside the (otherwise empty) band, so a fresh meeting
+    /// shows where captions will appear and whether the model is still loading.
+    private var bandStatusRow: some View {
+        HStack(spacing: 8) {
+            switch model.listenState {
+            case .warming:
+                BreathingDot(color: CaptionTheme.Palette.accentSystem, animated: !model.reduceMotion, size: 6)
+                    .frame(width: 6, height: 6)
+                Text("模型載入中…可先開始說話（開頭不會漏）")
+            case .listening:
+                BreathingDot(color: CaptionTheme.Palette.mic, animated: !model.reduceMotion, size: 6)
+                    .frame(width: 6, height: 6)
+                Text("聆聽中… Listening")
+            case .loading:
+                BreathingDot(color: CaptionTheme.Palette.accentSystem, animated: !model.reduceMotion, size: 6)
+                    .frame(width: 6, height: 6)
+                Text("準備模型… Preparing")
+            case .idle:
+                Circle().fill(CaptionTheme.Palette.inkTertiary).frame(width: 6, height: 6)
+                Text("待命 Idle")
+            }
+        }
+        .font(.system(size: 12, weight: .medium))
+        .foregroundStyle(Color(hex: 0xC9CDD4).opacity(0.85))
     }
 }
 
