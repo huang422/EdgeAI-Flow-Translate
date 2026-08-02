@@ -57,12 +57,31 @@ jobs:
         run: brew install xcodegen
 
       - name: Build DMG
+        # build_dmg.sh signs the staged app (inside-out, hardened runtime) BEFORE
+        # packaging when DEVELOPER_ID_APP is present — signing after packaging
+        # ships an ad-hoc app inside the DMG and notarization always fails.
         run: bash Packaging/build_dmg.sh
 
       # Optional notarization — runs only when signing secrets are present.
       - name: Notarize DMG
         if: ${{ env.DEVELOPER_ID_APP != '' }}
         run: bash Packaging/notarize.sh
+
+      # No signing secrets → tell downloaders exactly what to expect.
+      - name: Mark release as unsigned
+        if: ${{ env.DEVELOPER_ID_APP == '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ needs.release-please.outputs.tag_name }}"
+          BODY="$(gh release view "$TAG" --json body -q .body)"
+          NOTE="> ⚠️ 此 DMG 未經 Apple 公證（unsigned build）。首次開啟請在 App 上按右鍵 → 打開，或執行 \`xattr -cr /Applications/FlowTranslate.app\`。"
+          case "$BODY" in
+            *"unsigned build"*) echo "note already present" ;;
+            *) gh release edit "$TAG" --notes "$BODY
+
+          $NOTE" ;;
+          esac
 
       - name: Upload DMG to the GitHub Release
         env:

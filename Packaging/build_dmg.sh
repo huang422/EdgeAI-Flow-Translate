@@ -36,6 +36,18 @@ mkdir -p "$EXPORT_DIR"
 cp -R "$APP_PATH" "$EXPORT_DIR/"
 ln -sf /Applications "$EXPORT_DIR/Applications"
 
+# Sign the STAGED app BEFORE packaging (the DMG snapshots its contents — signing
+# afterwards used to ship an ad-hoc app inside a "signed" DMG and notarization
+# always failed). Runs only when a Developer ID is configured.
+if [ -n "${DEVELOPER_ID_APP:-}" ]; then
+    echo "==> Signing staged app with Developer ID"
+    bash Packaging/sign_app.sh "$EXPORT_DIR/${APP_NAME}.app"
+else
+    echo "WARNING: DEVELOPER_ID_APP not set — the DMG will contain an AD-HOC"
+    echo "         signed app. Gatekeeper will block it on other Macs until the"
+    echo "         user right-clicks → Open (or runs: xattr -cr the app)."
+fi
+
 echo "==> Creating DMG"
 rm -f "$DMG_PATH"
 hdiutil create \
