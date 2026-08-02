@@ -45,6 +45,22 @@ import Foundation
         reopened.clear()
     }
 
+    @Test func updateSourceTextPersists() throws {
+        // A repair that only lived in memory would be lost by the crash-recovery
+        // path — the corrected transcript has to be the durable one.
+        let dir = tempDir()
+        let store = try FileTranscriptStore(directory: dir)
+        let session = store.beginSession(settings: .default)
+        let seg = segment(session, 0, "we run it on cooper netties")
+        store.append(seg)
+        store.updateSourceText(segmentId: seg.id, corrected: "we run it on Kubernetes")
+        store.flush()
+
+        let reopened = try FileTranscriptStore(directory: dir)
+        #expect(reopened.segments.first?.sourceText == "we run it on Kubernetes")
+        reopened.clear()
+    }
+
     @Test func recoversIncompleteSessionAfterCrash() throws {
         let dir = tempDir()
         let store = try FileTranscriptStore(directory: dir)

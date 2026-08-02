@@ -4,20 +4,35 @@ import Foundation
 
 @Suite struct CaptionSettingsTests {
     @Test func defaultsAreEnglishToTraditionalChinese() {
+        // The shipped configuration: English in, Traditional Chinese out, the
+        // lowest-latency tier, with speakers labelled.
         let s = CaptionSettings.default
         #expect(s.firstLanguage == "en-US")
+        #expect(s.asrTier == "560ms")
         #expect(s.secondCaptionEnabled == true)
         #expect(s.secondLanguage == .traditionalChinese)
         #expect(s.needsTranslation == true)
-        #expect(s.diarizationEnabled == false)
+        #expect(s.diarizationEnabled == true)
     }
 
     @Test func roundTripPreservesDiarizationSetting() throws {
         var s = CaptionSettings.default
-        s.diarizationEnabled = true
+        s.diarizationEnabled = false
         let back = try JSONDecoder().decode(
             CaptionSettings.self, from: JSONEncoder().encode(s))
-        #expect(back.diarizationEnabled == true)
+        #expect(back.diarizationEnabled == false)
+    }
+
+    @Test func acousticContextExperimentDefaultsOff() {
+        #expect(CaptionSettings.default.keepAcousticContext == false)
+    }
+
+    @Test func roundTripPreservesAcousticContextSetting() throws {
+        var s = CaptionSettings.default
+        s.keepAcousticContext = true
+        let back = try JSONDecoder().decode(
+            CaptionSettings.self, from: JSONEncoder().encode(s))
+        #expect(back.keepAcousticContext == true)
     }
 
     @Test func secondCaptionCanBeDisabled() {
@@ -32,9 +47,33 @@ import Foundation
     }
 
     @Test func supportedLanguagesCoverExpectedCount() {
-        // 19 transcription-ready + 13 broad-coverage = 32
-        #expect(SupportedASRLanguages.all.count == 32)
+        // 19 transcription-ready + 14 broad-coverage = 33
+        #expect(SupportedASRLanguages.all.count == 33)
         #expect(SupportedASRLanguages.locale(for: "en-US") != nil)
+    }
+
+    @Test func bothMandarinLocalesAreOffered() {
+        // The model ships separate prompts for them (zh-CN → 4, zh-TW → 5), so
+        // offering only one meant Taiwanese Mandarin ran under the Mainland prompt.
+        #expect(SupportedASRLanguages.locale(for: "zh-CN") != nil)
+        #expect(SupportedASRLanguages.locale(for: "zh-TW") != nil)
+    }
+
+    @Test func traditionalSourceNeedsNoTranslationToTraditional() {
+        // zh-TW already recognizes into Traditional characters — translating it
+        // to Traditional Chinese would burn a generation to reproduce the input.
+        let s = CaptionSettings(firstLanguage: "zh-TW", secondLanguage: .traditionalChinese)
+        #expect(s.needsTranslation == false)
+    }
+
+    @Test func simplifiedSourceStillConvertsToTraditional() {
+        let s = CaptionSettings(firstLanguage: "zh-CN", secondLanguage: .traditionalChinese)
+        #expect(s.needsTranslation == true)
+    }
+
+    @Test func mandarinToEnglishAlwaysTranslates() {
+        #expect(CaptionSettings(firstLanguage: "zh-TW", secondLanguage: .english).needsTranslation)
+        #expect(CaptionSettings(firstLanguage: "zh-CN", secondLanguage: .english).needsTranslation)
     }
 
     @Test func autoCloseOverlayDefaultsOff() {
@@ -97,6 +136,26 @@ import Foundation
         #expect(s.systemInputGainDb == 0)
         #expect(s.micInputGainDb == 0)
         #expect(s.autoGainEnabled == false)
+    }
+
+    @Test func transcriptCorrectionDefaultsOff() {
+        // It keeps the ~2.5 GB model resident for the whole meeting, so it has to
+        // be something the user opts into knowingly.
+        #expect(CaptionSettings.default.transcriptCorrectionEnabled == false)
+    }
+
+    @Test func tolerantDecodeMissingCorrectionKeyDefaultsOff() throws {
+        let json = Data(#"{"firstLanguage":"en-US"}"#.utf8)
+        let s = try JSONDecoder().decode(CaptionSettings.self, from: json)
+        #expect(s.transcriptCorrectionEnabled == false)
+    }
+
+    @Test func roundTripPreservesCorrectionSetting() throws {
+        var s = CaptionSettings.default
+        s.transcriptCorrectionEnabled = true
+        let back = try JSONDecoder().decode(
+            CaptionSettings.self, from: JSONEncoder().encode(s))
+        #expect(back.transcriptCorrectionEnabled == true)
     }
 
     @Test func roundTripPreservesGainSettings() throws {

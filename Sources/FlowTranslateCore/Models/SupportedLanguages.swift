@@ -43,7 +43,7 @@ public enum SupportedASRLanguages {
         .init(code: "uk-UA", displayName: "烏克蘭文"),
     ]
 
-    /// Broad-coverage (13 locales) — usable recognition quality.
+    /// Broad-coverage (14 locales) — usable recognition quality.
     public static let broadCoverage: [LanguageLocale] = [
         .init(code: "pl-PL", displayName: "波蘭文"),
         .init(code: "sv-SE", displayName: "瑞典文"),
@@ -54,13 +54,19 @@ public enum SupportedASRLanguages {
         .init(code: "fi-FI", displayName: "芬蘭文"),
         .init(code: "hr-HR", displayName: "克羅埃西亞文"),
         .init(code: "sk-SK", displayName: "斯洛伐克文"),
+        // The model ships SEPARATE prompts for the two Mandarin locales
+        // (`zh-CN` → 4, `zh-TW` → 5), exactly as it does for en-US/en-GB and
+        // pt-BR/pt-PT. Offering only zh-CN meant Taiwanese Mandarin was
+        // recognized under the Mainland prompt, and its output needed a
+        // Simplified→Traditional pass that zh-TW doesn't.
         .init(code: "zh-CN", displayName: "中文 (簡體/普通話)"),
+        .init(code: "zh-TW", displayName: "中文 (台灣/繁體)"),
         .init(code: "hu-HU", displayName: "匈牙利文"),
         .init(code: "ro-RO", displayName: "羅馬尼亞文"),
         .init(code: "et-EE", displayName: "愛沙尼亞文"),
     ]
 
-    /// All directly transcribable languages (32 locales).
+    /// All directly transcribable languages (33 locales).
     public static var all: [LanguageLocale] { transcriptionReady + broadCoverage }
 
     public static func locale(for code: String) -> LanguageLocale? {

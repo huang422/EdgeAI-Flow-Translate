@@ -101,6 +101,13 @@ public final class FileTranscriptStore: TranscriptStoring {
         onChange?()
     }
 
+    public func updateSourceText(segmentId: UUID, corrected: String) {
+        guard let i = indexById[segmentId] else { return }
+        _segments[i].sourceText = corrected
+        scheduleWrite()
+        onChange?()
+    }
+
     public func endSession() {
         session?.endedAt = Date()
         flush()   // guarantee the end-of-meeting state is durable on disk

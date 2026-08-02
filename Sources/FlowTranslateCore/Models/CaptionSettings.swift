@@ -29,8 +29,12 @@ public enum TranslationEngine: String, Codable, Sendable, CaseIterable, Identifi
 
 /// How the in-progress (interim) recognition line is drawn in the overlay.
 public enum InterimStyle: String, Codable, Sendable, CaseIterable {
-    /// Dimmed text with a blinking caret + dotted underline (a "still typing" cue).
-    case dimmedWithCaret
+    /// A blinking caret + dotted underline + breathing dot mark the line as
+    /// "still being recognized". The text itself is drawn exactly like every
+    /// finalized line — it used to be dimmed too, which made the live sentence
+    /// the faintest thing on screen and flashed it brighter the instant it
+    /// ended. The raw value keeps the old spelling so persisted settings decode.
+    case markedWithCaret = "dimmedWithCaret"
     /// Don't show the interim line at all (only finalized units).
     case hidden
 }
@@ -50,6 +54,24 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     /// Optional speaker diarization (pyannote 3.1 + WeSpeaker via FluidAudio):
     /// labels speakers per audio source; applied on the next Start.
     public var diarizationEnabled: Bool
+
+    /// **Experimental.** Keep the model's acoustic context across sentence
+    /// boundaries instead of resetting it at every finalize. The encoder carries
+    /// 3.36 s of left context (`att_context_size [42, 13]`) and the reset throws
+    /// it away, so the first words of each sentence are recognized cold.
+    ///
+    /// Off by default because the same reset also re-seeds the language lock and
+    /// clears the decoder state — keeping it may make the model continue the
+    /// previous sentence rather than start a new one. There is no WER harness in
+    /// this project, so this exists to be A/B'd on real speech.
+    public var keepAcousticContext: Bool
+
+    // MARK: Transcript correction (accurate track — never the live captions)
+
+    /// Whether the on-device Qwen model repairs finalized sentences in the
+    /// recorded transcript. Off by default: it keeps the ~2.5 GB model resident
+    /// for the whole meeting even when Apple handles translation.
+    public var transcriptCorrectionEnabled: Bool
 
     // MARK: Input gain (help a quiet meeting participant clear the level gates)
 
@@ -94,14 +116,19 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         translationEngine: TranslationEngine = .system,
         clickThrough: Bool = true,
         asrTier: String = "560ms",
-        diarizationEnabled: Bool = false,
+        // On by default: knowing who said what is core to a meeting transcript,
+        // and the labels flow into the summary and exports. Costs a ~60 MB model
+        // and one pyannote inference per finalized sentence.
+        diarizationEnabled: Bool = true,
+        transcriptCorrectionEnabled: Bool = false,
+        keepAcousticContext: Bool = false,
         systemInputGainDb: Double = 0,
         micInputGainDb: Double = 0,
         autoGainEnabled: Bool = false,
         scenario: CaptureScenario = .video,
         primaryLineOnTop: PrimaryLine = .original,
         historyLineCount: Int = 1,
-        interimStyle: InterimStyle = .dimmedWithCaret,
+        interimStyle: InterimStyle = .markedWithCaret,
         overlayOpacity: Double = 0.66,
         overlayFontSize: Double = 16,
         overlayPosition: CGPoint? = nil,
@@ -114,6 +141,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.clickThrough = clickThrough
         self.asrTier = asrTier
         self.diarizationEnabled = diarizationEnabled
+        self.transcriptCorrectionEnabled = transcriptCorrectionEnabled
+        self.keepAcousticContext = keepAcousticContext
         self.systemInputGainDb = CaptionSettings.clampGain(systemInputGainDb)
         self.micInputGainDb = CaptionSettings.clampGain(micInputGainDb)
         self.autoGainEnabled = autoGainEnabled
@@ -141,6 +170,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         clickThrough = try c.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? d.clickThrough
         asrTier = try c.decodeIfPresent(String.self, forKey: .asrTier) ?? d.asrTier
         diarizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? d.diarizationEnabled
+        transcriptCorrectionEnabled = try c.decodeIfPresent(Bool.self, forKey: .transcriptCorrectionEnabled) ?? d.transcriptCorrectionEnabled
+        keepAcousticContext = try c.decodeIfPresent(Bool.self, forKey: .keepAcousticContext) ?? d.keepAcousticContext
         systemInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .systemInputGainDb) ?? d.systemInputGainDb)
         micInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .micInputGainDb) ?? d.micInputGainDb)
         autoGainEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoGainEnabled) ?? d.autoGainEnabled
@@ -166,12 +197,21 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         let firstBase = String(firstLanguage.prefix(2)).lowercased()
         let secondBase = String(secondLanguage.rawValue.prefix(2)).lowercased()
         if firstBase != secondBase { return true }
-        // Same base language (e.g. both Chinese): still needs script conversion
-        // when a simplified source maps to a traditional target.
+        // Same base language (both Chinese): only a SIMPLIFIED source needs
+        // converting to a Traditional target. Comparing the raw codes would
+        // make `zh-TW` → `zh-Hant` look like a translation job and push every
+        // already-Traditional sentence through the translator for nothing.
         if firstBase == "zh" {
+            if secondLanguage == .traditionalChinese { return !sourceIsTraditionalChinese }
             return firstLanguage.lowercased() != secondLanguage.rawValue.lowercased()
         }
         return false
+    }
+
+    /// Whether the recognition language already produces Traditional characters.
+    var sourceIsTraditionalChinese: Bool {
+        let c = firstLanguage.lowercased()
+        return c.hasSuffix("-tw") || c.hasSuffix("-hk") || c.contains("hant")
     }
 
     public static let `default` = CaptionSettings()

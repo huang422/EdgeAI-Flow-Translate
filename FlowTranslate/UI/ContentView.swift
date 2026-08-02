@@ -220,11 +220,15 @@ struct ContentView: View {
                         idleGuidance
                     }
                     ForEach(vm.lines) { line in
-                        TranscriptRow(line: line).id(line.id)
+                        TranscriptRow(line: line,
+                                      showSpeakerSlot: vm.settings.diarizationEnabled)
+                            .id(line.id)
                             .transition(.opacity)
                     }
                     if !vm.interimText.isEmpty {
-                        InterimRow(text: vm.interimText, chinese: vm.interimChinese, source: vm.currentInterimSourceForUI)
+                        InterimRow(text: vm.interimText, chinese: vm.interimChinese,
+                                   source: vm.currentInterimSourceForUI,
+                                   showSpeakerSlot: vm.settings.diarizationEnabled)
                     }
                     Color.clear.frame(height: 1).id(Self.bottomAnchor)
                 }
@@ -365,18 +369,49 @@ private struct VolumeMeter: View {
 
 // MARK: - Transcript rows
 
+/// Leading geometry shared by every transcript row, so a finalized line, the
+/// in-progress line and their translations all start at the same x — with or
+/// without the speaker column. Each row hardcoding its own indent (it was 13 =
+/// dot + gap) is what misaligned them the moment a speaker label appeared.
+private enum TranscriptRowLayout {
+    static let dotSize: CGFloat = 6
+    static let gap: CGFloat = 7
+    static let labelSize: CGFloat = 10
+    static var speakerWidth: CGFloat { CaptionTheme.speakerSlotWidth(labelSize: labelSize) }
+
+    /// Where the caption text — and therefore its wrapped lines and translation
+    /// — begins.
+    static func textIndent(speakerSlot: Bool) -> CGFloat {
+        speakerSlot ? dotSize + gap + speakerWidth + gap : dotSize + gap
+    }
+}
+
 private struct TranscriptRow: View {
     let line: CaptionLine
+    /// Mirrors the diarization setting so the speaker column is reserved for
+    /// every row, not just the ones that happen to carry a label.
+    var showSpeakerSlot = false
+
+    /// Reserve the speaker column when diarization is on — or whenever a label
+    /// exists, so one can never be dropped because the setting is stale.
+    private var reservesSpeakerSlot: Bool { showSpeakerSlot || line.speakerLabel != nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Circle().fill(CaptionTheme.Palette.sourceDot(line.source)).frame(width: 6, height: 6)
+            HStack(alignment: .firstTextBaseline, spacing: TranscriptRowLayout.gap) {
+                Circle().fill(CaptionTheme.Palette.sourceDot(line.source))
+                    .frame(width: TranscriptRowLayout.dotSize, height: TranscriptRowLayout.dotSize)
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
-                if let speaker = line.speakerLabel {
-                    Text(speaker)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                if reservesSpeakerSlot {
+                    // Fixed-width column: the sentence starts at the same x with
+                    // or without a label, and its wrapped lines stay inside the
+                    // text column instead of running back under the speaker.
+                    Text(line.speakerLabel ?? "")
+                        .font(.system(size: TranscriptRowLayout.labelSize, weight: .bold))
+                        .foregroundStyle(CaptionTheme.Palette.inkSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(width: TranscriptRowLayout.speakerWidth, alignment: .leading)
                 }
                 Text(line.english)
                     .font(.system(size: 13.5, weight: .semibold))
@@ -391,7 +426,7 @@ private struct TranscriptRow: View {
                 Text(zh)
                     .font(.system(size: 12.5))
                     .foregroundStyle(Color(hex: 0x9DA3AE))
-                    .padding(.leading, 13)
+                    .padding(.leading, TranscriptRowLayout.textIndent(speakerSlot: reservesSpeakerSlot))
                     .textSelection(.enabled)
             }
         }
@@ -415,12 +450,20 @@ private struct InterimRow: View {
     let text: String
     let chinese: String
     let source: AudioSourceType
+    /// Reserve the same speaker column as the finalized rows even though an
+    /// in-progress line never has a label yet — otherwise the live line sits a
+    /// whole column to the left of everything above it.
+    var showSpeakerSlot = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: 7) {
-                Circle().fill(CaptionTheme.Palette.sourceDot(source)).frame(width: 6, height: 6)
+            HStack(alignment: .firstTextBaseline, spacing: TranscriptRowLayout.gap) {
+                Circle().fill(CaptionTheme.Palette.sourceDot(source))
+                    .frame(width: TranscriptRowLayout.dotSize, height: TranscriptRowLayout.dotSize)
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+                if showSpeakerSlot {
+                    Color.clear.frame(width: TranscriptRowLayout.speakerWidth, height: 1)
+                }
                 Text(text)
                     .font(.system(size: 13.5, weight: .medium))
                     .foregroundStyle(CaptionTheme.Palette.inkPrimary.opacity(0.66))
@@ -432,7 +475,7 @@ private struct InterimRow: View {
                 Text(chinese)
                     .font(.system(size: 12.5))
                     .foregroundStyle(Color(hex: 0x9DA3AE).opacity(0.7))
-                    .padding(.leading, 13)
+                    .padding(.leading, TranscriptRowLayout.textIndent(speakerSlot: showSpeakerSlot))
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)

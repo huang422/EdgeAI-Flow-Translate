@@ -50,14 +50,8 @@ final class MLXTranslator {
 
     /// Decode-length cap proportional to the input (subtitle sentences are short;
     /// a translation never legitimately needs more than ~6 tokens per source word).
-    /// Whitespace word-count fails for unspaced scripts (a Chinese/Japanese line
-    /// is ONE "word" → cap stuck at the floor and long lines got truncated), so
-    /// the estimate also considers characters/3 as a word-equivalent proxy.
     static func tokenCap(for text: String) -> Int {
-        let spaced = text.split { $0 == " " || $0 == "\n" }.count
-        let byChars = text.count / 3            // CJK ≈ 1 word per ~1-3 chars
-        let units = max(1, max(spaced, byChars))
-        return min(256, max(64, units * 6))
+        min(256, max(64, SpokenTextMetrics.units(text) * 6))
     }
 
     // MARK: - Prompts

@@ -161,10 +161,11 @@ public struct TranscriptExporter: TranscriptExporting {
 
     /// Cached formatters — constructing them per segment made export O(n) in
     /// formatter allocations (they are notoriously expensive to build).
-    /// `nonisolated(unsafe)`: (NS)DateFormatter has been documented thread-safe
-    /// since macOS 10.9, it just isn't annotated Sendable.
+    /// `ISO8601DateFormatter` still needs `nonisolated(unsafe)` — it is documented
+    /// thread-safe since macOS 10.9 but isn't annotated `Sendable`. `DateFormatter`
+    /// now is, so the same annotation there would be redundant.
     nonisolated(unsafe) private static let isoFormatter = ISO8601DateFormatter()
-    nonisolated(unsafe) private static let clockFormatter: DateFormatter = {
+    private static let clockFormatter: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "HH:mm:ss"
         return f

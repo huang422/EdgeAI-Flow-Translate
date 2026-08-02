@@ -18,20 +18,25 @@ bilingual transcript and an end-of-meeting summary. **Everything runs on-device*
 the only network access is a one-time model download.
 
 - **Speech recognition** with NVIDIA **Nemotron‑3.5 Streaming ASR — Multilingual (0.6B)** on the Apple Neural Engine (via [FluidAudio](https://github.com/FluidInference/FluidAudio)). Pick a language or use **Auto** for per-sentence detection / mixed-language audio.
-- **Optional speaker diarization** with **pyannote/speaker-diarization-3.1** and WeSpeaker embeddings on Core ML (via FluidAudio), labeling speakers independently in microphone and system audio. Speaker labels appear in captions, transcripts, summaries, and exports.
+- **Speaker diarization** (on by default) with **pyannote/speaker-diarization-3.1** and WeSpeaker embeddings on Core ML (via FluidAudio), labeling speakers independently in microphone and system audio. Speaker labels appear in captions, transcripts, summaries, and exports. Turn it off to save a ~60 MB model and one inference per finalized sentence.
 - **Live translation** (default English → Traditional Chinese, also live on the in-progress sentence). A selectable **translation engine**: **Apple** (Apple's on-device **Translation** framework when it supports the pair, Qwen fallback otherwise — default) or **Qwen** (always the on-device **MLX Qwen3-4B-Instruct-2507**, non-thinking, with bilingual rolling context for consistent terminology). **Auto-detect** first caption always uses Qwen (Apple can't auto-detect a source). The Qwen path is tuned for real time: a bounded queue keeps the newest sentences fresh, common short phrases ("Okay.", "Can you hear me?") translate instantly from a lookup table, and a Traditional-Chinese guard fixes rare Simplified-character leakage and Mainland-only terms.
-- **Floating, click-through caption overlay** — a stacked list of caption units (English original on top, translation below, with a source-colour dot), the in-progress line shown live with a blinking caret; newest line brightest, older ones dimmed. Hover reveals a control bar (drag, pin/pause, copy, font size, reset). It stays on top of full-screen meetings/videos and only the control bar is interactive, so clicks pass straight through to the app behind.
+- **Floating, click-through caption overlay** — a stacked list of caption units (English original on top, translation below, with a source-colour dot). Built so **nothing on screen moves or changes appearance when a sentence finalizes**: every line renders at full brightness in one weight, the in-progress line is marked only by a breathing dot, blinking caret and dotted underline, and the speaker name (when diarization is on) sits in a fixed-width slot so it can't shift the text when it arrives. The band is a **fixed-height window onto text that is never truncated** — it scrolls, bottom-anchored, so the newest words hold a constant position while longer sentences move up out of view rather than being cut off. **Pin (⌃⌥P)** freezes the band and lets you scroll back through the lines it is holding — that is the visible-lines setting plus whatever the current sentence has pushed out of view, not the whole meeting; the full record lives in the transcript window. Hover reveals a control bar (drag, pin/pause, copy, font size, reset). It stays on top of full-screen meetings/videos and stays click-through, so clicks pass straight through to the app behind.
 - **System audio _and_ microphone**, captured separately and tagged per source. While system audio is playing, mic echo is suppressed so the same speech isn't transcribed twice.
 - **Adjustable input gain / auto-gain** — boost a quiet source (e.g. a soft-spoken meeting participant) *before* recognition so it still clears the voice-activity gate. A fixed per-source gain (**System** / **Mic**, 0–30 dB) plus an optional **auto-gain** that lifts quiet speech toward a target loudness (rate-limited + noise-gated), with a soft limiter so boosted peaks never clip.
 - **Full bilingual transcript**, persisted to disk (crash-safe) and exportable to Markdown / TXT / SRT / VTT / JSON.
+- **Optional AI transcript correction** (off by default) — a second, *non-real-time* quality track. Finalized sentences are repaired by the shared Qwen model (mis-heard words, names, punctuation) and the result flows into the transcript, summary and exports. The live overlay is deliberately never rewritten, and corrections always yield the model to live translation, so captions keep their latency.
 - **Post-meeting summary** via an on-demand **MLX Qwen3-4B-Instruct-2507 (4-bit)** LLM on the GPU — overview, key points, decisions, action items, Q&A, glossary, produced in **separate English and Traditional Chinese versions** (with a pure-Swift extractive fallback when offline / on load failure).
 - **Global shortcut ⌃⌥C** toggles the overlay from any app (e.g. while Zoom is focused).
 - **Private by design** — audio and text never leave your Mac.
 
 > Target hardware: **Apple M1 Pro / 16 GB**, macOS 15+ (Apple Silicon). The
-> real-time loop deliberately avoids loading any large LLM so it stays fast and
-> memory-light; the heavy summarization model is only loaded on demand, after the
-> meeting ends.
+> real-time loop keeps only the ASR on the ANE, and the default setup never loads
+> a large LLM at all: Apple's Translation framework handles the second caption and
+> the ~2.5 GB Qwen model stays on disk until you ask for the summary. Three opt-in
+> choices do bring it into memory for the whole meeting — selecting the **Qwen**
+> translation engine, using **Auto** first-caption detection (Apple can't
+> auto-detect, so Qwen translates), or turning on **AI transcript correction**.
+> Each says so in Settings.
 
 ---
 
@@ -248,6 +253,7 @@ sequenceDiagram
     participant C as TextCleaner
     participant T as TranslationService
     participant D as TranscriptStore
+    participant G as QwenCorrector
 
     A->>R: PCM buffer
     R->>R: convert → 16kHz mono Float32, tag source, apply input gain
@@ -261,6 +267,11 @@ sequenceDiagram
     C->>T: translate (async, never blocks interim)
     T-->>O: translation (line 2)
     T->>D: updateTranslation
+    opt AI transcript correction enabled
+        C->>G: enqueue (low priority, yields to translation)
+        G->>D: updateSourceText — gated repair
+        Note over O,G: the overlay is never revisited
+    end
 ```
 
 **Why it stays real-time:** interim captions render straight from the ASR partial
@@ -268,13 +279,20 @@ callback. Cleanup and translation run **only on finalized sentences** and never
 sit in the interim path, so display latency is bounded by the ASR tier, not by
 translation.
 
+**Two quality tracks.** Everything above the `opt` block is the *fast track*: it
+must keep up with speech, so its text is whatever the recognizer produced and is
+never rewritten once shown. Optional correction is the *accurate track*: it lags
+by design, only runs while the model is otherwise idle, and lands solely in the
+stored transcript (and therefore the summary and exports). Splitting them is what
+lets the record improve without the captions jittering.
+
 ### Module map
 
 | Layer | Type | Responsibility |
 |-------|------|----------------|
 | `AudioCapture/` | App | Capture mic + system audio, resample, per-source input gain (AGC + limiter), route with source tags |
 | `ASR/` | App | FluidAudio Nemotron streaming wrapper + Silero VAD endpointing |
-| `Translation/` | App | Queue finalized text → Apple translation or the shared MLX Qwen (`QwenModelHost`) for auto / unsupported pairs |
+| `Translation/` | App | Queue finalized text → Apple translation or the shared MLX Qwen (`QwenModelHost`) for auto / unsupported pairs; `QwenCorrector` repairs the recorded transcript on a separate low-priority queue |
 | `UI/` | App | Control panel, settings, click-through `NSPanel` overlay |
 | `Support/` | App | Permissions, settings persistence, global hotkeys, MLX memory governance |
 | `FlowTranslateCore` | Package | Models, protocols, transcript store, exporter, summarizer, text utils — pure & unit-tested |
@@ -294,7 +312,16 @@ per task rather than putting everything on MLX:
 > **Is the `mlx-community` Nemotron faster?** That model is the *same* NVIDIA
 > weights in MLX format. Published MLX numbers (≈112× realtime) are **batch**
 > benchmarks on an M4 Max / 64 GB; they don't transfer to an M1 Pro / 16 GB, and
-> caption latency is bounded by the streaming chunk **tier** (560/1120 ms),
+> **On the latency tiers:** each is a separately converted Core ML package, not a
+> runtime switch — the encoder's tensor shapes are baked in at conversion, so only
+> ~7% of a tier's bytes (the decoder/joint side) are byte-identical to another
+> tier's. All tiers share the same `att_context_size` of `[42, 13]` (3.36 s of
+> left context), so they differ in chunk size, not in how much history the model
+> sees. FluidAudio also converted some tiers from a newer checkpoint than others
+> (`nemotron-3.5-asr-streaming-0.6b` vs `nemotron-asr-streaming-multilingual-0.6b`),
+> which is visible in each variant's `metadata.json`.
+
+> caption latency is bounded by the streaming chunk **tier** (560/1120/2240 ms),
 > not by raw throughput. For an always-on, on-battery, GPU-shared workload the
 > ANE path is the better-optimized choice — so the ASR stays on CoreML/ANE while
 > MLX is reserved for the summarizer, where it actually helps.
@@ -306,9 +333,9 @@ structured JSON into a `Summary`, then the model is released. If it can't run (o
 / first-run download failed / low memory) it transparently falls back to the
 pure-Swift extractive summarizer.
 
-**One shared Qwen, bounded GPU cache.** Live translation and the summary both run
-through a single `QwenModelHost`, so the 4-bit model is loaded into memory **at most
-once** (never duplicated across consumers). MLX's Metal buffer cache is bounded at
+**One shared Qwen, bounded GPU cache.** Live translation, optional transcript
+correction and the summary all run through a single `QwenModelHost`, so the 4-bit
+model is loaded into memory **at most once** (never duplicated across consumers). MLX's Metal buffer cache is bounded at
 launch and cleared at lifecycle boundaries (`FlowTranslate/Support/MLXMemory.swift`),
 so freed weights / KV-caches are returned to the OS instead of leaving the app sitting
 at many GB after a meeting or a translation-backend switch.
@@ -320,14 +347,16 @@ at many GB after a meeting or a translation-backend switch.
 Open the **gear icon** in the top-right. Preferences are persisted automatically.
 
 - **Scenario** — what the *system audio* is: **🎬 Video** (edited content: sentences finalize after a 0.3 s pause, snappier captions) or **👥 Meeting** (live speakers: tolerates 0.8 s thinking pauses so sentences aren't cut in half; longer max turn). The microphone is always a live human, so it always uses the meeting timing. Values follow streaming-caption practice (Azure ~0.5 s segmentation default, AssemblyAI 0.7 s + longer for conversations, Deepgram ≥1 s utterance ends) and pause research: edited/read speech pauses 0.15–0.5 s at sentence boundaries only, while spontaneous speech hesitates 0.5–1.5 s mid-sentence. Applies on the next **Start**.
-- **First caption (recognition) language** — any of Nemotron's 32 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`.
-- **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (more accurate).
-- **Speaker diarization** — optionally download and run the Core ML conversion of `pyannote/speaker-diarization-3.1` with WeSpeaker embeddings on microphone and system audio. Token timestamps split text at measured speaker changes instead of ASR chunk boundaries. Each source keeps an independent speaker database. Applies on the next **Start**.
+- **First caption (recognition) language** — any of Nemotron's 33 supported locales, or **Auto** (per-sentence detection / mixed-language). Default `en-US`. **Naming the language is an accuracy setting, not just a lock:** the model ships as two builds, and a Latin-script locale loads a vocabulary-pruned one (2,828 tokens instead of 13,087), so there are far fewer confusable words. Auto always loads the full multilingual build — use it only when the audio really does switch languages. Mandarin is offered as both `zh-CN` and `zh-TW`, which the model prompts separately; picking `zh-TW` also means the recognized text is already Traditional, so no Simplified→Traditional pass runs.
+- **Latency tier (advanced)** — `560ms` (most real-time, default) / `1120ms` (balanced) / `2240ms` (most accurate, FluidAudio's recommended quality tier). A higher tier hears more audio per step, so accuracy improves and caption updates get chunkier. Applies on the next **Start**.
+- **AI transcript correction** — off by default. After a sentence is finalized, the shared Qwen model repairs mis-heard words, names and punctuation **in the recorded transcript only**. It runs on a separate low-priority queue behind live translation, so captions are never delayed, and the floating overlay is never rewritten — a line you have already read stays as it was. Every repair passes a safety gate (length ratio, digit preservation, bounded character edit distance) before it can replace anything; anything that looks like a paraphrase is discarded. Keeps the ~2.5 GB model resident for the whole meeting.
+- **Speaker diarization** — **on by default.** Downloads and runs the Core ML conversion of `pyannote/speaker-diarization-3.1` with WeSpeaker embeddings on microphone and system audio. Token timestamps split text at measured speaker changes instead of ASR chunk boundaries. Each source keeps an independent speaker database. It costs a ~60 MB model and one inference per finalized sentence, so turn it off if you don't need speaker labels. Applies on the next **Start**.
+- **Carry acoustic context (experimental)** — off by default. The encoder holds 3.36 s of audio history (`att_context_size [42, 13]`), which is normally cleared at every sentence end, so each sentence is recognized cold. Keeping it may sharpen the opening words, but it also skips the language-lock re-seed and can let one sentence run on into the next. There is no WER harness here, so it ships as a switch to compare on your own speech. Applies on the next **Start**.
 - **Second caption** — turn translation on/off; target **Traditional Chinese** or **English**; engine **Apple** (fastest, Qwen fallback for unsupported pairs) or **Qwen** (context-aware quality; fixed to Qwen when the first caption is **Auto**). A status line shows the active source → target and engine (with live load progress).
-- **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through, and **auto-close on stop** (off by default — the overlay stays put and just shows an idle state when a meeting ends). The overlay is a **stacked caption list** (original + translation per line, newest brightest, older dimmed), draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
+- **Overlay presentation** — font size (12–22), background opacity, primary line (original / translation), visible lines (1–3), interim style, click-through, and **auto-close on stop** (off by default — the overlay stays put and just shows an idle state when a meeting ends). The overlay is a **stacked caption list** (original + translation per line, all at the same full brightness — the live line is marked by its dot, caret and underline, never by being dimmer). Each unit's window is two recognition rows tall; longer sentences scroll instead of truncating, and **pin (⌃⌥P)** freezes the band so you can scroll back. Draggable, with a hover control bar and reset-to-defaults. Toggle anywhere with **⌃⌥C**, pin/pause with **⌃⌥P**, font size with **⌃⌥=** / **⌃⌥-**.
 - **Audio input** — a fixed **input gain** per source (**System gain** / **Mic gain**, 0–30 dB) to make a quiet speaker louder so they clear the voice-activity threshold, plus **Auto-gain** which adaptively raises quiet speech toward a target loudness (rate-limited, noise-gated, boost-only). A soft limiter keeps boosted peaks from clipping. Off by default (0 dB, auto-gain off) so capture is unchanged until you opt in.
 
-Defaults match the primary use case: **English → Traditional Chinese**, most real-time.
+Defaults match the primary use case: first caption **`en-US`** at the **560 ms** (most real-time) tier, second caption **on**, targeting **Traditional Chinese**, with **speaker diarization on**.
 
 ---
 
@@ -339,7 +368,7 @@ Defaults match the primary use case: **English → Traditional Chinese**, most r
 | Translation after finalize | < 1 s |
 | ASR runtime | ANE-accelerated, RTFx ≫ 1× on M1 Pro |
 | Overlay | 60 fps, no stutter |
-| Memory | Real-time loop stays light; one shared Qwen (loaded on demand, freed after) + bounded MLX cache so memory returns near idle after a meeting |
+| Memory | Real-time loop stays light: mic + system audio run independent streaming pipelines over **one shared copy** of the ASR weights (~633 MB, not two), and one shared Qwen (loaded on demand, freed after) + bounded MLX cache so memory returns near idle after a meeting |
 
 ---
 
@@ -353,9 +382,12 @@ Flow-Translate/
 ├── Sources/FlowTranslateCore/    # pure logic (no platform deps)
 │   ├── Models/                   # Session, TranscriptSegment, Summary, CaptionSettings, …
 │   ├── Contracts/Protocols.swift # layer interfaces
-│   ├── Audio/AudioMath.swift     # rms / level helpers
-│   ├── Audio/Endpointer.swift    # utterance boundaries (Silero-driven)
-│   ├── Translation/              # BilingualContextBuffer, BasicTextCleaner, BasicS2TWPConverter, TraditionalChineseGuard, InstantPhraseTranslations
+│   ├── Audio/                    # AudioMath (rms/level), Endpointer (Silero-driven utterance
+│   │                             #   boundaries), SemanticEndpoint, GainProcessor
+│   ├── Captions/                 # CaptionBandState, PrefixStableText, InterimSourceArbiter
+│   ├── Translation/              # BilingualContextBuffer, BasicTextCleaner, BasicS2TWPConverter,
+│   │                             #   TraditionalChineseGuard, InstantPhraseTranslations,
+│   │                             #   TranscriptCorrectionGate, SpokenTextMetrics
 │   ├── Transcript/               # In-memory + file (crash-safe) stores, exporter
 │   └── Summarization/            # ExtractiveSummarizer (pure-Swift fallback)
 ├── FlowTranslate/                # macOS app (SwiftUI + AppKit)

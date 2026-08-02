@@ -8,9 +8,14 @@ options:
 packages:
   FlowTranslateCore:
     path: .
+  # Pinned exactly: no Package.resolved is committed (it lives inside the
+  # gitignored .xcodeproj), so CI re-resolves from scratch and an open range
+  # silently upgrades the build. 0.15.5 dropped `DownloadUtils`, which this app
+  # uses for model-download progress — an open `from:` meant CI broke the moment
+  # that version shipped, with no change on our side.
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
-    from: "0.15.0"
+    exactVersion: 0.15.4
   # Pinned to a minor version so the MLXLLM/MLXLMCommon API matches our code.
   # 2.29.x is required to compile under Xcode 26 / Swift 6.
   MLXSwiftExamples:

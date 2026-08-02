@@ -38,6 +38,10 @@ public protocol TranscriptStoring: AnyObject {
     func beginSession(settings: CaptionSettings) -> Session
     func append(_ segment: TranscriptSegment)
     func updateTranslation(segmentId: UUID, translated: String)
+    /// Replace a segment's recognized text with a gated LLM repair (the accurate
+    /// track). Only ever called for the stored transcript — the live captions
+    /// keep whatever the ASR produced.
+    func updateSourceText(segmentId: UUID, corrected: String)
     func endSession()
 }
 

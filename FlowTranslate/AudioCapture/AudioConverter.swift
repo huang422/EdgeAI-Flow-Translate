@@ -25,7 +25,16 @@ public final class AudioConverter {
         let inputFormat = inputBuffer.format
 
         if converter == nil || lastInputFormat != inputFormat {
-            converter = AVAudioConverter(from: inputFormat, to: targetFormat)
+            let c = AVAudioConverter(from: inputFormat, to: targetFormat)
+            // Capture is typically 48 kHz, so this is a 3:1 decimation and the
+            // anti-alias filter decides how much energy above 8 kHz folds back
+            // INTO the speech band. Aliasing is exactly the kind of distortion
+            // an acoustic model has never seen in training, so it is worth the
+            // best filter available — set once per format, never per buffer,
+            // and the output is 16 kHz mono so the cost is negligible.
+            c?.sampleRateConverterQuality = AVAudioQuality.max.rawValue
+            c?.sampleRateConverterAlgorithm = AVSampleRateConverterAlgorithm_Mastering
+            converter = c
             lastInputFormat = inputFormat
         }
         guard let converter else { return nil }

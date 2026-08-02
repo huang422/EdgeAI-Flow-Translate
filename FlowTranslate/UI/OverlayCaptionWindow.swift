@@ -34,7 +34,10 @@ final class OverlayModel: ObservableObject {
     @Published var historyLineCount: Int = 1 {
         didSet { band.historyLimit = historyLineCount }
     }
-    @Published var interimStyle: InterimStyle = .dimmedWithCaret
+    @Published var interimStyle: InterimStyle = .markedWithCaret
+    /// Mirrors the diarization setting: when on, every line reserves the fixed
+    /// speaker-name slot so the label arriving at finalize can't shift the text.
+    @Published var showSpeakerSlot = false
     @Published var reduceMotion = false
 
     var isPinned: Bool { band.isPinned }
@@ -130,16 +133,12 @@ private extension View {
     }
 }
 
-/// A source-colour dot; the latest finalized / listening dot gets a soft glow.
+/// A source-colour dot marking which input produced a finalized line.
 struct SourceDot: View {
     let color: Color
-    var glow: Bool = false
-    var size: CGFloat = 6
+    var size: CGFloat = CaptionTheme.Metric.dotSize
     var body: some View {
-        Circle()
-            .fill(color)
-            .frame(width: size, height: size)
-            .shadow(color: glow ? color.opacity(0.6) : .clear, radius: glow ? 4 : 0)
+        Circle().fill(color).frame(width: size, height: size)
     }
 }
 
@@ -178,15 +177,21 @@ private struct DottedUnderline: Shape {
 // MARK: - Caption band line
 
 /// One line of the caption band. The SAME view renders the line through its whole
-/// life: interim (dim, caret, breathing dot) → finalized (bright, source dot) —
-/// the text morphs in place via `contentTransition(.interpolate)` (new words fade
-/// in; cleanup edits crossfade) and the style animates, so nothing jumps.
+/// life, and the text morphs in place via `contentTransition(.interpolate)` (new
+/// words fade in; cleanup edits crossfade).
+///
+/// **The text itself never changes appearance.** One colour, one weight, full
+/// strength, whether the line is in progress, newest or old — so a sentence
+/// ending doesn't flash anything. Only the ornaments switch: a breathing dot,
+/// blinking caret and dotted underline while recognizing, a static source dot
+/// once finalized.
 private struct BandLineView: View {
     let line: BandLine
     let fontSize: Double
     let primaryOnTop: PrimaryLine
     let showSecond: Bool
-    let isLatest: Bool
+    /// Whether to reserve the fixed speaker-name slot (diarization on).
+    let showSpeakerSlot: Bool
     let reduceMotion: Bool
 
     /// Non-empty translation text, if any.
@@ -209,22 +214,38 @@ private struct BandLineView: View {
     /// translation is still pending) so the finalize morph never swaps rows.
     private var englishOnTop: Bool { !showSecondRow || primaryOnTop == .original }
 
+    /// Where the second row must start so it lines up with the text above it —
+    /// derived from the gutter that is actually rendered, not a magic number.
+    /// This was hardcoded at 14 (dot + one gap), which silently misaligned the
+    /// translation the moment the speaker slot widened the gutter.
+    private var secondRowIndent: CGFloat {
+        var x = CaptionTheme.Metric.dotSize + CaptionTheme.Metric.gutterSpacing
+        if reservesSpeakerSlot {
+            x += speakerSlotWidth + CaptionTheme.Metric.gutterSpacing
+        }
+        return x
+    }
+
+    private var speakerSlotWidth: CGFloat {
+        CaptionTheme.speakerSlotWidth(labelSize: CaptionTheme.speakerLabelSize(fontSize))
+    }
+
+    /// Reserve the speaker column when diarization is on — OR whenever a label
+    /// actually exists, so a label can never be dropped just because the mirrored
+    /// setting is stale.
+    private var reservesSpeakerSlot: Bool { showSpeakerSlot || line.speakerLabel != nil }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+        VStack(alignment: .leading, spacing: CaptionTheme.Metric.rowGap) {
+            HStack(alignment: .firstTextBaseline, spacing: CaptionTheme.Metric.gutterSpacing) {
                 dot
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
-                if let speaker = line.speakerLabel {
-                    Text(speaker)
-                        .font(.system(size: max(10, fontSize - 5), weight: .bold))
-                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
-                }
+                speakerLabel
                 if englishOnTop {
                     englishRow(font: CaptionTheme.primaryFont(fontSize), color: topColor)
                 } else {
                     Text(secondRowText)
-                        .font(CaptionTheme.primaryFont(fontSize)
-                            .weight(line.isFinal ? .semibold : .medium))
+                        .font(CaptionTheme.primaryFont(fontSize).weight(.semibold))
                         .contentTransition(reduceMotion ? .identity : .interpolate)
                         .foregroundStyle(translation == nil ? CaptionTheme.Palette.inkTertiary : topColor)
                         .fixedSize(horizontal: false, vertical: true)
@@ -243,18 +264,45 @@ private struct BandLineView: View {
                                    color: bottomEnglishColor)
                     }
                 }
-                .padding(.leading, 14)
+                .padding(.leading, secondRowIndent)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
+    /// Speaker name in a FIXED-width slot, so the text's left edge never moves.
+    /// The label only arrives at finalize — diarization runs on the completed
+    /// utterance — so letting it push the sentence right would shift the text
+    /// AND re-wrap it at the exact moment the speaker stopped talking. The slot
+    /// exists only while diarization is on; otherwise the layout is unchanged.
+    @ViewBuilder
+    private var speakerLabel: some View {
+        if reservesSpeakerSlot {
+            Text(line.speakerLabel ?? "")
+                .font(.system(size: CaptionTheme.speakerLabelSize(fontSize), weight: .bold))
+                // `inkSecondary`, not `inkTertiary`: the speaker is a cue you
+                // actually read, and the weakest ink is near-invisible on the
+                // scrim at label size.
+                .foregroundStyle(CaptionTheme.Palette.inkSecondary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+                .frame(width: speakerSlotWidth, alignment: .leading)
+        }
+    }
+
     /// The recognition-text row: caret + dotted underline live HERE (wherever the
     /// English sits), never on a possibly-empty translation row.
+    ///
+    /// The text wraps to as many lines as it needs — nothing is ever truncated.
+    /// The band's viewport is what's fixed; text beyond it scrolls out of view
+    /// (bottom-anchored, so the newest words stay put) and stays reachable.
     private func englishRow(font: Font, color: Color) -> some View {
         HStack(alignment: .firstTextBaseline, spacing: 3) {
             Text(line.english)
-                .font(font.weight(line.isFinal ? .semibold : .medium))
+                // One weight for every state. Medium→semibold on finalize was the
+                // worst of the jumps: semibold is wider, so a sentence could
+                // re-wrap the moment it ended and shove the whole band upward.
+                .font(font.weight(.semibold))
                 .contentTransition(reduceMotion ? .identity : .interpolate)
                 .foregroundStyle(color)
                 .fixedSize(horizontal: false, vertical: true)
@@ -278,32 +326,33 @@ private struct BandLineView: View {
     @ViewBuilder
     private var dot: some View {
         if line.isFinal {
-            SourceDot(color: CaptionTheme.Palette.sourceDot(line.source), glow: isLatest)
+            // No glow-on-latest: that marked "newest", which the band's own
+            // bottom-up order already says, and it made every sentence boundary
+            // animate something. The dot's only job is source colour.
+            SourceDot(color: CaptionTheme.Palette.sourceDot(line.source))
         } else {
-            BreathingDot(color: CaptionTheme.Palette.stopRec, animated: !reduceMotion, size: 6)
-                .frame(width: 6, height: 6)
+            BreathingDot(color: CaptionTheme.Palette.stopRec, animated: !reduceMotion,
+                         size: CaptionTheme.Metric.dotSize)
+                .frame(width: CaptionTheme.Metric.dotSize, height: CaptionTheme.Metric.dotSize)
         }
     }
 
-    private var topColor: Color {
-        if !line.isFinal {
-            return Color(hex: 0xF5F5F7).opacity(CaptionTheme.Metric.interimOpacity)
-        }
-        return isLatest ? Color(hex: 0xF7F8FA) : CaptionTheme.Palette.inkPrimary
-    }
+    // Recognition and translation each have exactly ONE colour, whatever the
+    // line's state. Brightness used to carry "in progress" and "newest", which
+    // meant the live line — the one being read right now — was dimmer than the
+    // sentence that had just ended, and every finalize flashed two lines in
+    // opposite directions. State is the dot, caret and underline's job.
+
+    private var topColor: Color { CaptionTheme.Palette.inkPrimary }
 
     private var bottomColor: Color {
-        let base = CaptionTheme.Palette.inkTranslation
-        if translation == nil { return CaptionTheme.Palette.inkTertiary }   // ⋯ pending
-        return line.isFinal ? base : base.opacity(0.72)
+        // The ⋯ placeholder is not caption text — dimming it says "still coming",
+        // and the real translation replaces it at full strength.
+        translation == nil ? CaptionTheme.Palette.inkTertiary : CaptionTheme.Palette.inkTranslation
     }
 
     /// English shown on the bottom row (translation-on-top layout).
-    private var bottomEnglishColor: Color {
-        line.isFinal
-            ? CaptionTheme.Palette.inkTranslation
-            : Color(hex: 0xF5F5F7).opacity(CaptionTheme.Metric.interimOpacity)
-    }
+    private var bottomEnglishColor: Color { CaptionTheme.Palette.inkTranslation }
 }
 
 /// A 2pt vertical caret that blinks once per second (steps), or stays solid when
@@ -522,7 +571,7 @@ private struct OverlayRootView: View {
     private var bandLines: [BandLine] {
         var arr = model.band.visibleCommitted
         if let slot = model.band.visibleSlot,
-           slot.isFinal || model.interimStyle == .dimmedWithCaret {
+           slot.isFinal || model.interimStyle == .markedWithCaret {
             arr.append(slot)
         }
         return arr
@@ -536,13 +585,7 @@ private struct OverlayRootView: View {
                 PinnedBanner(pending: model.band.pendingWhilePinned)
             }
             bandContent
-                .frame(width: CaptionTheme.Metric.overlayMaxWidth,
-                       height: CaptionTheme.bandContentHeight(
-                           fontSize: model.fontSize,
-                           historyLines: model.historyLineCount,
-                           secondLine: model.showSecondLine),
-                       alignment: .bottomLeading)
-                .clipped()
+                .frame(width: CaptionTheme.Metric.overlayMaxWidth, alignment: .bottomLeading)
         }
         .padding(.horizontal, CaptionTheme.Metric.overlayScrimHPadding)
         .padding(.top, 14)
@@ -550,10 +593,42 @@ private struct OverlayRootView: View {
         .scrim(opacity: model.opacity, pinned: model.band.isPinned)
     }
 
+    /// Height of the band's scroll viewport — fixed by settings, never by text.
+    private var bandViewportHeight: CGFloat {
+        CaptionTheme.bandContentHeight(
+            fontSize: model.fontSize,
+            historyLines: model.historyLineCount,
+            secondLine: model.showSecondLine)
+    }
+
+    /// The caption band: a FIXED-height window onto text that is never truncated.
+    ///
+    /// Anchored to the bottom, so the newest words hold a constant position and
+    /// anything that no longer fits scrolls up out of view rather than being
+    /// replaced by an ellipsis — it is all still there. Scrolling back is
+    /// deliberately gated on the pin (⌃⌥P): unpinned, the band stays purely
+    /// click-through so it never steals a scroll meant for the app behind it;
+    /// pinned, the content is frozen anyway, which is exactly when you want to
+    /// read back through it.
     @ViewBuilder
     private var bandContent: some View {
+        ScrollView(.vertical) {
+            bandStack
+                // Short content still hugs the bottom of the window.
+                .frame(minHeight: bandViewportHeight, alignment: .bottomLeading)
+        }
+        .defaultScrollAnchor(.bottom)
+        .scrollDisabled(!model.isPinned)
+        .scrollIndicators(model.isPinned ? .automatic : .never)
+        .frame(height: bandViewportHeight)
+    }
+
+    @ViewBuilder
+    private var bandStack: some View {
         let lines = bandLines
-        VStack(alignment: .leading, spacing: 12) {
+        // MUST stay `Metric.unitSpacing` — `bandContentHeight` budgets exactly
+        // this much between units, so the viewport shows whole units.
+        VStack(alignment: .leading, spacing: CaptionTheme.Metric.unitSpacing) {
             if lines.isEmpty {
                 bandStatusRow
             }
@@ -563,10 +638,9 @@ private struct OverlayRootView: View {
                     fontSize: model.fontSize,
                     primaryOnTop: model.primaryLineOnTop,
                     showSecond: model.showSecondLine,
-                    isLatest: line.id == lines.last?.id,
+                    showSpeakerSlot: model.showSpeakerSlot,
                     reduceMotion: model.reduceMotion
                 )
-                .opacity(line.id == lines.last?.id ? 1.0 : CaptionTheme.Metric.historyOpacity)
                 .transition(model.reduceMotion
                             ? .identity
                             : .opacity.animation(.easeOut(duration: CaptionTheme.Metric.evictDuration)))
@@ -613,8 +687,13 @@ private struct OverlayRootView: View {
 private final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
     var interactiveTopInset: CGFloat = 40
     var controlsVisible: () -> Bool = { false }
+    /// Pinned = "read mode": the caption area accepts the scroll wheel so you can
+    /// go back through what was said. Unpinned it stays fully click-through, so a
+    /// scroll aimed at the app behind never lands on the captions by accident.
+    var readModeActive: () -> Bool = { false }
 
     override func hitTest(_ point: NSPoint) -> NSView? {
+        if readModeActive() { return super.hitTest(point) }
         guard controlsVisible() else { return nil }
         // Bottom-left origin: the control band sits at the TOP (high y).
         if point.y >= bounds.height - interactiveTopInset {
@@ -683,6 +762,7 @@ final class OverlayController {
         model.primaryLineOnTop = s.primaryLineOnTop
         model.historyLineCount = s.historyLineCount
         model.interimStyle = s.interimStyle
+        model.showSpeakerSlot = s.diarizationEnabled
         model.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         clickThroughEnabled = s.clickThrough
         overlayAnchor = s.overlayPosition
@@ -705,6 +785,7 @@ final class OverlayController {
         let root = OverlayRootView(model: model, actions: makeActions())
         let hosting = PassthroughHostingView(rootView: root)
         hosting.controlsVisible = { [weak self] in self?.model.showControls ?? false }
+        hosting.readModeActive = { [weak self] in self?.model.isPinned ?? false }
         self.hostingView = hosting
 
         let panel = NSPanel(
@@ -845,8 +926,10 @@ final class OverlayController {
             isHovering = overPanel
             model.showControls = overPanel
         }
-        // `ignoresMouseEvents == true` means click-through; capture only over the band.
-        panel.ignoresMouseEvents = !overBand
+        // `ignoresMouseEvents == true` means click-through; capture only over the
+        // control band — or, while pinned, anywhere on the panel, so the frozen
+        // captions can be scrolled back through (`PassthroughHostingView`).
+        panel.ignoresMouseEvents = !(overBand || (model.isPinned && overPanel))
     }
 
     private func setHovering(_ inside: Bool) {

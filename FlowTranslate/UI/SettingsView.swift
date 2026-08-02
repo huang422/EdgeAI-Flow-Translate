@@ -9,6 +9,34 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var confirmUninstall = false
 
+    /// Latency tiers whose model is already on disk for the selected language.
+    /// `nil` until the first check, so the row never flashes "needs download"
+    /// before it knows. Recomputed only when the language changes: the check
+    /// hits the filesystem and a Form body re-renders on every slider tick.
+    @State private var cachedTiers: Set<String>?
+
+    private static let tiers = ["560ms", "1120ms", "2240ms"]
+
+    /// Which tiers are ready and which would cost a download, for the CURRENT
+    /// language. Every latency tier is a separate ~600 MB model, and Latin and
+    /// multilingual are separate sets again — so switching language changes
+    /// every answer here. Without this the first hint you get is a surprise
+    /// download prompt AFTER you've already switched.
+    private var tierStatus: (text: String, complete: Bool)? {
+        guard let cachedTiers else { return nil }
+        let ready = Self.tiers.filter(cachedTiers.contains)
+        let missing = Self.tiers.filter { !cachedTiers.contains($0) }
+        guard !missing.isEmpty else {
+            return ("Models: all three tiers are downloaded for this language.", true)
+        }
+        var s = "Models: "
+        if !ready.isEmpty { s += ready.joined(separator: ", ") + " ready · " }
+        s += missing.joined(separator: ", ")
+            + (missing.count == 1 ? " needs" : " each need")
+            + " a ~600 MB download, fetched on the next Start."
+        return (s, false)
+    }
+
     /// Segmented "visible lines" (1/2/3) maps to `historyLineCount` (0/1/2 = now + N).
     private var visibleLines: Binding<Int> {
         Binding(get: { settings.historyLineCount + 1 },
@@ -63,20 +91,57 @@ struct SettingsView: View {
                         Text("\(locale.displayName) (\(locale.code))").tag(locale.code)
                     }
                 }
+                if settings.firstLanguage == "auto" {
+                    // Auto isn't just "no language lock" — it loads a different,
+                    // larger build. Worth saying plainly, because picking the
+                    // language is the cheapest accuracy win available.
+                    Text("Auto-detect loads the full 13,087-token multilingual model. "
+                        + "Naming the language instead loads a vocabulary-pruned build "
+                        + "(2,828 tokens for English and other Latin-script languages) and "
+                        + "locks the decoder to it — far fewer confusable words. Use Auto "
+                        + "only when the audio really does switch languages.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
                 Picker("延遲層級 Latency", selection: $settings.asrTier) {
                     Text("Lowest 560ms").tag("560ms")
                     Text("Balanced 1120ms").tag("1120ms")
                     Text("Accurate 2240ms").tag("2240ms")
                 }
                 .pickerStyle(.segmented)
+                // Re-checked whenever the language changes — Latin and
+                // multilingual ships have independent per-tier caches.
+                .task(id: settings.firstLanguage) {
+                    cachedTiers = Set(Self.tiers.filter {
+                        NemotronStreamingService.variantPresent(
+                            language: settings.firstLanguage, tier: $0)
+                    })
+                }
                 Text("Higher tiers hear more context per step — noticeably better accuracy, "
                     + "chunkier caption updates. 2240ms is FluidAudio's recommended quality tier. "
                     + "Applies on the next Start.")
                     .font(.caption).foregroundStyle(.secondary)
+                if let tierStatus {
+                    Text(tierStatus.text)
+                        .font(.caption)
+                        .foregroundStyle(tierStatus.complete ? .secondary : Color.orange)
+                }
                 Toggle(isOn: $settings.diarizationEnabled) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("講者辨識 Speaker diarization")
-                        Text("pyannote 3.1 + WeSpeaker label speakers per source (~60 MB download). Applies on the next Start.")
+                        Text("pyannote 3.1 + WeSpeaker label speakers per source (~60 MB download). "
+                            + "Runs an inference per finalized sentence, so it costs CPU throughout "
+                            + "a meeting. Applies on the next Start.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Toggle(isOn: $settings.keepAcousticContext) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("跨句聲學上下文 Carry acoustic context (experimental)")
+                        Text("The encoder holds 3.36 s of audio history, which is normally cleared "
+                            + "at every sentence end — so each sentence starts cold. Keeping it may "
+                            + "sharpen the opening words, but it also skips the language-lock re-seed "
+                            + "and can make one sentence run on into the next. Compare both on your "
+                            + "own speech. Applies on the next Start.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -100,6 +165,18 @@ struct SettingsView: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            Section("逐字稿 Transcript") {
+                Toggle(isOn: $settings.transcriptCorrectionEnabled) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("AI 校正逐字稿 AI transcript correction")
+                        Text("Qwen fixes homophones, names and punctuation in the recorded "
+                            + "transcript. Live captions are never delayed or rewritten. "
+                            + "Keeps the model resident (~2.5 GB) for the whole meeting.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
             Section("懸浮字幕 Overlay") {
                 Picker(selection: $settings.primaryLineOnTop) {
                     Text("Original").tag(PrimaryLine.original)
@@ -113,7 +190,7 @@ struct SettingsView: View {
                 .pickerStyle(.segmented)
 
                 Picker(selection: $settings.interimStyle) {
-                    Text("Dim + caret").tag(InterimStyle.dimmedWithCaret)
+                    Text("Caret + underline").tag(InterimStyle.markedWithCaret)
                     Text("Hidden").tag(InterimStyle.hidden)
                 } label: { Text("辨識中的文字 Interim text") }
                 .pickerStyle(.segmented)

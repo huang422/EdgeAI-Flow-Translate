@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import FlowTranslateCore
 
 /// Centralised design tokens for the redesigned UI and floating overlay
@@ -58,9 +59,20 @@ enum CaptionTheme {
         static let opacityMin: Double = 0.40
         static let opacityMax: Double = 0.90
 
-        /// History (older finalized) line opacity; the latest unit is always 1.0.
-        static let historyOpacity: Double = 0.46
-        static let interimOpacity: Double = 0.62
+        // No per-state text opacity: every caption line renders at full strength,
+        // so nothing on screen changes brightness when a sentence finalizes.
+        // "In progress" is carried by the breathing dot, caret and underline.
+
+        // Band layout constants. `bandContentHeight` and the views MUST agree on
+        // these — if the reserved height and the rendered rows ever disagree the
+        // band silently clips or leaves a gap, so they share one definition.
+        static let dotSize: CGFloat = 6
+        /// Gap between the dot, the speaker slot and the caption text.
+        static let gutterSpacing: CGFloat = 8
+        /// Gap between a unit's recognition row and its translation row.
+        static let rowGap: CGFloat = 4
+        /// Gap between caption units.
+        static let unitSpacing: CGFloat = 12
 
         static let enterDuration: Double = 0.18   // 180ms ease-out fade + slide
         static let controlsDuration: Double = 0.16
@@ -72,18 +84,55 @@ enum CaptionTheme {
 
     // MARK: - Caption band geometry
 
-    /// Fixed content height of the floating caption band, derived ONLY from
-    /// settings (font size, history lines, second caption on/off) — never from
-    /// the live text. This is what keeps the overlay's frame constant while
-    /// captions stream (the anti-jump core): content is bottom-aligned inside
-    /// and clipped at the top when a long sentence wraps.
+    /// Recognition rows the viewport shows per caption unit. Two means a wrapped
+    /// sentence is fully readable without touching anything; anything longer
+    /// scrolls rather than being cut off.
+    static let unitRows = 2
+
+    /// Height of the floating caption band's VIEWPORT, derived ONLY from settings
+    /// (font size, history lines, second caption on/off) — never from the live
+    /// text. This is what keeps the overlay's frame constant while captions
+    /// stream (the anti-jump core).
+    ///
+    /// The band scrolls inside this window, bottom-anchored, so text that no
+    /// longer fits moves out of view instead of being truncated away: the newest
+    /// words stay at a fixed height on screen. What remains scrollable is the
+    /// lines the band still holds — `CaptionBandState` drops finalized units past
+    /// `historyLimit`, so this is not a record of the whole meeting; that lives in
+    /// the transcript store.
     static func bandContentHeight(fontSize: Double, historyLines: Int, secondLine: Bool) -> CGFloat {
-        let en = ceil(fontSize * 1.4)                                // primary line height
-        let zh = secondLine ? ceil(fontSize * 0.82 * 1.45) + 4 : 0   // translation line + gap
-        let unit = en + zh
-        let slots = CGFloat(max(0, historyLines) + 1)                // history + current
-        let spacing = CGFloat(max(0, historyLines)) * 12             // inter-unit spacing
-        return slots * unit + spacing + en                           // +1 line wrap headroom
+        let unit = CGFloat(unitRows) * rowHeight(fontSize)
+            + (secondLine ? translationRowHeight(fontSize) : 0)
+        let history = CGFloat(max(0, historyLines))
+        return (history + 1) * unit + history * Metric.unitSpacing
+    }
+
+    /// Height of ONE recognition row. Both the band's reserved height and each
+    /// row's frame come from here, so they cannot drift apart.
+    static func rowHeight(_ fontSize: Double) -> CGFloat { ceil(fontSize * 1.4) }
+
+    /// Height of the translation row including the gap above it.
+    static func translationRowHeight(_ fontSize: Double) -> CGFloat {
+        ceil(fontSize * 0.82 * 1.45) + Metric.rowGap
+    }
+
+    /// Font size of the diarized speaker name in the overlay.
+    static func speakerLabelSize(_ fontSize: Double) -> CGFloat { max(10, fontSize - 5) }
+
+    /// Fixed width of the speaker-name column, so the caption text starts at the
+    /// same x whether or not the label has arrived yet (it only does at
+    /// finalize). Shared by the overlay and the transcript window so both indent
+    /// identically.
+    ///
+    /// MEASURED, not estimated: a `size × 5` rule of thumb came out ~2 pt under
+    /// "Speaker 9" at 11 pt and ~9 pt under "Speaker 88" at 17 pt, so the column
+    /// truncated the very labels it exists to show. FluidAudio names speakers
+    /// `"Speaker <index>"`, so the column is sized for a two-digit index and a
+    /// long meeting never starts showing an ellipsis.
+    static func speakerSlotWidth(labelSize: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: labelSize, weight: .bold)
+        let widest = "Speaker 88" as NSString
+        return ceil(widest.size(withAttributes: [.font: font]).width) + 2
     }
 
     // MARK: - Type

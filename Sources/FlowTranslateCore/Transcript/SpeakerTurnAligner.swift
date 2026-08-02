@@ -43,8 +43,14 @@ public enum SpeakerTurnAligner {
         var previousLabel: String?
         for token in tokens {
             let label = bestSpeaker(for: token, turns: turns) ?? previousLabel
-            if groups.last?.label == label {
-                groups[groups.count - 1].tokens.append(token)
+            // Bind the index rather than testing `groups.last?.label == label`:
+            // on an empty `groups` that optional chain yields nil, which compares
+            // EQUAL to an unlabelled token — and then indexes groups[-1]. That is
+            // the common case, not an exotic one: the first token of an utterance
+            // starts with no `previousLabel`, and diarization turns come from a
+            // separately buffered audio slice that need not cover it.
+            if let lastIndex = groups.indices.last, groups[lastIndex].label == label {
+                groups[lastIndex].tokens.append(token)
             } else {
                 groups.append(([token], label))
             }

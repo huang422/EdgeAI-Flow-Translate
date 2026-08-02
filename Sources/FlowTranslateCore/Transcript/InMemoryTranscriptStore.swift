@@ -39,6 +39,12 @@ public final class InMemoryTranscriptStore: TranscriptStoring {
         onChange?()
     }
 
+    public func updateSourceText(segmentId: UUID, corrected: String) {
+        guard let i = indexById[segmentId] else { return }
+        _segments[i].sourceText = corrected
+        onChange?()
+    }
+
     public func endSession() {
         session?.endedAt = Date()
         onChange?()

@@ -9,6 +9,9 @@ import FlowTranslateCore
 ///   continuous acoustic state, so feeding system audio and microphone audio into
 ///   a single model corrupts it (slow / garbled / no output). Each source gets its
 ///   own `StreamingNemotronMultilingualAsrManager` + Silero VAD + utterance state.
+///   The heavy CoreML **weights are shared** between those managers, though: the
+///   per-stream state (encoder state, caches, prediction buffers) is what must be
+///   private, not the ~633 MB of read-only weights.
 /// - **Memory policy.** The downloaded variant is cached on disk (no re-download),
 ///   but the in-memory models are RELEASED at meeting end (16 GB budget) and
 ///   lazily reloaded on the next Start — incoming audio is ring-buffered during
@@ -41,6 +44,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// Enables pyannote/speaker-diarization-3.1 for each active audio source.
     public var diarizationEnabled = false
 
+    /// Experimental: carry the encoder's acoustic context across sentence
+    /// boundaries instead of resetting at each finalize. Applied on the next Start.
+    public var keepAcousticContext = false
+
     /// Reports pyannote/WeSpeaker download and load progress (0...1).
     public var onDiarizationLoadProgress: ((Double) -> Void)?
 
@@ -64,9 +71,9 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// once it's ready so the opening words are never dropped (cold-start fix).
     private var pendingChunks: [AudioSourceType: [AudioChunk]] = [:]
     private let maxPendingChunks = 200   // ~recent audio kept while the model loads
-    /// Background-preloaded model, consumed by the first source that needs a
-    /// pipeline — so the model is ready by the time the user speaks.
-    private var warmTask: Task<StreamingNemotronMultilingualAsrManager?, Never>?
+    /// Background-preloaded CoreML weights, shared by every source's manager — so
+    /// running mic + system audio together costs one copy of the model, not two.
+    private var sharedTask: Task<SharedNemotronMultilingualModels?, Never>?
     private var running = false
     private let lock = NSLock()
 
@@ -119,30 +126,45 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         }
     }
 
-    /// Load one model in the background now, so it's ready by the time the user
-    /// speaks (overlaps the multi-second load with user prep → less first-caption
-    /// delay). The first source that needs a pipeline consumes it.
+    /// Load the weights in the background now, so they're ready by the time the
+    /// user speaks (overlaps the multi-second load with user prep → less
+    /// first-caption delay). Every source that needs a pipeline shares them.
     private func startBackgroundPreload() {
         lock.withLock {
-            guard warmTask == nil, pipelines.isEmpty else { return }
-            warmTask = Task { [weak self] in await self?.loadManager() ?? nil }
+            guard sharedTask == nil, pipelines.isEmpty else { return }
+            sharedTask = Task { [weak self] in await self?.loadShared() ?? nil }
         }
     }
 
-    /// Load + language-configure one streaming model from the cached variant.
-    /// Respects task cancellation (a cancelled warm preload stops early instead
-    /// of finishing a multi-second CoreML load whose result is discarded).
-    private func loadManager() async -> StreamingNemotronMultilingualAsrManager? {
+    /// Load the CoreML weights once, for every source to share. Respects task
+    /// cancellation (a cancelled warm preload stops early instead of finishing a
+    /// multi-second CoreML load whose result is discarded).
+    private func loadShared() async -> SharedNemotronMultilingualModels? {
         guard let dir = variantDir, !Task.isCancelled else { return nil }
         onModelLoading?(true)
         defer { onModelLoading?(false) }
+        guard let shared = try? await StreamingNemotronMultilingualAsrManager
+            .preloadShared(from: dir)                    // CoreML load + ANE warm-up
+        else { return nil }
+        guard !Task.isCancelled else { return nil }
+        lock.withLock { warm = true }
+        return shared
+    }
+
+    /// Build + language-configure one streaming manager over the shared weights.
+    /// `loadFromShared` adopts the `MLModel` references — which are safe for
+    /// concurrent `prediction(from:)` — while giving this manager its own encoder
+    /// state, caches and prediction buffers, so the two sources can never corrupt
+    /// each other's acoustic state.
+    private func makeManager(
+        from shared: SharedNemotronMultilingualModels
+    ) async -> StreamingNemotronMultilingualAsrManager? {
         let m = StreamingNemotronMultilingualAsrManager()
         do {
-            try await m.loadModels(from: dir)   // CoreML load + ANE warm-up
+            try await m.loadFromShared(shared)
         } catch {
             return nil
         }
-        guard !Task.isCancelled else { return nil }
         await m.setLanguage(currentLanguage)
         // Language lock (P0): when the user picked a SPECIFIC language, seed the
         // decoder with its lang-tag token (Whisper-style forced prefix) so the
@@ -151,7 +173,6 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         if currentLanguage != "auto" {
             await m.setForcedPrefix(true)
         }
-        lock.withLock { warm = true }
         return m
     }
 
@@ -305,20 +326,33 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
         Task { [weak self] in
             guard let self else { return }
-            // Use the background-preloaded model if available (first source);
-            // otherwise load one now (e.g. a second source).
-            let preload = self.lock.withLock { () -> Task<StreamingNemotronMultilingualAsrManager?, Never>? in
-                let t = self.warmTask; self.warmTask = nil; return t
+            // Every source awaits the SAME weight-load task: the first one starts
+            // it (or reuses the warm preload), later ones adopt the result instead
+            // of loading a second copy of the model.
+            let load = self.lock.withLock { () -> Task<SharedNemotronMultilingualModels?, Never> in
+                if let t = self.sharedTask { return t }
+                let t = Task { [weak self] in await self?.loadShared() ?? nil }
+                self.sharedTask = t
+                return t
             }
-            let loaded = preload != nil ? await preload!.value : await self.loadManager()
-            guard let manager = loaded else {
+            let shared = await load.value
+            if shared == nil {
+                // Drop the failed task so the NEXT source (or the next chunk that
+                // re-triggers this path) actually retries. Caching a completed
+                // task that yielded nil would keep handing every later attempt
+                // the same failure — one transient CoreML hiccup would leave the
+                // whole meeting with no captions at all.
+                self.lock.withLock { if self.sharedTask == load { self.sharedTask = nil } }
+            }
+            guard let shared, let manager = await self.makeManager(from: shared) else {
                 self.lock.withLock { _ = self.creating.remove(source) }
                 return
             }
 
             let pipeline = SourceASR(
                 source: source, manager: manager,
-                tuning: .forSource(source, scenario: self.scenario))
+                tuning: .forSource(source, scenario: self.scenario),
+                keepAcousticContext: self.keepAcousticContext)
             pipeline.configureDiarization(enabled: self.diarizationEnabled,
                                           models: self.diarizerModels,
                                           config: self.diarizerConfig)
@@ -360,8 +394,8 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
             pipelines.removeAll()
             creating.removeAll()
             pendingChunks.removeAll()
-            warmTask?.cancel()
-            warmTask = nil
+            sharedTask?.cancel()
+            sharedTask = nil          // drops the shared weights → memory freed
             warm = false
             return v
         }
@@ -423,11 +457,15 @@ private final class SourceASR: @unchecked Sendable {
     private var asrAudioStartTime: TimeInterval?
     private let diarizationBufferSamples = 12 * 16_000
 
+    /// Experimental: carry the encoder's acoustic context across sentences.
+    private let keepAcousticContext: Bool
+
     init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager,
-         tuning: SegmentationTuning) {
+         tuning: SegmentationTuning, keepAcousticContext: Bool = false) {
         self.source = source
         self.manager = manager
         self.tuning = tuning
+        self.keepAcousticContext = keepAcousticContext
         self.endpointer = Endpointer(
             config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech))
     }
@@ -484,11 +522,30 @@ private final class SourceASR: @unchecked Sendable {
 
     // MARK: - Private
 
-    private func resetState() {
+    /// Close out an utterance: drop the model's streaming state, or keep it.
+    ///
+    /// `manager.reset()` clears the encoder cache (3.36 s of left context), the
+    /// decoder LSTM and `absoluteFrameBase`, so the next sentence starts cold.
+    /// Keeping it hands the model real acoustic history — at the cost of the
+    /// language-lock re-seed and a decoder that may run the new sentence on as a
+    /// continuation of the last. Hence opt-in.
+    ///
+    /// The reset and the timing origin MUST move together. Token times are
+    /// `asrAudioStartTime + timing.startTime`, and `timing.startTime` counts from
+    /// `absoluteFrameBase`. Resetting zeroes the frame base, so the origin has to
+    /// be re-taken from the next chunk; keeping it means the origin has to be
+    /// kept too — otherwise every later sentence's timestamps collapse back to
+    /// the start of the stream and speaker alignment silently breaks.
+    private func endUtterance() async {
+        if !keepAcousticContext { await manager.reset() }
+        resetState(keepingAudioOrigin: keepAcousticContext)
+    }
+
+    private func resetState(keepingAudioOrigin: Bool = false) {
         utteranceStart = 0
         hasSpeech = false
         lastPartial = ""
-        asrAudioStartTime = nil
+        if !keepingAudioOrigin { asrAudioStartTime = nil }
         endpointer.reset()
     }
 
@@ -576,8 +633,7 @@ private final class SourceASR: @unchecked Sendable {
         let result = try? await manager.finishWithTokenTimings()
         let trimmed = (result?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            await manager.reset()
-            resetState()
+            await endUtterance()
             return
         }
 
@@ -609,8 +665,7 @@ private final class SourceASR: @unchecked Sendable {
                 )))
             }
         }
-        await manager.reset()
-        resetState()
+        await endUtterance()
     }
 
     /// pyannote consumes raw PCM around the utterance; its five-second inference

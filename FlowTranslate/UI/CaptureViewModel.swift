@@ -58,6 +58,24 @@ final class CaptureViewModel: ObservableObject {
 
     /// Model download/prefetch status (e.g. the Qwen model fetched at Start).
     @Published var modelStatus = ""
+    /// Identifies the most recent auto-clearing message, so a later one can't be
+    /// wiped by an older one's timer.
+    private var modelStatusFlash = UUID()
+
+    /// Show a status line that clears itself. A one-off success ("ready",
+    /// "downloaded") that never clears sits in the footer for the rest of the
+    /// meeting pretending to be current state. Problems still use `modelStatus`
+    /// directly and stay put until something replaces them.
+    private func flashModelStatus(_ text: String, seconds: Double = 4) {
+        modelStatus = text
+        let token = UUID()
+        modelStatusFlash = token
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(seconds))
+            guard let self, self.modelStatusFlash == token else { return }
+            self.modelStatus = ""
+        }
+    }
 
     /// True when a required model is missing at launch — the UI shows a one-time
     /// download prompt so the first meeting isn't blocked by a surprise download.
@@ -103,6 +121,20 @@ final class CaptureViewModel: ObservableObject {
     private var mlxQueue: [PendingMLXSentence] = []
     private var mlxRunning = false
     private let mlxQueueLimit = 3
+
+    // Transcript correction (accurate track). Deliberately a SEPARATE, lower
+    // priority queue from translation: a correction is never on screen, so it
+    // must never make a viewer wait for a subtitle. It only starts when the
+    // translation queue is idle, and its own backlog is bounded the same way —
+    // beyond `correctionQueueLimit` the oldest waiting sentence is dropped and
+    // keeps its raw ASR text.
+    private struct PendingCorrection { let id: UUID; let text: String }
+    private lazy var corrector = QwenCorrector(host: qwenHost)
+    private var correctionQueue: [PendingCorrection] = []
+    private var correctionRunning = false
+    private var inflightCorrection: Task<Void, Never>?
+    private var acceptingCorrections = true
+    private let correctionQueueLimit = 4
 
     // Echo suppression: when system audio is playing through speakers, the mic
     // mostly hears that same audio → skip mic input to avoid garbled double
@@ -150,8 +182,41 @@ final class CaptureViewModel: ObservableObject {
     /// prefetch is intentionally left running — the summary needs those files even
     /// after translation switches to Apple or the meeting ends. Waiting queued
     /// sentences are dropped (they belonged to the previous backend/session).
-    private func unloadQwen() {
+    ///
+    /// This is a *translation-side* release, so it must not pull the model out
+    /// from under the transcript corrector, which shares the same host: switching
+    /// the engine to Apple mid-meeting calls this while a correction may be
+    /// generating, and `unload()` → `GPU.clearCache()` mid-generation is the
+    /// documented crash. While correction is live the model stays resident —
+    /// exactly what the setting warns about — and `endMeeting` frees it after
+    /// `drainCorrections()`.
+    /// Release the shared Qwen model from **memory**. Safe from any call site.
+    ///
+    /// Two things must hold before the model can go, and both were previously
+    /// only enforced at `endMeeting`:
+    ///
+    /// 1. **Nothing may still be generating.** `unload()` → `MLXMemory.reclaim()`
+    ///    → `GPU.clearCache()` during a live generation is a documented crash.
+    ///    Switching the translation engine to Apple mid-meeting reached the
+    ///    unload without draining anything, so a sentence being translated on the
+    ///    GPU at that moment took the cache out from under itself.
+    /// 2. **No other consumer may still need it.** Transcript correction shares
+    ///    the same host, so the model stays resident while correction is live —
+    ///    including while a correction is mid-generation but the user has just
+    ///    switched the setting off, which a setting-only check would miss.
+    ///
+    /// The disk prefetch is deliberately left running: the summary needs those
+    /// files even after translation switches to Apple or the meeting ends.
+    private func releaseQwen() async {
         mlxQueue.removeAll()
+        // Only a consumer that will still be GIVEN work keeps the model. A
+        // generation that merely happens to be running right now must not block
+        // the release — draining it is what the next two lines are for, and
+        // treating it as "still needed" would leave the 2.5 GB resident forever
+        // whenever a meeting ended mid-repair.
+        guard !(settings.transcriptCorrectionEnabled && acceptingCorrections) else { return }
+        await drainInflightTranslations()
+        await drainCorrections()
         qwenHost.unload()         // frees the container + returns the MLX cache to the OS
         qwenLoadTask?.cancel(); qwenLoadTask = nil
     }
@@ -191,7 +256,7 @@ final class CaptureViewModel: ObservableObject {
                     }
                 }
                 self.qwenDownloadPct = nil
-                self.modelStatus = "Qwen 模型已下載（用到時載入記憶體）"
+                self.flashModelStatus("Qwen 模型已下載（用到時載入記憶體）")
             } catch {
                 Self.log.error("Qwen prefetch failed: \(String(reflecting: error), privacy: .public)")
                 self.qwenDownloadPct = nil
@@ -200,44 +265,94 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
+    /// How a shared-Qwen memory load is progressing. Translation and transcript
+    /// correction both wait on the same load but describe it differently (and in
+    /// different status lines), so each maps these phases to its own wording.
+    enum QwenLoadPhase { case loading(Double?), ready, failedRetryable, failedFinal }
+
     /// Load the Qwen model into memory on demand (guarded so it loads exactly
-    /// once), showing live progress. Files are normally already on disk (fetched
-    /// at Start), so this is just a memory load. Returns whether the model is ready.
+    /// once), reporting progress through `report`. Files are normally already on
+    /// disk (fetched at Start), so this is just a memory load. Returns whether the
+    /// model is ready.
+    ///
+    /// Every consumer — live translation and the transcript corrector — comes
+    /// through here, so the ~2.5 GB model is loaded once regardless of which one
+    /// needs it first.
     ///
     /// A failed load clears the task handle so the NEXT sentence retries (a
     /// transient failure — e.g. momentary memory pressure — no longer kills
     /// translation for the whole meeting). After `qwenLoadFailureLimit`
-    /// consecutive failures translation stays off with a persistent status.
-    private func ensureQwenReady(srcName: String, tgtName: String) async -> Bool {
+    /// consecutive failures the feature stays off with a persistent status.
+    private func ensureQwenReady(
+        report: @escaping @MainActor (QwenLoadPhase) -> Void
+    ) async -> Bool {
         if qwenHost.isLoaded { return true }
         guard qwenLoadFailures < qwenLoadFailureLimit else { return false }
         if qwenLoadTask == nil {
             qwenLoadTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型載入中…"
+                report(.loading(nil))
                 // Wait for the at-Start disk prefetch (if any) so we don't download twice.
                 await self.qwenPrefetchTask?.value
                 do {
                     try await self.qwenHost.ensureLoaded { p in
-                        Task { @MainActor in
-                            self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型載入中… \(Int(p * 100))%"
-                        }
+                        Task { @MainActor in report(.loading(p)) }
                     }
                     self.qwenLoadFailures = 0
-                    self.translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Qwen 模型翻譯（已載入）"
+                    report(.ready)
                 } catch {
                     Self.log.error("Qwen load failed: \(String(reflecting: error), privacy: .public)")
                     self.qwenLoadFailures += 1
                     // Clear the handle so the next sentence can retry the load.
                     self.qwenLoadTask = nil
-                    self.translationStatus = self.qwenLoadFailures >= self.qwenLoadFailureLimit
-                        ? "翻譯語言：Qwen 載入失敗，本場翻譯已停用（第一字幕不受影響）"
-                        : "翻譯語言：Qwen 載入失敗，下一句自動重試"
+                    report(self.qwenLoadFailures >= self.qwenLoadFailureLimit
+                           ? .failedFinal : .failedRetryable)
                 }
             }
         }
         await qwenLoadTask?.value
         return qwenHost.isLoaded
+    }
+
+    /// Await the shared model for a live translation, narrating on `translationStatus`.
+    private func ensureQwenReadyForTranslation(srcName: String, tgtName: String) async -> Bool {
+        await ensureQwenReady { [weak self] phase in
+            guard let self else { return }
+            let pair = "翻譯語言：\(srcName) → \(tgtName)"
+            switch phase {
+            case .loading(nil):        self.translationStatus = "\(pair) · Qwen 模型載入中…"
+            case .loading(let p?):     self.translationStatus = "\(pair) · Qwen 模型載入中… \(Int(p * 100))%"
+            case .ready:               self.translationStatus = "\(pair) · Qwen 模型翻譯（已載入）"
+            case .failedRetryable:     self.translationStatus = "翻譯語言：Qwen 載入失敗，下一句自動重試"
+            case .failedFinal:         self.translationStatus = "翻譯語言：Qwen 載入失敗，本場翻譯已停用（第一字幕不受影響）"
+            }
+        }
+    }
+
+    /// Whether the shared model is resident **right now**. Never blocks: if it
+    /// isn't, the load is kicked off in the background and this sentence is
+    /// skipped. See the call site for why correction must not await the load.
+    private func qwenReadyForCorrection() -> Bool {
+        if qwenHost.isLoaded { return true }
+        guard qwenLoadFailures < qwenLoadFailureLimit, qwenLoadTask == nil else { return false }
+        Task { @MainActor [weak self] in _ = await self?.ensureQwenReadyForCorrection() }
+        return false
+    }
+
+    /// Await the shared model for transcript correction. Reported on `modelStatus`,
+    /// not `translationStatus`: correction can be on while Apple handles
+    /// translation, and a translation-flavoured message would be a lie there.
+    private func ensureQwenReadyForCorrection() async -> Bool {
+        await ensureQwenReady { [weak self] phase in
+            guard let self else { return }
+            switch phase {
+            case .loading(nil):        self.modelStatus = "AI 校正：Qwen 模型載入中…"
+            case .loading(let p?):     self.modelStatus = "AI 校正：Qwen 模型載入中… \(Int(p * 100))%"
+            case .ready:               self.flashModelStatus("AI 校正：已就緒（字幕不受影響）")
+            case .failedRetryable:     self.modelStatus = "AI 校正：模型載入失敗，下一句自動重試"
+            case .failedFinal:         self.modelStatus = "AI 校正：模型載入失敗，本場已停用（逐字稿保留原文）"
+            }
+        }
     }
 
     // User settings (persisted). Applied to the live pipeline on change.
@@ -458,6 +573,10 @@ final class CaptureViewModel: ObservableObject {
                 manualGainDb: settings.micInputGainDb,
                 autoEnabled: settings.autoGainEnabled))
         overlay.applySettings(settings)
+        // Turning correction off mid-meeting drops the backlog so it can't keep
+        // the model busy. A generation already in flight is left to finish and
+        // land — it is a valid repair, and cancelling it would waste the work.
+        if !settings.transcriptCorrectionEnabled { correctionQueue.removeAll() }
         SettingsStore.save(settings)
         let translationKey = [
             settings.firstLanguage, settings.secondLanguage.rawValue,
@@ -485,7 +604,12 @@ final class CaptureViewModel: ObservableObject {
               !NemotronStreamingService.variantPresent(
                   language: settings.firstLanguage, tier: settings.asrTier)
         else { return }
-        modelStatus = "所選辨識語言的模型尚未下載（約 600 MB）— 下次「開始」會自動下載，或關閉設定後於提示中先下載"
+        // Say WHICH combination is missing: every latency tier is a separate
+        // ~600 MB model file, and Latin vs. multilingual are separate sets again,
+        // so "the model for this language" alone reads as a bug when the tier is
+        // what actually changed.
+        modelStatus = "「\(settings.firstLanguage) · \(settings.asrTier)」的辨識模型尚未下載（約 600 MB）"
+            + "— 每個語言與延遲檔位各是一份模型。下次「開始」會自動下載，或關閉設定後於提示中先下載"
         showModelDownloadPrompt = true
     }
 
@@ -498,12 +622,12 @@ final class CaptureViewModel: ObservableObject {
 
         // Off vs. same-language: distinct, clear messages (was a confusing "關閉").
         guard settings.secondCaptionEnabled else {
-            translationMethod = .none; translation.enabled = false; unloadQwen()
+            translationMethod = .none; translation.enabled = false; await releaseQwen()
             translationStatus = "翻譯語言：已關閉"
             return
         }
         guard settings.needsTranslation else {
-            translationMethod = .none; translation.enabled = false; unloadQwen()
+            translationMethod = .none; translation.enabled = false; await releaseQwen()
             translationStatus = "翻譯語言：來源與目標同為「\(tgtName)」，無需翻譯（請改選不同的目標語言）"
             return
         }
@@ -532,7 +656,7 @@ final class CaptureViewModel: ObservableObject {
         if !useQwen {
             translationMethod = .apple
             translation.enabled = true
-            unloadQwen()
+            await releaseQwen()
             translationStatus = "翻譯語言：\(srcName) → \(tgtName) · Apple 系統翻譯（即時）"
             return
         }
@@ -608,15 +732,98 @@ final class CaptureViewModel: ObservableObject {
                 self.inflightTranslations[next.id] = nil
                 self.mlxRunning = false
                 self.pumpMLXQueue()
+                // Translation just freed the model; if nothing took its place the
+                // correction backlog finally gets a turn.
+                self.pumpCorrectionQueue()
             }
             // Load the model into memory on first use (already on disk from Start).
-            guard await self.ensureQwenReady(srcName: srcName, tgtName: tgtName) else { return }
+            guard await self.ensureQwenReadyForTranslation(srcName: srcName, tgtName: tgtName) else { return }
             guard !Task.isCancelled else { return }
             guard let translated = await self.mlxTranslator.translate(
                 next.text, target: target, context: context) else { return }
             self.applyTranslation(id: next.id, chinese: translated)
         }
         inflightTranslations[next.id] = task
+    }
+
+    // MARK: - Transcript correction (accurate track)
+
+    /// Queue a finalized sentence for LLM repair. Sentences too short to hold a
+    /// repairable error are filtered out here rather than costing a generation.
+    private func enqueueCorrection(id: UUID, text: String) {
+        guard settings.transcriptCorrectionEnabled, acceptingCorrections,
+              TranscriptCorrectionGate.shouldAttempt(text) else { return }
+        correctionQueue.append(PendingCorrection(id: id, text: text))
+        if correctionQueue.count > correctionQueueLimit {
+            correctionQueue.removeFirst(correctionQueue.count - correctionQueueLimit)
+        }
+        pumpCorrectionQueue()
+    }
+
+    /// Start the next queued correction — but only while no translation is
+    /// running or waiting. Live captions always win the model; a correction is
+    /// never on screen, so making a viewer wait for one would be indefensible.
+    /// Starved corrections are simply dropped by the queue bound.
+    private func pumpCorrectionQueue() {
+        guard !correctionRunning, acceptingCorrections,
+              settings.transcriptCorrectionEnabled, !correctionQueue.isEmpty,
+              !mlxRunning, mlxQueue.isEmpty else { return }
+        let next = correctionQueue.removeFirst()
+        correctionRunning = true
+        // The surrounding lines carry the recurring names this sentence may
+        // repeat. Corrections lag the live captions, so these are usually the
+        // sentences AFTER it — later context is just as good for a proper noun.
+        let context = lines.suffix(3).filter { $0.id != next.id }.map(\.english)
+        inflightCorrection = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                self.inflightCorrection = nil
+                self.correctionRunning = false
+                self.pumpCorrectionQueue()
+            }
+            guard !Task.isCancelled else { return }
+            // Never WAIT for the model here. `ensureQwenReady` ends in
+            // `await qwenLoadTask?.value`, and awaiting a `Task<Void, Never>` is
+            // not cancellation-aware — a correction parked on the multi-GB load
+            // would hold `endMeeting`'s drain open for the whole thing, so Stop
+            // appeared to hang. Correction is the low-priority track: if the
+            // model isn't resident it starts the load and skips this sentence,
+            // and the next one lands once it's warm.
+            guard self.qwenReadyForCorrection() else { return }
+            guard let repaired = await self.corrector.correct(
+                next.text, context: context) else { return }
+            guard !Task.isCancelled else { return }
+            self.applyCorrection(id: next.id, corrected: repaired)
+        }
+    }
+
+    /// Land a repair on the accurate track ONLY: the transcript window, the
+    /// stored session, and everything downstream of it (summary, exports).
+    ///
+    /// The floating overlay is deliberately left alone — that line has already
+    /// been read, and rewriting it under the viewer's eyes is exactly the jitter
+    /// the caption-band design exists to prevent.
+    ///
+    /// The second caption is NOT re-translated: it was produced from the raw
+    /// recognition and stays that way. Re-translating would mean a second
+    /// generation per repaired sentence, competing with live subtitles for the
+    /// one model — the record gains the corrected source text, and the
+    /// translation of a repaired homophone rarely changes meaning.
+    private func applyCorrection(id: UUID, corrected: String) {
+        if let i = lines.firstIndex(where: { $0.id == id }) {
+            lines[i].english = corrected
+        }
+        store.updateSourceText(segmentId: id, corrected: corrected)
+    }
+
+    /// Cancel and await any running correction, then drop the backlog — so no
+    /// generation is still on the GPU when the shared Qwen model is unloaded.
+    private func drainCorrections() async {
+        correctionQueue.removeAll()
+        let task = inflightCorrection
+        inflightCorrection = nil
+        task?.cancel()
+        await task?.value   // its `defer` clears `correctionRunning`
     }
 
     // MARK: - ASR events
@@ -685,10 +892,13 @@ final class CaptureViewModel: ObservableObject {
         // No active session (extreme timing edge) → nothing to attribute the
         // segment to; never invent a random session id (FR-008 integrity).
         guard let session = currentSession else { return }
-        let english = cleaner.cleanup(segment.text)
-        guard !english.isEmpty else {
-            // Nothing usable (pure filler). Clear the displayed interim AND the
-            // band slot — otherwise a dimmed caret line would linger forever.
+        // Split a (possibly multi-sentence) utterance into individual sentences,
+        // so captions appear one sentence at a time — not one big block.
+        let sentences = SentenceSplitter.split(cleaner.cleanup(segment.text))
+        guard !sentences.isEmpty else {
+            // Nothing usable — pure filler, or punctuation the recognizer emitted
+            // with no words behind it. Clear the displayed interim AND the band
+            // slot; otherwise a caret line would linger forever.
             if wasDisplayed { clearDisplayedInterim() }
             if let uttId { overlay.model.applyDiscard(utteranceId: uttId) }
             promoteNextInterim(nextOwner)
@@ -699,10 +909,6 @@ final class CaptureViewModel: ObservableObject {
             // Stop live-translating; the accurate finalized translation takes over.
             clearDisplayedInterim()
         }
-
-        // Split a (possibly multi-sentence) utterance into individual sentences,
-        // so captions appear one sentence at a time — not one big block.
-        let sentences = Self.splitSentences(english)
         var pairs: [(key: UUID, english: String)] = []
         for (i, sentence) in sentences.enumerated() {
             let isLast = i == sentences.count - 1
@@ -725,6 +931,8 @@ final class CaptureViewModel: ObservableObject {
             store.append(seg)
             // Translate via the active backend (Apple or Qwen/MLX).
             translateSentence(id: id, text: sentence)
+            // Accurate track: repair the recorded sentence behind the live work.
+            enqueueCorrection(id: id, text: sentence)
         }
         if lines.count > 500 { lines.removeFirst(lines.count - 500) }
         currentOverlayId = pairs.last?.key   // marks that a sentence just finalized
@@ -854,25 +1062,6 @@ final class CaptureViewModel: ObservableObject {
         translation.translate(id: id, text: text)
     }
 
-    /// Split text into sentences, keeping terminal punctuation. Used so the
-    /// transcript and overlay present one sentence at a time.
-    static func splitSentences(_ text: String) -> [String] {
-        let terminators: Set<Character> = [".", "?", "!", "。", "！", "？", "…"]
-        var sentences: [String] = []
-        var current = ""
-        for ch in text {
-            current.append(ch)
-            if terminators.contains(ch) {
-                let s = current.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !s.isEmpty { sentences.append(s) }
-                current = ""
-            }
-        }
-        let tail = current.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty { sentences.append(tail) }
-        return sentences.isEmpty ? [text] : sentences
-    }
-
     /// Clear all live-caption / live-translation bookkeeping.
     private func resetLiveCaptionState() {
         currentOverlayId = nil
@@ -956,8 +1145,8 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func startRecognition() async {
-        // Idle only — and never while a summary is running (its unloadQwen would
-        // race a new meeting's translations: documented GPU.clearCache hazard) or
+        // Idle only — and never while a summary is running (its `releaseQwen()`
+        // would race a new meeting's translations: GPU.clearCache hazard) or
         // while the launch-time bulk download runs (two concurrent downloads of
         // the same ASR variant would corrupt the cache).
         guard asrState == .idle, !isSummarizing, !isDownloadingModels else { return }
@@ -983,6 +1172,7 @@ final class CaptureViewModel: ObservableObject {
             asr.currentLanguage = settings.firstLanguage
             asr.scenario = settings.scenario
             asr.diarizationEnabled = settings.diarizationEnabled
+            asr.keepAcousticContext = settings.keepAcousticContext
             asr.onLoadProgress = { [weak self] p in
                 Task { @MainActor in
                     guard let self else { return }
@@ -1000,6 +1190,8 @@ final class CaptureViewModel: ObservableObject {
             lastSummaryZH = nil
             interimText = ""
             acceptingTranslations = true
+            acceptingCorrections = true
+            correctionQueue.removeAll()
             qwenLoadFailures = 0
             asrDownloadPct = nil
             resetLiveCaptionState()
@@ -1025,9 +1217,10 @@ final class CaptureViewModel: ObservableObject {
 
     // MARK: - Model preflight / uninstall
 
-    /// Whether all on-disk models (ASR + Silero VAD + Qwen) are present — for the
-    /// **currently selected** first language + tier, not just any cached variant
-    /// (switching language/tier can require a fresh ~600 MB variant download).
+    /// Whether all on-disk models are present — ASR, Silero VAD, Qwen, and the
+    /// pyannote diarization pair when that setting is on (it now is by default).
+    /// Checked for the **currently selected** first language + tier, not just any
+    /// cached variant: every language/tier pair is a separate ~600 MB download.
     var modelsPresent: Bool {
         NemotronStreamingService.variantPresent(
             language: settings.firstLanguage, tier: settings.asrTier)
@@ -1078,7 +1271,8 @@ final class CaptureViewModel: ObservableObject {
                 english: seg.sourceText,
                 chinese: seg.translatedText,
                 source: seg.source,
-                timestamp: recovered.session.startedAt.addingTimeInterval(seg.startTime))
+                timestamp: recovered.session.startedAt.addingTimeInterval(seg.startTime),
+                speakerLabel: seg.speakerLabel)   // persisted; dropping it blanked the speaker column
         }
         summaryText = ""
         lastSummaryEN = nil
@@ -1113,7 +1307,8 @@ final class CaptureViewModel: ObservableObject {
         }
     }
 
-    /// Download every model now (ASR variant, Silero VAD, Qwen), with progress.
+    /// Download every model now (ASR variant, Silero VAD, Qwen, and the pyannote
+    /// diarization pair when that setting is on), with progress.
     /// Idle-only: running this concurrently with a meeting's `loadModels` would
     /// double-download the same ASR variant into the same directory.
     func downloadAllModels() async {
@@ -1128,6 +1323,7 @@ final class CaptureViewModel: ObservableObject {
         prefetchQwen()
         asr.currentLanguage = settings.firstLanguage
         asr.diarizationEnabled = settings.diarizationEnabled
+        asr.keepAcousticContext = settings.keepAcousticContext
         asr.onLoadProgress = { [weak self] p in
             Task { @MainActor in self?.statusMessage = "下載 ASR 模型… \(Int(p * 100))%" }
         }
@@ -1192,12 +1388,11 @@ final class CaptureViewModel: ObservableObject {
         // window is dropped by the state guard (no ghost captions).
         try? await Task.sleep(nanoseconds: 600_000_000)
         asr.releaseModels()       // free ASR memory
-        // Stop accepting new translations, then wait for any in-flight GPU
-        // generation to finish BEFORE unloading the model — otherwise
-        // `unloadQwen()` → `GPU.clearCache()` could fire mid-generation (crash).
+        // Stop accepting new work first, so nothing can be queued behind the
+        // drain that `releaseQwen()` performs before it frees the model.
         acceptingTranslations = false
-        await drainInflightTranslations()
-        unloadQwen()              // free the translation model now — summary is on-demand
+        acceptingCorrections = false
+        await releaseQwen()       // drains both queues, then frees the model
         store.endSession()
         asrState = .idle
         modelLoadsInFlight = 0
@@ -1223,7 +1418,7 @@ final class CaptureViewModel: ObservableObject {
         guard canSummarize else { return }
         statusMessage = "產生摘要中… Generating summary…"
         await summarize()
-        unloadQwen()              // free the shared Qwen model + MLX cache after the summary
+        await releaseQwen()       // free the shared Qwen model + MLX cache after the summary
         // Honest completion status: `summarize()` can fail on both backends.
         statusMessage = summaryText.isEmpty
             ? "摘要失敗 Summary failed · 請再試一次（記憶體不足或模型未下載）"
@@ -1336,34 +1531,48 @@ final class CaptureViewModel: ObservableObject {
 
     // MARK: - Export
 
+    /// File extension and display name for each export format.
+    private static func exportFileType(_ format: ExportFormat) -> (ext: String, label: String) {
+        switch format {
+        case .markdown:  return ("md", "Markdown")
+        case .plainText: return ("txt", "Plain text")
+        case .srt:       return ("srt", "SRT subtitles")
+        case .vtt:       return ("vtt", "WebVTT subtitles")
+        case .json:      return ("json", "JSON")
+        }
+    }
+
+    /// Export the transcript. The format follows the extension the user picks in
+    /// the save panel — `TranscriptExporter` has always produced all five, but
+    /// the panel used to be locked to `.md`, so SRT/VTT/TXT/JSON were written,
+    /// tested and unreachable.
     func exportTranscript() {
         guard let session = currentSession else { return }
-        let exporter = TranscriptExporter()
-        guard let data = try? exporter.exportBilingual(
-            session: session, segments: store.segments,
-            chinese: lastSummaryZH, english: lastSummaryEN, format: .markdown
-        ) else {
-            statusMessage = "Nothing to export"
-            return
-        }
 
-        // Let the user choose where to save (NSSavePanel), defaulting to a
-        // timestamped Markdown file.
         let panel = NSSavePanel()
         let stamp = { let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd-HHmm"; return f.string(from: Date()) }()
         panel.nameFieldStringValue = "FlowTranslate-\(stamp).md"
         panel.canCreateDirectories = true
         panel.title = "匯出逐字稿 Export transcript"
-        if let md = UTType(filenameExtension: "md") {
-            panel.allowedContentTypes = [md]
+        panel.message = "副檔名決定格式 The extension picks the format: "
+            + ExportFormat.allCases.map { Self.exportFileType($0).ext }.joined(separator: " · ")
+        panel.allowedContentTypes = ExportFormat.allCases.compactMap {
+            UTType(filenameExtension: Self.exportFileType($0).ext)
         }
         panel.begin { [weak self] response in
-            guard response == .OK, let url = panel.url else { return }
+            guard let self, response == .OK, let url = panel.url else { return }
+            // Map the chosen extension back to a format; anything unexpected
+            // falls back to Markdown rather than failing the export.
+            let chosen = url.pathExtension.lowercased()
+            let format = ExportFormat.allCases.first { Self.exportFileType($0).ext == chosen } ?? .markdown
             do {
+                let data = try TranscriptExporter().exportBilingual(
+                    session: session, segments: self.store.segments,
+                    chinese: self.lastSummaryZH, english: self.lastSummaryEN, format: format)
                 try data.write(to: url)
-                self?.statusMessage = "Exported transcript to \(url.path)"
+                self.statusMessage = "Exported \(Self.exportFileType(format).label) to \(url.path)"
             } catch {
-                self?.statusMessage = "Export failed: \(error.localizedDescription)"
+                self.statusMessage = "Export failed: \(error.localizedDescription)"
             }
         }
     }
