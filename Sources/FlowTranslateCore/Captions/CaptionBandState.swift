@@ -16,6 +16,9 @@ public struct BandLine: Identifiable, Equatable, Sendable {
     /// Whether a translation is expected for this line (drives the "⋯" pending
     /// placeholder in the reserved second-line space).
     public var expectsTranslation: Bool
+    /// Diarized speaker label ("Speaker 1"…); nil while interim or when
+    /// diarization is off.
+    public var speakerLabel: String?
 
     public init(
         id: UUID,
@@ -24,7 +27,8 @@ public struct BandLine: Identifiable, Equatable, Sendable {
         chinese: String? = nil,
         source: AudioSourceType,
         isFinal: Bool,
-        expectsTranslation: Bool = false
+        expectsTranslation: Bool = false,
+        speakerLabel: String? = nil
     ) {
         self.id = id
         self.translationKey = translationKey
@@ -33,6 +37,7 @@ public struct BandLine: Identifiable, Equatable, Sendable {
         self.source = source
         self.isFinal = isFinal
         self.expectsTranslation = expectsTranslation
+        self.speakerLabel = speakerLabel
     }
 }
 
@@ -116,7 +121,8 @@ public struct CaptionBandState: Equatable, Sendable {
         utteranceId: UUID?,
         source: AudioSourceType,
         sentences: [(key: UUID, english: String)],
-        expectsTranslation: Bool
+        expectsTranslation: Bool,
+        speakerLabel: String? = nil
     ) {
         guard !sentences.isEmpty else { return }
         if isPinned { pendingWhilePinned += sentences.count }
@@ -125,7 +131,8 @@ public struct CaptionBandState: Equatable, Sendable {
             for s in sentences.dropLast() {
                 committed.append(BandLine(
                     id: s.key, translationKey: s.key, english: s.english,
-                    source: source, isFinal: true, expectsTranslation: expectsTranslation))
+                    source: source, isFinal: true, expectsTranslation: expectsTranslation,
+                    speakerLabel: speakerLabel))
             }
             let last = sentences[sentences.count - 1]
             slot?.english = last.english
@@ -133,6 +140,7 @@ public struct CaptionBandState: Equatable, Sendable {
             slot?.isFinal = true
             slot?.expectsTranslation = expectsTranslation
             slot?.source = source
+            slot?.speakerLabel = speakerLabel
         } else {
             // Background commit: roll a finalized slot up first so ordering stays
             // chronological, then append these sentences as history.
@@ -140,7 +148,8 @@ public struct CaptionBandState: Equatable, Sendable {
             for s in sentences {
                 committed.append(BandLine(
                     id: s.key, translationKey: s.key, english: s.english,
-                    source: source, isFinal: true, expectsTranslation: expectsTranslation))
+                    source: source, isFinal: true, expectsTranslation: expectsTranslation,
+                    speakerLabel: speakerLabel))
             }
         }
         trimCommitted()

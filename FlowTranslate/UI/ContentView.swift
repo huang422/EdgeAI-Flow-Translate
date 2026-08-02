@@ -373,6 +373,11 @@ private struct TranscriptRow: View {
             HStack(alignment: .firstTextBaseline, spacing: 7) {
                 Circle().fill(CaptionTheme.Palette.sourceDot(line.source)).frame(width: 6, height: 6)
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+                if let speaker = line.speakerLabel {
+                    Text(speaker)
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                }
                 Text(line.english)
                     .font(.system(size: 13.5, weight: .semibold))
                     .foregroundStyle(CaptionTheme.Palette.inkPrimary)

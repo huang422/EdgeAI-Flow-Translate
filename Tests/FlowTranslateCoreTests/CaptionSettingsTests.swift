@@ -9,6 +9,15 @@ import Foundation
         #expect(s.secondCaptionEnabled == true)
         #expect(s.secondLanguage == .traditionalChinese)
         #expect(s.needsTranslation == true)
+        #expect(s.diarizationEnabled == false)
+    }
+
+    @Test func roundTripPreservesDiarizationSetting() throws {
+        var s = CaptionSettings.default
+        s.diarizationEnabled = true
+        let back = try JSONDecoder().decode(
+            CaptionSettings.self, from: JSONEncoder().encode(s))
+        #expect(back.diarizationEnabled == true)
     }
 
     @Test func secondCaptionCanBeDisabled() {

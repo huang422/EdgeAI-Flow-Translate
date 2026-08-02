@@ -15,6 +15,8 @@ struct CaptionLine: Identifiable, Equatable {
     var source: AudioSourceType = .system
     /// Wall-clock time the line was finalized (shown as a transcript timestamp).
     var timestamp: Date = Date()
+    /// Diarized speaker label ("Speaker 1"…), when speaker diarization is on.
+    var speakerLabel: String?
 }
 
 /// Wires audio capture → Nemotron ASR → translation → bilingual captions /
@@ -142,6 +144,7 @@ final class CaptureViewModel: ObservableObject {
     // independently animating footer rows.
     private var asrDownloadPct: Int?
     private var qwenDownloadPct: Int?
+    private var diarDownloadPct: Int?
 
     /// Free the Qwen model from **memory** and reset its load state. The disk
     /// prefetch is intentionally left running — the summary needs those files even
@@ -366,6 +369,21 @@ final class CaptureViewModel: ObservableObject {
         }
         asr.onVadUnavailable = { [weak self] msg in
             Task { @MainActor in self?.statusMessage = "⚠️ " + msg }
+        }
+        asr.onDiarizationLoadProgress = { [weak self] p in
+            Task { @MainActor in
+                guard let self else { return }
+                self.diarDownloadPct = Int(p * 100)
+                if self.asrState == .loading {
+                    self.composeLoadingStatus()   // fold into the single Start line
+                } else {
+                    self.modelStatus = "下載講者辨識模型（pyannote）… \(Int(p * 100))%"
+                }
+                if p >= 1 { self.diarDownloadPct = nil }
+            }
+        }
+        asr.onDiarizationUnavailable = { [weak self] msg in
+            Task { @MainActor in self?.statusMessage = "⚠️ 講者辨識無法使用（字幕不受影響）: " + msg }
         }
         translation.onResult = { [weak self] id, zh in
             self?.applyTranslation(id: id, chinese: zh)
@@ -691,7 +709,8 @@ final class CaptureViewModel: ObservableObject {
             let id = (isLast && wasDisplayed && uttId != nil) ? uttId! : UUID()
             pairs.append((key: id, english: sentence))
             lines.append(CaptionLine(id: id, english: sentence, chinese: nil,
-                                     source: source, timestamp: Date()))
+                                     source: source, timestamp: Date(),
+                                     speakerLabel: segment.speakerLabel))
             let seg = TranscriptSegment(
                 id: id,
                 sessionId: session.id,
@@ -714,7 +733,8 @@ final class CaptureViewModel: ObservableObject {
             utteranceId: wasDisplayed ? uttId : nil,
             source: source,
             sentences: pairs,
-            expectsTranslation: settings.needsTranslation)
+            expectsTranslation: settings.needsTranslation,
+            speakerLabel: segment.speakerLabel)
 
         promoteNextInterim(nextOwner)
     }
@@ -910,6 +930,7 @@ final class CaptureViewModel: ObservableObject {
         guard asrState == .loading else { return }
         var parts: [String] = []
         if let a = asrDownloadPct { parts.append("ASR \(a)%") }
+        if let d = diarDownloadPct, d < 100 { parts.append("講者模型 \(d)%") }
         if let q = qwenDownloadPct, q < 100 { parts.append("Qwen 背景下載 \(q)%") }
         statusMessage = parts.isEmpty ? "準備模型… Preparing models"
                                       : "準備模型：" + parts.joined(separator: " · ")
@@ -961,6 +982,7 @@ final class CaptureViewModel: ObservableObject {
             // meeting segmentation timing) before loading the model.
             asr.currentLanguage = settings.firstLanguage
             asr.scenario = settings.scenario
+            asr.diarizationEnabled = settings.diarizationEnabled
             asr.onLoadProgress = { [weak self] p in
                 Task { @MainActor in
                     guard let self else { return }
@@ -1010,6 +1032,7 @@ final class CaptureViewModel: ObservableObject {
         NemotronStreamingService.variantPresent(
             language: settings.firstLanguage, tier: settings.asrTier)
             && NemotronStreamingService.vadModelPresent
+            && (!settings.diarizationEnabled || NemotronStreamingService.diarizationModelPresent)
             && qwenHost.isComplete
     }
 
@@ -1104,6 +1127,7 @@ final class CaptureViewModel: ObservableObject {
         statusMessage = "Downloading models…"
         prefetchQwen()
         asr.currentLanguage = settings.firstLanguage
+        asr.diarizationEnabled = settings.diarizationEnabled
         asr.onLoadProgress = { [weak self] p in
             Task { @MainActor in self?.statusMessage = "下載 ASR 模型… \(Int(p * 100))%" }
         }

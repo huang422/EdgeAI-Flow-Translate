@@ -47,6 +47,9 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     public var translationEngine: TranslationEngine
     public var clickThrough: Bool
     public var asrTier: String
+    /// Optional speaker diarization (pyannote 3.1 + WeSpeaker via FluidAudio):
+    /// labels speakers per audio source; applied on the next Start.
+    public var diarizationEnabled: Bool
 
     // MARK: Input gain (help a quiet meeting participant clear the level gates)
 
@@ -91,6 +94,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         translationEngine: TranslationEngine = .system,
         clickThrough: Bool = true,
         asrTier: String = "560ms",
+        diarizationEnabled: Bool = false,
         systemInputGainDb: Double = 0,
         micInputGainDb: Double = 0,
         autoGainEnabled: Bool = false,
@@ -109,6 +113,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.translationEngine = translationEngine
         self.clickThrough = clickThrough
         self.asrTier = asrTier
+        self.diarizationEnabled = diarizationEnabled
         self.systemInputGainDb = CaptionSettings.clampGain(systemInputGainDb)
         self.micInputGainDb = CaptionSettings.clampGain(micInputGainDb)
         self.autoGainEnabled = autoGainEnabled
@@ -135,6 +140,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         translationEngine = try c.decodeIfPresent(TranslationEngine.self, forKey: .translationEngine) ?? d.translationEngine
         clickThrough = try c.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? d.clickThrough
         asrTier = try c.decodeIfPresent(String.self, forKey: .asrTier) ?? d.asrTier
+        diarizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? d.diarizationEnabled
         systemInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .systemInputGainDb) ?? d.systemInputGainDb)
         micInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .micInputGainDb) ?? d.micInputGainDb)
         autoGainEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoGainEnabled) ?? d.autoGainEnabled

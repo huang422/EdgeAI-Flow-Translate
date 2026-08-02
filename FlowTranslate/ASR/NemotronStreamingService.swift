@@ -38,6 +38,15 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// Called true when a model starts loading lazily, false when it's ready.
     public var onModelLoading: ((Bool) -> Void)?
 
+    /// Enables pyannote/speaker-diarization-3.1 for each active audio source.
+    public var diarizationEnabled = false
+
+    /// Reports pyannote/WeSpeaker download and load progress (0...1).
+    public var onDiarizationLoadProgress: ((Double) -> Void)?
+
+    /// Reports a recoverable diarization failure. ASR continues without labels.
+    public var onDiarizationUnavailable: ((String) -> Void)?
+
     private var variantDir: URL?
     private var loadedKey: String?        // "<language>|<tier>" currently downloaded
     private var pipelines: [AudioSourceType: SourceASR] = [:]
@@ -46,6 +55,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// preload or a pipeline load finished). Drives the UI's "warming" state so
     /// it can show an honest "model loading" instead of a premature "Listening".
     private var warm = false
+    private let diarizerConfig = DiarizerConfig(
+        minSpeechDuration: 0.5,
+        minEmbeddingUpdateDuration: 1.0,
+        chunkDuration: 5.0)
+    private var diarizerModels: DiarizerModels?
     /// Audio captured while a source's pipeline is still being created, replayed
     /// once it's ready so the opening words are never dropped (cold-start fix).
     private var pendingChunks: [AudioSourceType: [AudioChunk]] = [:]
@@ -69,6 +83,7 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// (re-downloads a partial/corrupt cache). Fast when already cached. The model
     /// is loaded into memory lazily on first audio. No-op if already prepared.
     public func loadModels(tier: String) async throws {
+        await prepareDiarizationIfNeeded()
         let key = "\(currentLanguage)|\(tier)"
         if loadedKey == key, variantDir != nil { return }   // already prepared, no re-download
 
@@ -81,6 +96,27 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         variantDir = try await ensureVariant(lang: currentLanguage, chunkMs: Self.chunkMs(for: tier))
         loadedKey = key
         onLoadProgress?(1.0)
+    }
+
+    /// Download and load the pyannote 3.1 pipeline independently of ASR. Diarization
+    /// is optional, so a model failure is surfaced to the UI but never prevents
+    /// captions (fail-open).
+    private func prepareDiarizationIfNeeded() async {
+        guard diarizationEnabled else {
+            diarizerModels = nil
+            return
+        }
+        guard diarizerModels == nil else { return }
+        do {
+            let progress: DownloadUtils.ProgressHandler = { [weak self] p in
+                self?.onDiarizationLoadProgress?(p.fractionCompleted)
+            }
+            diarizerModels = try await DiarizerModels.downloadIfNeeded(
+                progressHandler: progress)
+            onDiarizationLoadProgress?(1.0)
+        } catch {
+            onDiarizationUnavailable?("pyannote diarization unavailable: \(error.localizedDescription)")
+        }
     }
 
     /// Load one model in the background now, so it's ready by the time the user
@@ -189,6 +225,14 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
             .appendingPathComponent("silero-vad/silero-vad-unified-256ms-v6.0.0.mlmodelc").path)
     }
 
+    /// True when the pyannote segmentation and WeSpeaker embedding models are cached.
+    public static var diarizationModelPresent: Bool {
+        let directory = DiarizerModels.defaultModelsDirectory()
+        return DiarizerModels.requiredModelNames.allSatisfy {
+            FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+        }
+    }
+
     /// Download the Silero VAD model now (no-op if cached). `false` on failure.
     /// The presence check avoids loading the whole CoreML model into memory (and
     /// immediately discarding it) just to prove the files are on disk.
@@ -228,6 +272,7 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// summarization LLM. The next Start reloads them lazily; download is kept.
     public func releaseModels() {
         teardownAll()
+        diarizerModels = nil
     }
 
     public func stopStream() {
@@ -267,6 +312,9 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
             let pipeline = SourceASR(
                 source: source, manager: manager,
                 tuning: .forSource(source, scenario: self.scenario))
+            pipeline.configureDiarization(enabled: self.diarizationEnabled,
+                                          models: self.diarizerModels,
+                                          config: self.diarizerConfig)
             pipeline.onEvent = { [weak self] event in self?.onEvent?(event) }
             pipeline.onVadUnavailable = { [weak self] msg in self?.onVadUnavailable?(msg) }
             await pipeline.start()
@@ -358,6 +406,15 @@ private final class SourceASR: @unchecked Sendable {
     private var hasSpeech = false
     private var lastPartial = ""   // live partial, for terminal-punctuation close
 
+    // Optional speaker diarization (pyannote 3.1 + WeSpeaker). Each source keeps
+    // its own diarizer + speaker database so mic and system identities never mix.
+    private var diarizationEnabled = false
+    private var diarizer: DiarizerManager?
+    private var diarizationAudio: [Float] = []
+    private var diarizationAudioStartTime: TimeInterval?
+    private var asrAudioStartTime: TimeInterval?
+    private let diarizationBufferSamples = 12 * 16_000
+
     init(source: AudioSourceType, manager: StreamingNemotronMultilingualAsrManager,
          tuning: SegmentationTuning) {
         self.source = source
@@ -369,6 +426,7 @@ private final class SourceASR: @unchecked Sendable {
 
     func start() async {
         await manager.reset()   // clean streaming state before the first utterance
+        resetDiarization()
         await ensureSilero()
         resetState()
         await manager.setPartialCallback { [weak self] text in
@@ -389,6 +447,21 @@ private final class SourceASR: @unchecked Sendable {
         cont?.yield(chunk)
     }
 
+    /// Each source pipeline owns its speaker database so labels remain stable
+    /// without mixing microphone and system-audio identities.
+    func configureDiarization(enabled: Bool, models: DiarizerModels?, config: DiarizerConfig) {
+        diarizationEnabled = enabled
+        guard enabled, let models else {
+            diarizer = nil
+            diarizationAudio.removeAll(keepingCapacity: false)
+            diarizationAudioStartTime = nil
+            return
+        }
+        let instance = DiarizerManager(config: config)
+        instance.initialize(models: models)
+        diarizer = instance
+    }
+
     /// Permanently stop and release. The consumer task is cancelled (its loop
     /// breaks at the next chunk) but the trailing finalize still emits, so the
     /// sentence in flight when Stop was pressed reaches the transcript.
@@ -407,7 +480,14 @@ private final class SourceASR: @unchecked Sendable {
         utteranceStart = 0
         hasSpeech = false
         lastPartial = ""
+        asrAudioStartTime = nil
         endpointer.reset()
+    }
+
+    private func resetDiarization() {
+        diarizer?.speakerManager.reset()
+        diarizationAudio.removeAll(keepingCapacity: true)
+        diarizationAudioStartTime = nil
     }
 
     /// Load the Silero VAD once. Fail loud: on failure warn the caller (no silent
@@ -432,6 +512,20 @@ private final class SourceASR: @unchecked Sendable {
         for await chunk in stream {
             if Task.isCancelled { break }
             lastTimestamp = chunk.timestamp
+
+            // Keep a rolling PCM window for pyannote (independent of Nemotron's
+            // chunk tier; its 5 s inference windows need raw audio context).
+            if diarizer != nil {
+                if diarizationAudioStartTime == nil { diarizationAudioStartTime = chunk.timestamp }
+                diarizationAudio.append(contentsOf: chunk.samples)
+                if diarizationAudio.count > diarizationBufferSamples {
+                    let removed = diarizationAudio.count - diarizationBufferSamples
+                    diarizationAudio.removeFirst(removed)
+                    diarizationAudioStartTime? += Double(removed) / 16_000.0
+                }
+            }
+
+            if asrAudioStartTime == nil { asrAudioStartTime = chunk.timestamp }
 
             _ = try? await manager.process(samples: chunk.samples)
 
@@ -469,14 +563,79 @@ private final class SourceASR: @unchecked Sendable {
 
     private func finalizeUtterance(at endTime: TimeInterval) async {
         guard hasSpeech else { return }
-        let text = (try? await manager.finish()) ?? ""
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty {
+        let result = try? await manager.finishWithTokenTimings()
+        let trimmed = (result?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            await manager.reset()
+            resetState()
+            return
+        }
+
+        let turns = diarizationTurns(from: utteranceStart, to: endTime)
+        let origin = asrAudioStartTime ?? utteranceStart
+        let tokens = (result?.timings ?? []).map {
+            TimedTextToken(
+                text: $0.token,
+                startTime: origin + $0.startTime,
+                endTime: origin + $0.endTime)
+        }
+        // Preserve Nemotron's exact decoded text when diarization is disabled or
+        // unavailable; token-piece reconstruction is only needed to split turns.
+        let aligned = turns.isEmpty ? [] : SpeakerTurnAligner.align(tokens: tokens, turns: turns)
+
+        if aligned.isEmpty {
             onEvent?(.finalized(segment: ASRSegment(
-                text: trimmed, source: source, startTime: utteranceStart, endTime: endTime
+                text: trimmed, source: source, startTime: utteranceStart, endTime: endTime,
+                speakerLabel: dominantSpeaker(in: turns, from: utteranceStart, to: endTime)
             )))
+        } else {
+            for group in aligned {
+                onEvent?(.finalized(segment: ASRSegment(
+                    text: group.text,
+                    source: source,
+                    startTime: group.startTime,
+                    endTime: group.endTime,
+                    speakerLabel: group.speakerLabel
+                )))
+            }
         }
         await manager.reset()
         resetState()
+    }
+
+    /// pyannote consumes raw PCM around the utterance; its five-second inference
+    /// windows are independent of Nemotron's chunk tier and finalization points.
+    private func diarizationTurns(from startTime: TimeInterval, to endTime: TimeInterval) -> [SpeakerTurn] {
+        guard diarizationEnabled else { return [] }
+        guard let diarizer, let bufferStart = diarizationAudioStartTime, !diarizationAudio.isEmpty else {
+            return []
+        }
+
+        let contextStart = max(bufferStart, startTime - 1.0)
+        let startIndex = min(diarizationAudio.count, max(0, Int((contextStart - bufferStart) * 16_000)))
+        let endIndex = min(diarizationAudio.count, max(startIndex, Int((endTime - bufferStart) * 16_000)))
+        guard endIndex > startIndex else { return [] }
+        let audio = Array(diarizationAudio[startIndex..<endIndex])
+        guard let result = try? diarizer.performCompleteDiarization(
+            audio, sampleRate: 16_000, atTime: contextStart) else { return [] }
+
+        return result.segments.map { segment in
+            SpeakerTurn(
+                label: diarizer.speakerManager.getSpeaker(for: segment.speakerId)?.name
+                    ?? "Speaker \(segment.speakerId)",
+                startTime: Double(segment.startTimeSeconds),
+                endTime: Double(segment.endTimeSeconds))
+        }
+    }
+
+    private func dominantSpeaker(
+        in turns: [SpeakerTurn], from startTime: TimeInterval, to endTime: TimeInterval
+    ) -> String? {
+        var totals: [String: TimeInterval] = [:]
+        for turn in turns {
+            totals[turn.label, default: 0] += max(
+                0, min(endTime, turn.endTime) - max(startTime, turn.startTime))
+        }
+        return totals.max { $0.value < $1.value }?.key
     }
 }

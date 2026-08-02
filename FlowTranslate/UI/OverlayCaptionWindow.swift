@@ -50,9 +50,11 @@ final class OverlayModel: ObservableObject {
 
     /// Finalized utterance, cleaned + split; the last sentence morphs the slot.
     func applyCommit(utteranceId: UUID?, source: AudioSourceType,
-                     sentences: [(key: UUID, english: String)], expectsTranslation: Bool) {
+                     sentences: [(key: UUID, english: String)], expectsTranslation: Bool,
+                     speakerLabel: String? = nil) {
         band.commit(utteranceId: utteranceId, source: source,
-                    sentences: sentences, expectsTranslation: expectsTranslation)
+                    sentences: sentences, expectsTranslation: expectsTranslation,
+                    speakerLabel: speakerLabel)
     }
 
     /// Accurate translation for a finalized sentence.
@@ -212,6 +214,11 @@ private struct BandLineView: View {
             HStack(alignment: .firstTextBaseline, spacing: 8) {
                 dot
                     .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+                if let speaker = line.speakerLabel {
+                    Text(speaker)
+                        .font(.system(size: max(10, fontSize - 5), weight: .bold))
+                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                }
                 if englishOnTop {
                     englishRow(font: CaptionTheme.primaryFont(fontSize), color: topColor)
                 } else {
