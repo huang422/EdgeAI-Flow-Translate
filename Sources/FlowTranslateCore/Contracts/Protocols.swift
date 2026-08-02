@@ -26,11 +26,6 @@ public protocol ASRStreaming: AnyObject {
     var onEvent: ((TranscriptEvent) -> Void)? { get set }
 }
 
-/// Simplified-to-Traditional Chinese conversion protocol.
-public protocol SimplifiedToTraditionalConverting: Sendable {
-    func s2twp(_ text: String) -> String
-}
-
 /// Pre-finalization text cleanup protocol (contracts/translation.md, FR-006).
 public protocol TextCleaning: Sendable {
     func cleanup(_ text: String) -> String

@@ -8,7 +8,7 @@ import Foundation
 /// (Foundation) and context-aware for one-to-many characters (头发→頭髮,
 /// 干杯→乾杯, 里面→裡面). The small character table remains as a fallback in
 /// case the ICU transform is unavailable.
-public struct BasicS2TWPConverter: SimplifiedToTraditionalConverting {
+public struct BasicS2TWPConverter {
     public init() {}
 
     public func s2twp(_ text: String) -> String {
@@ -30,24 +30,35 @@ public struct BasicS2TWPConverter: SimplifiedToTraditionalConverting {
         return out
     }
 
-    /// Common Taiwan-preferred phrase substitutions.
-    static let phrases: [(String, String)] = [
-        ("软件", "軟體"),
-        ("硬件", "硬體"),
-        ("网络", "網路"),
-        ("服务器", "伺服器"),
-        ("内存", "記憶體"),
-        ("硬盘", "硬碟"),
-        ("鼠标", "滑鼠"),
-        ("屏幕", "螢幕"),
-        ("视频", "影片"),
-        ("程序", "程式"),
-        ("打印", "列印"),
-        ("信息", "資訊"),
-        ("数据", "資料"),
-        ("默认", "預設"),
-        ("文件", "檔案"),
+    /// **Single source of truth** for the Taiwan vocabulary, shared with
+    /// `TraditionalChineseGuard` (edit here only — the two lists used to drift).
+    /// Each entry: the Simplified spelling, the Mainland spelling in Traditional
+    /// script (`nil` when a Traditional-script rewrite would be unsafe because
+    /// the term is ALSO a legitimate Taiwan word, e.g. 程序/文件), and the
+    /// Taiwan-preferred term.
+    static let taiwanTerms: [(simplified: String, mainlandTraditional: String?, taiwan: String)] = [
+        ("软件", "軟件", "軟體"),
+        ("硬件", "硬件", "硬體"),
+        ("网络", "網絡", "網路"),
+        ("服务器", "服務器", "伺服器"),
+        ("内存", "內存", "記憶體"),
+        ("硬盘", "硬盤", "硬碟"),
+        ("鼠标", "鼠標", "滑鼠"),
+        ("屏幕", "屏幕", "螢幕"),
+        ("视频", "視頻", "影片"),
+        ("打印", "打印", "列印"),
+        ("默认", "默認", "預設"),
+        ("人工智能", "人工智能", "人工智慧"),
+        // Simplified-only rewrites: as Traditional-script words these are real
+        // Taiwan vocabulary with a different meaning — never rewrite those.
+        ("程序", nil, "程式"),
+        ("信息", nil, "資訊"),
+        ("数据", nil, "資料"),
+        ("文件", nil, "檔案"),
     ]
+
+    /// Simplified → Taiwan phrase substitutions (derived from `taiwanTerms`).
+    static let phrases: [(String, String)] = taiwanTerms.map { ($0.simplified, $0.taiwan) }
 
     /// Common single-character Simplified → Traditional mappings.
     static let characters: [Character: Character] = [

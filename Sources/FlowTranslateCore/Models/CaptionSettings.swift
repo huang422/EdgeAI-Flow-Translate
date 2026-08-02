@@ -45,10 +45,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     public var secondLanguage: SecondCaptionLanguage
     /// Which backend translates the second caption (see `TranslationEngine`).
     public var translationEngine: TranslationEngine
-    public var audioSources: Set<AudioSourceType>
     public var clickThrough: Bool
     public var asrTier: String
-    public var diarizationEnabled: Bool
 
     // MARK: Input gain (help a quiet meeting participant clear the level gates)
 
@@ -91,10 +89,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         secondCaptionEnabled: Bool = true,
         secondLanguage: SecondCaptionLanguage = .traditionalChinese,
         translationEngine: TranslationEngine = .system,
-        audioSources: Set<AudioSourceType> = [.system],
         clickThrough: Bool = true,
         asrTier: String = "560ms",
-        diarizationEnabled: Bool = false,
         systemInputGainDb: Double = 0,
         micInputGainDb: Double = 0,
         autoGainEnabled: Bool = false,
@@ -111,10 +107,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.secondCaptionEnabled = secondCaptionEnabled
         self.secondLanguage = secondLanguage
         self.translationEngine = translationEngine
-        self.audioSources = audioSources
         self.clickThrough = clickThrough
         self.asrTier = asrTier
-        self.diarizationEnabled = diarizationEnabled
         self.systemInputGainDb = CaptionSettings.clampGain(systemInputGainDb)
         self.micInputGainDb = CaptionSettings.clampGain(micInputGainDb)
         self.autoGainEnabled = autoGainEnabled
@@ -139,10 +133,8 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         secondCaptionEnabled = try c.decodeIfPresent(Bool.self, forKey: .secondCaptionEnabled) ?? d.secondCaptionEnabled
         secondLanguage = try c.decodeIfPresent(SecondCaptionLanguage.self, forKey: .secondLanguage) ?? d.secondLanguage
         translationEngine = try c.decodeIfPresent(TranslationEngine.self, forKey: .translationEngine) ?? d.translationEngine
-        audioSources = try c.decodeIfPresent(Set<AudioSourceType>.self, forKey: .audioSources) ?? d.audioSources
         clickThrough = try c.decodeIfPresent(Bool.self, forKey: .clickThrough) ?? d.clickThrough
         asrTier = try c.decodeIfPresent(String.self, forKey: .asrTier) ?? d.asrTier
-        diarizationEnabled = try c.decodeIfPresent(Bool.self, forKey: .diarizationEnabled) ?? d.diarizationEnabled
         systemInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .systemInputGainDb) ?? d.systemInputGainDb)
         micInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .micInputGainDb) ?? d.micInputGainDb)
         autoGainEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoGainEnabled) ?? d.autoGainEnabled

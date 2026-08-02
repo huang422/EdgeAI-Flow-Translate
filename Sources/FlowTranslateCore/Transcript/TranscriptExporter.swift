@@ -159,15 +159,24 @@ public struct TranscriptExporter: TranscriptExporting {
 
     // MARK: - Time formatting
 
+    /// Cached formatters — constructing them per segment made export O(n) in
+    /// formatter allocations (they are notoriously expensive to build).
+    /// `nonisolated(unsafe)`: (NS)DateFormatter has been documented thread-safe
+    /// since macOS 10.9, it just isn't annotated Sendable.
+    nonisolated(unsafe) private static let isoFormatter = ISO8601DateFormatter()
+    nonisolated(unsafe) private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm:ss"
+        return f
+    }()
+
     private func iso(_ date: Date) -> String {
-        ISO8601DateFormatter().string(from: date)
+        Self.isoFormatter.string(from: date)
     }
 
     /// Wall-clock time of day (local system timezone) for the readable transcript.
     private func clockTime(_ date: Date) -> String {
-        let f = DateFormatter()
-        f.dateFormat = "HH:mm:ss"
-        return f.string(from: date)
+        Self.clockFormatter.string(from: date)
     }
 
     /// SRT uses a comma before milliseconds: HH:MM:SS,mmm

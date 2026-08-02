@@ -9,7 +9,6 @@ public struct Session: Identifiable, Codable, Sendable, Equatable {
     public var firstLanguage: String
     public var secondLanguage: String
     public var asrTier: String
-    public var diarizationEnabled: Bool
 
     public init(
         id: UUID = UUID(),
@@ -18,8 +17,7 @@ public struct Session: Identifiable, Codable, Sendable, Equatable {
         title: String? = nil,
         firstLanguage: String = "en",
         secondLanguage: String = "zh-Hant",
-        asrTier: String = "1120ms",
-        diarizationEnabled: Bool = false
+        asrTier: String = "1120ms"
     ) {
         self.id = id
         self.startedAt = startedAt
@@ -28,7 +26,6 @@ public struct Session: Identifiable, Codable, Sendable, Equatable {
         self.firstLanguage = firstLanguage
         self.secondLanguage = secondLanguage
         self.asrTier = asrTier
-        self.diarizationEnabled = diarizationEnabled
     }
 
     /// Whether the meeting is still in progress (not yet ended).

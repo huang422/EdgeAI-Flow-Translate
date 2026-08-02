@@ -175,7 +175,7 @@ The diagram below reflects the **current implementation**:
 │  LAYER 3 . LANGUAGE   (finalized only -- never blocks interim)           │
 ├──────────────────────────────────────────────────────────────────────────┤
 │    BasicTextCleaner  -->  Translation (Apple on-device  /  MLX Qwen)     │
-│                           + ContextBuffer (prior sentences)              │
+│                           + BilingualContextBuffer (prior pairs)              │
 └──────────────────────────────────────────────────────────────────────────┘
                                       |
                                       v  EN (line 1) + ZH (line 2)
@@ -213,7 +213,7 @@ flowchart TB
     subgraph Lang["3 · Language layer"]
         CLEAN["BasicTextCleaner<br/>(finalized only)"]
         TRANS["Translation<br/>(Apple on-device · MLX Qwen fallback)"]
-        CTX["ContextBuffer"]
+        CTX["BilingualContextBuffer"]
     end
 
     subgraph UX["4 · Presentation & Records"]
@@ -353,7 +353,7 @@ Flow-Translate/
 │   ├── Contracts/Protocols.swift # layer interfaces
 │   ├── Audio/AudioMath.swift     # rms / level helpers
 │   ├── Audio/Endpointer.swift    # utterance boundaries (Silero-driven)
-│   ├── Translation/              # ContextBuffer, BilingualContextBuffer, BasicTextCleaner, BasicS2TWPConverter, TraditionalChineseGuard, InstantPhraseTranslations
+│   ├── Translation/              # BilingualContextBuffer, BasicTextCleaner, BasicS2TWPConverter, TraditionalChineseGuard, InstantPhraseTranslations
 │   ├── Transcript/               # In-memory + file (crash-safe) stores, exporter
 │   └── Summarization/            # ExtractiveSummarizer (pure-Swift fallback)
 ├── FlowTranslate/                # macOS app (SwiftUI + AppKit)

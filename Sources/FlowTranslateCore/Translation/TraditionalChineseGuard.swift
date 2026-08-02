@@ -47,20 +47,12 @@ public enum TraditionalChineseGuard {
     ]
 
     /// Mainland terms written in Traditional script → Taiwan equivalents.
-    /// Deliberately conservative: only terms with no legitimate Taiwan usage
-    /// (e.g. 程序/文件/質量 are REAL Taiwan words and must not be rewritten).
-    static let mainlandTraditionalTerms: [(String, String)] = [
-        ("軟件", "軟體"),
-        ("硬件", "硬體"),
-        ("網絡", "網路"),
-        ("服務器", "伺服器"),
-        ("內存", "記憶體"),
-        ("硬盤", "硬碟"),
-        ("鼠標", "滑鼠"),
-        ("屏幕", "螢幕"),
-        ("視頻", "影片"),
-        ("打印", "列印"),
-        ("默認", "預設"),
-        ("人工智能", "人工智慧"),
-    ]
+    /// Derived from the canonical table in `BasicS2TWPConverter.taiwanTerms`
+    /// (single source of truth). Deliberately conservative: entries whose
+    /// Traditional spelling is ALSO a real Taiwan word (程序/文件/質量) carry a
+    /// `nil` Traditional key there and are excluded here.
+    static let mainlandTraditionalTerms: [(String, String)] =
+        BasicS2TWPConverter.taiwanTerms.compactMap { term in
+            term.mainlandTraditional.map { ($0, term.taiwan) }
+        }
 }

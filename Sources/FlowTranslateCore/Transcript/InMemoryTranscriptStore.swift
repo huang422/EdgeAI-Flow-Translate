@@ -18,8 +18,7 @@ public final class InMemoryTranscriptStore: TranscriptStoring {
         let s = Session(
             firstLanguage: settings.firstLanguage,
             secondLanguage: settings.secondCaptionEnabled ? settings.secondLanguage.rawValue : "",
-            asrTier: settings.asrTier,
-            diarizationEnabled: settings.diarizationEnabled
+            asrTier: settings.asrTier
         )
         session = s
         _segments.removeAll()
