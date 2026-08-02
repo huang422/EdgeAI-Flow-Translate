@@ -71,4 +71,51 @@ import Foundation
         #expect(reopened.recoverIncompleteSession() == nil)
         reopened.clear()
     }
+
+    /// Regression (H1): starting a NEW session must never overwrite a crashed
+    /// session's snapshot — it is archived to a `recovered-*.json` instead.
+    @Test func beginSessionArchivesCrashedSnapshotInsteadOfOverwriting() throws {
+        let dir = tempDir()
+        let store = try FileTranscriptStore(directory: dir)
+        let session = store.beginSession(settings: .default)
+        store.append(segment(session, 0, "precious words"))
+        store.flush()
+        // Simulate a crash + relaunch: reload from disk, session still active.
+        let reopened = try FileTranscriptStore(directory: dir)
+        #expect(reopened.hasIncompleteSession == true)
+
+        // User presses Start → new session begins.
+        _ = reopened.beginSession(settings: .default)
+        reopened.flush()
+
+        // The crashed transcript survives as an archive file.
+        let archives = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("recovered-") && $0.hasSuffix(".json") }
+        #expect(archives.count == 1)
+        // And the archived file still contains the old segment.
+        let data = try Data(contentsOf: dir.appendingPathComponent(archives[0]))
+        let text = String(decoding: data, as: UTF8.self)
+        #expect(text.contains("precious words"))
+        // The live store starts clean.
+        #expect(reopened.segments.isEmpty)
+        reopened.clear()
+        try? FileManager.default.removeItem(at: dir)
+    }
+
+    /// An ended (properly closed) session is NOT archived on the next begin.
+    @Test func beginSessionDoesNotArchiveEndedSession() throws {
+        let dir = tempDir()
+        let store = try FileTranscriptStore(directory: dir)
+        let session = store.beginSession(settings: .default)
+        store.append(segment(session, 0, "done"))
+        store.endSession()
+
+        _ = store.beginSession(settings: .default)
+        store.flush()
+        let archives = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasPrefix("recovered-") }
+        #expect(archives.isEmpty)
+        store.clear()
+        try? FileManager.default.removeItem(at: dir)
+    }
 }

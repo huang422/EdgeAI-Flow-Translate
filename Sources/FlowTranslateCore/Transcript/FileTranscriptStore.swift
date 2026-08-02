@@ -54,11 +54,12 @@ public final class FileTranscriptStore: TranscriptStoring {
 
     @discardableResult
     public func beginSession(settings: CaptionSettings) -> Session {
+        // Never overwrite a crashed session's data: archive it first (FR-008).
+        archiveIncompleteSnapshot()
         let s = Session(
             firstLanguage: settings.firstLanguage,
             secondLanguage: settings.secondCaptionEnabled ? settings.secondLanguage.rawValue : "",
-            asrTier: settings.asrTier,
-            diarizationEnabled: settings.diarizationEnabled
+            asrTier: settings.asrTier
         )
         session = s
         _segments.removeAll()
@@ -66,6 +67,24 @@ public final class FileTranscriptStore: TranscriptStoring {
         persist()
         onChange?()
         return s
+    }
+
+    /// If the persisted session never ended (crash / force-quit), move its
+    /// snapshot to a timestamped `recovered-*.json` next to the live file instead
+    /// of overwriting it, so the transcript survives until the user deals with it.
+    private func archiveIncompleteSnapshot() {
+        guard let session, session.isActive, !_segments.isEmpty else { return }
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fileURL.path) else { return }
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        var dest = fileURL.deletingLastPathComponent()
+            .appendingPathComponent("recovered-\(f.string(from: session.startedAt)).json")
+        if fm.fileExists(atPath: dest.path) {   // same-second collision → unique name
+            dest = fileURL.deletingLastPathComponent()
+                .appendingPathComponent("recovered-\(f.string(from: session.startedAt))-\(UUID().uuidString.prefix(8)).json")
+        }
+        try? fm.moveItem(at: fileURL, to: dest)
     }
 
     public func append(_ segment: TranscriptSegment) {
