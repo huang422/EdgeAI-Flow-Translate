@@ -66,8 +66,13 @@ struct SettingsView: View {
                 Picker("延遲層級 Latency", selection: $settings.asrTier) {
                     Text("Lowest 560ms").tag("560ms")
                     Text("Balanced 1120ms").tag("1120ms")
+                    Text("Accurate 2240ms").tag("2240ms")
                 }
                 .pickerStyle(.segmented)
+                Text("Higher tiers hear more context per step — noticeably better accuracy, "
+                    + "chunkier caption updates. 2240ms is FluidAudio's recommended quality tier. "
+                    + "Applies on the next Start.")
+                    .font(.caption).foregroundStyle(.secondary)
                 Toggle(isOn: $settings.diarizationEnabled) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("講者辨識 Speaker diarization")

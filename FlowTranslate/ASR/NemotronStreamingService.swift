@@ -144,6 +144,13 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         }
         guard !Task.isCancelled else { return nil }
         await m.setLanguage(currentLanguage)
+        // Language lock (P0): when the user picked a SPECIFIC language, seed the
+        // decoder with its lang-tag token (Whisper-style forced prefix) so the
+        // multilingual model can't drift or mis-detect mid-meeting. "auto" keeps
+        // per-sentence detection for mixed-language audio.
+        if currentLanguage != "auto" {
+            await m.setForcedPrefix(true)
+        }
         lock.withLock { warm = true }
         return m
     }
@@ -366,7 +373,8 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     static func chunkMs(for tier: String) -> Int {
         switch tier {
         case "560ms": return 560
-        default: return 1120   // "1120ms" (and any legacy value) → balanced tier
+        case "2240ms": return 2240   // FluidAudio's recommended quality tier
+        default: return 1120         // "1120ms" (and any legacy value) → balanced tier
         }
     }
 }
@@ -546,8 +554,10 @@ private final class SourceASR: @unchecked Sendable {
 
             let dt = Double(chunk.samples.count) / 16_000.0
             let sentenceEnded = Endpointer.endsSentence(lastPartial)
+            let sentenceIncomplete = SemanticEndpoint.isIncomplete(lastPartial)
             for event in endpointer.process(
-                speechStarted: started, speechEnded: ended, sentenceEnded: sentenceEnded, dt: dt
+                speechStarted: started, speechEnded: ended, sentenceEnded: sentenceEnded,
+                sentenceIncomplete: sentenceIncomplete, dt: dt
             ) {
                 switch event {
                 case .start:

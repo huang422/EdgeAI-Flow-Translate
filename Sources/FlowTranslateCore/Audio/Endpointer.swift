@@ -8,10 +8,16 @@ public struct EndpointerConfig: Sendable, Equatable {
     public var minSpeech: TimeInterval
     /// Hard cap so a non-stop talker still flushes to ASR/translation.
     public var maxSpeech: TimeInterval
+    /// How many acoustic endpoints may be deferred per utterance when the live
+    /// text looks unfinished (semantic endpointing, see `SemanticEndpoint`).
+    /// Each deferral waits one more VAD silence window; `maxSpeech` still caps.
+    public var maxGraceEndings: Int
 
-    public init(minSpeech: TimeInterval = 0.30, maxSpeech: TimeInterval = 8) {
+    public init(minSpeech: TimeInterval = 0.30, maxSpeech: TimeInterval = 8,
+                maxGraceEndings: Int = 1) {
         self.minSpeech = minSpeech
         self.maxSpeech = maxSpeech
+        self.maxGraceEndings = max(0, maxGraceEndings)
     }
 
     public static let `default` = EndpointerConfig()
@@ -34,12 +40,14 @@ public struct Endpointer {
     public private(set) var inUtterance = false
 
     private var elapsed: TimeInterval = 0   // total time since onset
+    private var graceUsed = 0               // semantic-endpoint deferrals so far
 
     public init(config: EndpointerConfig = .default) { self.config = config }
 
     public mutating func reset() {
         inUtterance = false
         elapsed = 0
+        graceUsed = 0
     }
 
     /// Whether terminal punctuation ends the live partial, enabling an early close.
@@ -50,9 +58,12 @@ public struct Endpointer {
 
     /// Advance by one chunk of `dt` seconds. `speechStarted`/`speechEnded` are the
     /// Silero stream events; `sentenceEnded` is a terminal-punctuation hint (used
-    /// only as a secondary close once `minSpeech` is met).
+    /// only as a secondary close once `minSpeech` is met); `sentenceIncomplete`
+    /// is the semantic hint that the live text ends mid-thought — an acoustic
+    /// endpoint arriving then is deferred (up to `maxGraceEndings` times).
     public mutating func process(
-        speechStarted: Bool, speechEnded: Bool, sentenceEnded: Bool, speakerChanged: Bool = false,
+        speechStarted: Bool, speechEnded: Bool, sentenceEnded: Bool,
+        sentenceIncomplete: Bool = false, speakerChanged: Bool = false,
         dt: TimeInterval
     ) -> [EndpointEvent] {
         var events: [EndpointEvent] = []
@@ -60,6 +71,7 @@ public struct Endpointer {
         if speechStarted && !inUtterance {
             inUtterance = true
             elapsed = 0
+            graceUsed = 0
             events.append(.start)
         }
         guard inUtterance else { return events }
@@ -68,7 +80,17 @@ public struct Endpointer {
 
         // Primary: Silero endpoint. Finalize if long enough, else drop the blip.
         if speechEnded {
-            if elapsed >= config.minSpeech { events.append(.finalize) }
+            if elapsed < config.minSpeech {
+                reset()
+                return events
+            }
+            // Semantic grace: the text ends mid-thought ("so", "然後…") — hold
+            // the utterance open for one more silence window instead of cutting.
+            if sentenceIncomplete && graceUsed < config.maxGraceEndings {
+                graceUsed += 1
+                return events
+            }
+            events.append(.finalize)
             reset()
             return events
         }
