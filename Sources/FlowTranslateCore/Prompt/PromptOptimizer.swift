@@ -494,20 +494,29 @@ public enum PromptOptimizer {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    /// Built by appending rather than by one `+` chain.
+    ///
+    /// Eleven heterogeneous operands joined with `+` is a single expression the
+    /// Swift type checker has to solve as a whole, and it is slow enough to hit
+    /// the "unable to type-check in reasonable time" limit on a slower machine —
+    /// which compiles locally and fails in CI, the worst way for it to fail.
+    /// Appending in statements gives each operand its own, trivial solution.
     static func bulletsWithSections(_ ir: PromptIR) -> [(IRSection, String)] {
-        (ir.goal.isEmpty ? [] : [(IRSection.goal, ir.goal)])
-            // Linted like the goal, and for the same reason: on a pure question
-            // this is the single load-bearing field, and it is copied from the
-            // user's own words — which is exactly where "CRITICAL:" and "think
-            // step by step" come from.
-            + (ir.question.isEmpty ? [] : [(IRSection.question, ir.question)])
-            + ir.steps.map { (IRSection.steps, $0) }
-            + ir.context.map { (IRSection.context, $0) }
-            + ir.constraints.map { (IRSection.constraints, $0) }
-            + ir.scopeExclusions.map { (IRSection.scopeExclusions, $0) }
-            + ir.deliverables.map { (IRSection.deliverables, $0) }
-            + ir.acceptance.map { (IRSection.acceptance, $0) }
-            + ir.failureCases.map { (IRSection.failureCases, $0) }
+        var out: [(IRSection, String)] = []
+        if !ir.goal.isEmpty { out.append((.goal, ir.goal)) }
+        // Linted like the goal, and for the same reason: on a pure question this
+        // is the single load-bearing field, and it is copied from the user's own
+        // words — which is exactly where "CRITICAL:" and "think step by step"
+        // come from.
+        if !ir.question.isEmpty { out.append((.question, ir.question)) }
+        out.append(contentsOf: ir.steps.map { (IRSection.steps, $0) })
+        out.append(contentsOf: ir.context.map { (IRSection.context, $0) })
+        out.append(contentsOf: ir.constraints.map { (IRSection.constraints, $0) })
+        out.append(contentsOf: ir.scopeExclusions.map { (IRSection.scopeExclusions, $0) })
+        out.append(contentsOf: ir.deliverables.map { (IRSection.deliverables, $0) })
+        out.append(contentsOf: ir.acceptance.map { (IRSection.acceptance, $0) })
+        out.append(contentsOf: ir.failureCases.map { (IRSection.failureCases, $0) })
+        return out
     }
 
     // MARK: - Applying fixes
