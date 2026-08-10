@@ -9,31 +9,100 @@ struct ContentView: View {
     /// closing and reopening the window never spawns a second overlay / hotkey set.
     @ObservedObject var vm: CaptureViewModel
     @State private var showSettings = false
+    @State private var tab: MainTab = .captions
 
     private static let bottomAnchor = "TRANSCRIPT_BOTTOM"
+
+    /// The two panes of the window. Kept as a picker under the shared title bar
+    /// rather than a `TabView` so the title bar, the hidden translation host and
+    /// the window accessor stay mounted across a switch — tearing down the Apple
+    /// Translation session on every tab change would be a real regression.
+    enum MainTab: String, CaseIterable, Identifiable {
+        case captions, prompt
+        var id: String { rawValue }
+
+        var chinese: String {
+            switch self {
+            case .captions: return "即時字幕"
+            case .prompt: return "提示詞編譯"
+            }
+        }
+
+        var english: String {
+            switch self {
+            case .captions: return "Live captions"
+            case .prompt: return "Prompt composer"
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .captions: return "captions.bubble.fill"
+            case .prompt: return "wand.and.stars"
+            }
+        }
+
+        /// One accent each, so the two modes are distinguishable by colour and
+        /// not only by which outline is lit.
+        var tint: Color {
+            switch self {
+            case .captions: return CaptionTheme.Palette.accentSystem
+            case .prompt: return CaptionTheme.Palette.privacy
+            }
+        }
+
+        var hint: String {
+            switch self {
+            case .captions: return "會議與影片的即時雙語字幕"
+            case .prompt: return "把口述或打字的需求編譯成給編碼代理的提示詞"
+            }
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             titleBar
-            sourcesSection
-            actionRow
-            languageChip
-            transcriptArea
-            if !vm.summaryText.isEmpty { summaryArea }
-            footer
+            // Always shown. Both panes are primary features, and a picker that
+            // can vanish is a picker that can strand you on the pane it was the
+            // only way out of.
+            tabPicker
+            switch tab {
+            case .captions: captionsPane
+            case .prompt: PromptComposerView(vm: vm, composer: vm.composer)
+            }
         }
         .padding(20)
-        .frame(minWidth: 680, minHeight: 620)
+        // Both dimensions are set by the Prompt tab, which is the denser of the
+        // two. The width now has to hold an editor column and a 300 pt inspector
+        // beside it — at 680 the prompt preview was down to about 330 pt, which is
+        // too narrow to read a rendered prompt in. The height came *down* when the
+        // settings moved into that inspector and stopped contributing to it.
+        .frame(minWidth: 940, minHeight: 620)
         .background(CaptionTheme.Palette.canvas)
         .preferredColorScheme(.dark)
+        // Entering the tab starts the model download, the way pressing Start
+        // does for a meeting. Without it the first compile silently blocks on
+        // 2.3 GB with the UI showing only "compiling".
+        .onChange(of: tab) { _, current in
+            if current == .prompt { vm.prepareForPromptWork() }
+        }
         // Hidden host for Apple's on-device translation session.
         .background(TranslationHostView(service: vm.translation))
         // Bind the main window so closing it stops the meeting + hides the overlay.
         .background(WindowAccessor { vm.bindMainWindow($0) })
         .sheet(isPresented: $showSettings) {
-            SettingsView(settings: $vm.settings, vm: vm)
+            SettingsView(
+                settings: $vm.settings, vm: vm,
+                initialPane: tab == .prompt ? .prompt : .captions
+            )
         }
         .task {
+            // Ask the Speech framework whether the built-in recognizer exists on
+            // this machine before anything reads the answer. Until it has run,
+            // `builtInAvailable` is false — which is the safe default: starting a
+            // dictation on Nemotron and finding the built-in engine was available
+            // costs nothing, while the reverse fails mid-session.
+            await DictationEngineFactory.refreshAvailability()
             // Recovery first: its prompt defers the model-download prompt
             // (two simultaneous alerts on one view drop one of them).
             vm.checkForRecoverableSession()
@@ -43,7 +112,8 @@ struct ContentView: View {
             Button("恢復 Recover") { vm.recoverIncompleteSession() }
             Button("捨棄 Discard", role: .destructive) { vm.discardIncompleteSession() }
         } message: {
-            Text("上次會議未正常結束，仍保有 \(vm.recoverableCount) 句逐字稿。恢復後可匯出或產生摘要。")
+            Text("The last meeting did not end cleanly. \(vm.recoverableCount) transcript "
+                + "sentences are still recoverable — export them or generate a summary.")
         }
         .alert("下載模型？ Download models?", isPresented: $vm.showModelDownloadPrompt) {
             Button("下載 Download") { Task { await vm.downloadAllModels() } }
@@ -53,10 +123,73 @@ struct ContentView: View {
             FlowTranslate 需要下載本機模型（一次性，之後完全離線可用）：
             • 語音辨識 ASR（所選語言）約 600 MB
             • Silero VAD 約 2 MB
-            • Qwen 翻譯／摘要模型 約 2.3 GB
+            • Qwen 翻譯／摘要／提示詞模型 約 2.3 GB
             合計約 2.9 GB — 建議使用 Wi-Fi。
             All processing stays on this Mac.
             """)
+        }
+    }
+
+    // MARK: - Panes
+
+    /// The app's two modes, as two cards rather than a segmented control.
+    ///
+    /// A segmented picker reads as a setting for whatever is below it, not as
+    /// the top-level navigation between two different features — and the two
+    /// labels disagreed with each other, one bilingual and one not. Each card
+    /// carries its own accent colour so which mode you are in is legible at a
+    /// glance rather than from a one-pixel selection outline.
+    private var tabPicker: some View {
+        HStack(spacing: 10) {
+            ForEach(MainTab.allCases) { item in
+                tabCard(item)
+            }
+            Spacer()
+        }
+    }
+
+    private func tabCard(_ item: MainTab) -> some View {
+        let selected = tab == item
+        return Button {
+            tab = item
+        } label: {
+            HStack(spacing: 8) {
+                Image(systemName: item.icon)
+                    .font(.system(size: 14, weight: .semibold))
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(item.english).font(.system(size: 13, weight: .semibold))
+                    Text(item.chinese).font(.system(size: 10))
+                        .foregroundStyle(selected ? item.tint.opacity(0.9)
+                                                  : CaptionTheme.Palette.inkTertiary)
+                }
+            }
+            .foregroundStyle(selected ? item.tint : CaptionTheme.Palette.inkSecondary)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 8)
+            .frame(minWidth: 150, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(selected ? item.tint.opacity(0.16) : CaptionTheme.Palette.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(selected ? item.tint.opacity(0.55) : .clear, lineWidth: 1.5)
+            )
+        }
+        .buttonStyle(.plain)
+        .help(item.hint)
+    }
+
+    /// The original single-window layout, unchanged — only lifted into its own
+    /// property so the Prompt tab can sit beside it.
+    private var captionsPane: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            sourcesSection
+            actionRow
+            languageChip
+            transcriptArea
+            if !vm.summaryText.isEmpty { summaryArea }
+            footer
         }
     }
 
@@ -119,9 +252,13 @@ struct ContentView: View {
             sectionLabel("音訊來源 SOURCES")
             HStack(spacing: 10) {
                 SourceCard(title: "🎤 麥克風 Mic", color: CaptionTheme.Palette.mic,
-                           on: vm.micEnabled, level: vm.micLevel) { Task { await vm.toggleMic() } }
+                           on: vm.micEnabled, levels: vm.levels, level: \.mic) {
+                    Task { await vm.toggleMic() }
+                }
                 SourceCard(title: "🔊 系統聲 System", color: CaptionTheme.Palette.accentSystem,
-                           on: vm.systemEnabled, level: vm.systemLevel) { Task { await vm.toggleSystem() } }
+                           on: vm.systemEnabled, levels: vm.levels, level: \.system) {
+                    Task { await vm.toggleSystem() }
+                }
             }
         }
     }
@@ -131,12 +268,12 @@ struct ContentView: View {
     private var actionRow: some View {
         HStack(spacing: 12) {
             mainButton
-            HStack(spacing: 8) {
-                Toggle("", isOn: $vm.overlayOn)
-                    .labelsHidden().toggleStyle(.switch).tint(CaptionTheme.Palette.accentSystem)
-                Text("浮動字幕 Overlay").font(.system(size: 12.5)).foregroundStyle(CaptionTheme.Palette.inkSecondary)
-                Text("⌃⌥C").font(.system(size: 10.5, design: .monospaced)).foregroundStyle(CaptionTheme.Palette.inkTertiary)
-            }
+            HotkeyToggle(
+                title: "浮動字幕 Overlay",
+                keys: "⌃⌥C",
+                isOn: $vm.overlayOn,
+                help: "在任何 app 上方顯示懸浮字幕，隨時可用 ⌃⌥C 開關。"
+            )
             Spacer()
             Button { Task { await vm.generateSummary() } } label: {
                 Label("摘要 Summary", systemImage: "doc.text.magnifyingglass").font(.system(size: 12.5))
@@ -192,11 +329,11 @@ struct ContentView: View {
                 Text(vm.settings.scenario == .video ? "🎬 Video" : "👥 Meeting")
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)
                 Rectangle().fill(.white.opacity(0.12)).frame(width: 1, height: 12)
-                Text("翻譯").font(.system(size: 12)).foregroundStyle(CaptionTheme.Palette.inkSecondary)
-                Text(vm.settings.firstLanguage == "auto" ? "自動偵測" : vm.settings.firstLanguage)
+                Text("翻譯 Translate").font(.system(size: 12)).foregroundStyle(CaptionTheme.Palette.inkSecondary)
+                Text(vm.settings.firstLanguage == "auto" ? "自動 Auto" : vm.settings.firstLanguage)
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)
                 Image(systemName: "arrow.right").font(.system(size: 9)).foregroundStyle(CaptionTheme.Palette.inkTertiary)
-                Text(vm.settings.secondCaptionEnabled ? vm.settings.secondLanguage.displayName : "關閉")
+                Text(vm.settings.secondCaptionEnabled ? vm.settings.secondLanguage.displayName : "關閉 Off")
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)
                 Spacer()
                 Text("變更 Change").font(.system(size: 11)).foregroundStyle(Color(hex: 0x7FB5FF))
@@ -297,7 +434,18 @@ struct ContentView: View {
         if !vm.modelStatus.isEmpty {
             Text(vm.modelStatus).font(.caption).foregroundStyle(CaptionTheme.Palette.privacy)
         }
-        Text(vm.statusMessage).font(.callout).foregroundStyle(CaptionTheme.Palette.inkTertiary)
+        // The message and, when a permission is what stopped it, the one control
+        // that can change the answer. Nothing here opens System Settings on its
+        // own — see `PermissionPane`.
+        HStack(spacing: 8) {
+            Text(vm.statusMessage).font(.callout).foregroundStyle(CaptionTheme.Palette.inkTertiary)
+            if let pane = vm.statusAction {
+                Button(PermissionPane.buttonTitle) { pane.open() }
+                    .font(.caption)
+                    .controlSize(.small)
+            }
+        }
+        .fixedSize(horizontal: false, vertical: true)
     }
 
     private func sectionLabel(_ text: String) -> some View {
@@ -313,7 +461,10 @@ private struct SourceCard: View {
     let title: String
     let color: Color
     let on: Bool
-    let level: Float
+    /// Observed here rather than read from the parent, so a level change repaints
+    /// this card alone instead of everything that observes the view model.
+    @ObservedObject var levels: LevelMeters
+    let level: KeyPath<LevelMeters, Float>
     let action: () -> Void
 
     var body: some View {
@@ -329,7 +480,7 @@ private struct SourceCard: View {
                 Toggle("", isOn: Binding(get: { on }, set: { _ in action() }))
                     .labelsHidden().toggleStyle(.switch).tint(color)
             }
-            VolumeMeter(level: level, color: color, active: on)
+            VolumeMeter(level: levels[keyPath: level], color: color, active: on)
         }
         .padding(.horizontal, 13).padding(.vertical, 12)
         .background((on ? color.opacity(0.08) : Color.white.opacity(0.03)),
@@ -377,11 +528,19 @@ private enum TranscriptRowLayout {
     static let dotSize: CGFloat = 6
     static let gap: CGFloat = 7
     static let labelSize: CGFloat = 10
-    static var speakerWidth: CGFloat { CaptionTheme.speakerSlotWidth(labelSize: labelSize) }
+    /// Sized for the wider *half* of a wrapped name, not the whole name.
+    ///
+    /// The transcript window had room for `Claude Mango` on one line, but the
+    /// column is reserved on every row here too, and 95 pt of it was going to a
+    /// name that fits in 55 pt stacked. Both speaker columns now lay the name out
+    /// the same way, which is also why they can share one measurement.
+    @MainActor static var speakerWidth: CGFloat {
+        CaptionTheme.speakerSlotWidth(labelSize: labelSize, style: .wrapped)
+    }
 
     /// Where the caption text — and therefore its wrapped lines and translation
     /// — begins.
-    static func textIndent(speakerSlot: Bool) -> CGFloat {
+    @MainActor static func textIndent(speakerSlot: Bool) -> CGFloat {
         speakerSlot ? dotSize + gap + speakerWidth + gap : dotSize + gap
     }
 }
@@ -396,39 +555,53 @@ private struct TranscriptRow: View {
     /// exists, so one can never be dropped because the setting is stale.
     private var reservesSpeakerSlot: Bool { showSpeakerSlot || line.speakerLabel != nil }
 
+    /// Dot and speaker beside a column holding both caption lines — the same
+    /// shape as the floating band, and for the same reason: a two-line speaker
+    /// inside the first row pushes the translation down and opens a gap between
+    /// the two captions.
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            HStack(alignment: .firstTextBaseline, spacing: TranscriptRowLayout.gap) {
-                Circle().fill(CaptionTheme.Palette.sourceDot(line.source))
-                    .frame(width: TranscriptRowLayout.dotSize, height: TranscriptRowLayout.dotSize)
-                    .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+        HStack(alignment: .firstTextBaseline, spacing: TranscriptRowLayout.gap) {
+            Circle().fill(CaptionTheme.Palette.sourceDot(line.source))
+                .frame(width: TranscriptRowLayout.dotSize, height: TranscriptRowLayout.dotSize)
+                .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
+            Group {
                 if reservesSpeakerSlot {
                     // Fixed-width column: the sentence starts at the same x with
                     // or without a label, and its wrapped lines stay inside the
                     // text column instead of running back under the speaker.
-                    Text(line.speakerLabel ?? "")
+                    Text(SpeakerName.wrapping(line.speakerLabel ?? ""))
                         .font(.system(size: TranscriptRowLayout.labelSize, weight: .bold))
                         .foregroundStyle(CaptionTheme.Palette.inkSecondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                        .frame(width: TranscriptRowLayout.speakerWidth, alignment: .leading)
+                        .multilineTextAlignment(.leading)
+                        .lineLimit(2)
+                        // Same reasoning as the floating band: a truncated
+                        // speaker name is worse than a column that widens for it,
+                        // because two names can truncate to the same prefix.
+                        // Both axes: a height proposed by the row is a one-line
+                        // height, and the label needs two.
+                        .fixedSize()
+                        .frame(minWidth: TranscriptRowLayout.speakerWidth, alignment: .leading)
                 }
-                Text(line.english)
-                    .font(.system(size: 13.5, weight: .semibold))
-                    .foregroundStyle(CaptionTheme.Palette.inkPrimary)
-                    .textSelection(.enabled)
-                Spacer(minLength: 8)
-                Text(Self.clock(line.timestamp))
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(CaptionTheme.Palette.inkTertiary)
             }
-            if let zh = line.chinese, !zh.isEmpty {
-                Text(zh)
-                    .font(.system(size: 12.5))
-                    .foregroundStyle(Color(hex: 0x9DA3AE))
-                    .padding(.leading, TranscriptRowLayout.textIndent(speakerSlot: reservesSpeakerSlot))
-                    .textSelection(.enabled)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: TranscriptRowLayout.gap) {
+                    Text(line.english)
+                        .font(.system(size: 13.5, weight: .semibold))
+                        .foregroundStyle(CaptionTheme.Palette.inkPrimary)
+                        .textSelection(.enabled)
+                    Spacer(minLength: 8)
+                    Text(Self.clock(line.timestamp))
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                }
+                if let zh = line.chinese, !zh.isEmpty {
+                    Text(zh)
+                        .font(.system(size: 12.5))
+                        .foregroundStyle(Color(hex: 0x9DA3AE))
+                        .textSelection(.enabled)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }

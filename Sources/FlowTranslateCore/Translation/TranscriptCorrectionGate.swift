@@ -8,6 +8,7 @@ import Foundation
 /// plausible *repair* of the original:
 ///
 /// - non-empty, single-line, and actually different
+/// - no Simplified characters the original did not already have
 /// - length within 0.5×–2× of the original
 /// - every digit run preserved (numbers must never change silently)
 /// - normalized character edit distance ≤ 0.35
@@ -67,6 +68,24 @@ public enum TranscriptCorrectionGate {
         guard !orig.isEmpty, !corr.isEmpty, corr != orig else { return false }
         guard !corr.contains("\n") else { return false }          // one line in, one line out
 
+        // The repair must not change the script.
+        //
+        // This gate guarded numbers, length and edit distance but not this, while
+        // both dictation gates have checked it from the start — and the model is
+        // the same Qwen, which is trained predominantly on Simplified and treats
+        // "keep the same language" as satisfied by it. So a Chinese meeting with
+        // AI transcript correction on could have its **recorded** transcript
+        // quietly converted, sentence by sentence, and the edit distance of a
+        // conversion sits comfortably under the 0.35 budget. The transcript feeds
+        // the summary and every export, so nothing downstream would have caught
+        // it either.
+        //
+        // Rejected rather than converted back, for the reason
+        // `SimplifiedChineseDetector` documents: the mapping is lossy both ways,
+        // and keeping an unrepaired sentence beats rewriting a correct one.
+        guard !SimplifiedChineseDetector.introducesSimplified(original: orig, corrected: corr)
+        else { return false }
+
         // Length sanity: a repair shouldn't halve or double the sentence.
         let ratio = Double(corr.count) / Double(orig.count)
         guard (0.5...2.0).contains(ratio) else { return false }
@@ -96,13 +115,33 @@ public enum TranscriptCorrectionGate {
         return scalars.filter(isCJK).count * 2 >= scalars.count
     }
 
-    /// Multiset of digit runs ("v2 costs 300" → ["2", "300"]).
+    /// Multiset of **positional** digit runs ("v2 costs 300" → ["2", "300"]).
+    ///
+    /// Digits only, and that restriction is the whole point. `Character.isNumber`
+    /// is true for 一 二 三 十 百 千 萬 — they carry a numeric value in Unicode —
+    /// so every ordinary Chinese sentence yields "digit runs": 幫我看**一**下 is
+    /// `["一"]`, 第**一**個 is `["一"]`, **十**分重要 is `["十"]`. Counting those
+    /// rejects almost every Chinese repair under the "numbers must not change"
+    /// rule, which is Tidy appearing to do nothing on Chinese while working on
+    /// English.
+    ///
+    /// Chinese numerals are words: they keep the protection every other word has
+    /// — the edit-distance budget and the content rules — and lose only a rule
+    /// never written for them. 三十秒 rewritten as "30 秒" is still rejected, since
+    /// the runs differ (`[]` against `["30"]`).
+    ///
+    /// **Full-width digits fold to ASCII rather than being skipped.** Qwen emits
+    /// ０-９ in Chinese routinely, so an `isASCII` test gives 價格３００元 no runs at
+    /// all — and a repair returning 價格５００元 none either, matching, and putting
+    /// an invented number into the transcript, the summary and every export.
+    /// Folding also makes ３００ and 300 compare equal, which is a width
+    /// normalization rather than a changed number.
     static func digitRuns(_ text: String) -> [String] {
         var runs: [String] = []
         var current = ""
         for ch in text {
-            if ch.isNumber {
-                current.append(ch)
+            if let digit = asciiDigit(ch) {
+                current.append(digit)
             } else if !current.isEmpty {
                 runs.append(current)
                 current = ""
@@ -110,6 +149,55 @@ public enum TranscriptCorrectionGate {
         }
         if !current.isEmpty { runs.append(current) }
         return runs.sorted()
+    }
+
+    /// `corrected`'s digit runs, minus the ones the speaker said in Chinese
+    /// numerals — those are a **normalization**, not an invented number.
+    ///
+    /// A speaker says 三十秒 and the repair writes "30 秒" — exactly the tidying
+    /// this pass exists for. Without the subtraction it costs the whole passage:
+    /// the original has no digit runs (`digitRuns` counts positional digits only,
+    /// so 幫我看**一**下 is not read as containing a number), the repair has one,
+    /// and the gate calls it invented.
+    ///
+    /// Only the **invented** side is relaxed. Chinese numerals stay out of the
+    /// "numbers were dropped" accounting: that is the check whose false positives
+    /// made Chinese repairs impossible in the first place, and a run removed here
+    /// matches nothing in the original, so it cannot mask a real drop either.
+    ///
+    /// An actual invention is still caught — 三十 → "50" is not a value the
+    /// original names, so it is rejected exactly as before.
+    public static func digitsNotNamedInChinese(of corrected: String, saidIn original: String) -> [String] {
+        let runs = digitRuns(corrected)
+        guard !runs.isEmpty else { return runs }
+        let spokenValues = ChineseNumerals.values(in: original)
+        guard !spokenValues.isEmpty else { return runs }
+        return runs.filter { run in
+            guard let value = Int(run) else { return true }
+            return !spokenValues.contains(value)
+        }
+    }
+
+    /// `ch` as an ASCII digit, for the ASCII and full-width forms; nil otherwise.
+    private static func asciiDigit(_ ch: Character) -> Character? {
+        guard let scalar = ch.unicodeScalars.first, ch.unicodeScalars.count == 1
+        else { return nil }
+        switch scalar.value {
+        case 0x30...0x39: return ch                                  // 0-9
+        case 0xFF10...0xFF19:                                        // ０-９
+            return Character(UnicodeScalar(scalar.value - 0xFF10 + 0x30)!)
+        default: return nil
+        }
+    }
+
+    private static func isCJK(_ scalar: Unicode.Scalar) -> Bool {
+        switch scalar.value {
+        case 0x2E80...0x9FFF, 0xAC00...0xD7AF,
+             0xF900...0xFAFF, 0xFF00...0xFFEF, 0x20000...0x2FA1F:
+            return true
+        default:
+            return false
+        }
     }
 
     static func levenshtein(_ a: [Character], _ b: [Character]) -> Int {
@@ -128,13 +216,4 @@ public enum TranscriptCorrectionGate {
         return prev[b.count]
     }
 
-    private static func isCJK(_ scalar: Unicode.Scalar) -> Bool {
-        switch scalar.value {
-        case 0x2E80...0x9FFF, 0x3400...0x4DBF, 0xAC00...0xD7AF,
-             0xF900...0xFAFF, 0xFF00...0xFFEF, 0x20000...0x2FA1F:
-            return true
-        default:
-            return false
-        }
-    }
 }

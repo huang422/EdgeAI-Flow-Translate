@@ -1,9 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Terminate hook (M1 fix): Cmd+Q / logout / shutdown used to kill the process
-/// while up to 2.5 s of debounced transcript writes were still pending, and left
-/// the session flagged active. Flush + close the session before dying.
+/// Terminate hook: Cmd+Q / logout / shutdown can arrive with up to 2.5 s of
+/// debounced transcript writes still pending, and would leave the session flagged
+/// active. Flush and close the session before dying.
 final class AppDelegate: NSObject, NSApplicationDelegate {
     @MainActor static weak var viewModel: CaptureViewModel?
 

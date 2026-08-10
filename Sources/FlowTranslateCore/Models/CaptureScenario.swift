@@ -57,3 +57,68 @@ public struct SegmentationTuning: Sendable, Equatable {
         source == .microphone ? .meeting : forScenario(scenario)
     }
 }
+
+/// How readily the diarizer treats two segments as different people.
+///
+/// One value cannot serve every room, which is why this is a setting rather than
+/// a constant. The dial is a cosine distance between voice embeddings: below it
+/// a segment joins the nearest known speaker, above it a new speaker is created.
+///
+/// - Two people on one microphone sit far apart in embedding space, and the risk
+///   is *over*-segmentation — the same voice picked up at two distances, or
+///   across a cough, drifting past the threshold and becoming a second person.
+///   A loose threshold is right.
+/// - Five people on a conference call are compressed by the codec and recorded
+///   through one channel, so their embeddings crowd together and the risk is
+///   *under*-segmentation — everyone collapsing into two or three speakers. A
+///   tight threshold is right.
+///
+/// Those are opposite corrections, which is why a single default produced both
+/// of the complaints this exists to answer.
+public enum DiarizationSensitivity: String, Codable, Sendable, CaseIterable, Identifiable {
+    /// Fewest speakers. Merges readily — pick it when a two-person conversation
+    /// is being reported as four.
+    case merge
+    /// The default.
+    case balanced
+    /// Most speakers. Separates readily — pick it when five people are collapsing
+    /// into two.
+    case split
+
+    public var id: String { rawValue }
+
+    public var displayName: String {
+        switch self {
+        case .merge: return "偏合併 Fewer speakers"
+        case .balanced: return "標準 Balanced"
+        case .split: return "偏分離 More speakers"
+        }
+    }
+
+    public var explanation: String {
+        switch self {
+        case .merge:
+            return "同一個人被拆成好幾個講者時選這個。兩人對談用這個通常最準。"
+        case .balanced:
+            return "多數會議的預設值。"
+        case .split:
+            return "人數多卻被合併成兩三個講者時選這個。五人以上的線上會議用這個較準。"
+        }
+    }
+
+    /// The cosine-distance threshold handed to the clustering config.
+    ///
+    /// FluidAudio derives the speaker-assignment threshold as `× 1.2` and the
+    /// embedding-update threshold as `× 0.8`, so `balanced` lands on 0.66 / 0.44
+    /// — the values `SpeakerManager` documents as its own defaults. The previous
+    /// setting of 0.7 produced 0.84, a *29% looser* assignment threshold than the
+    /// library recommends, which is what let five distinct voices collapse into
+    /// two or three.
+    public var clusteringThreshold: Float {
+        switch self {
+        case .merge: return 0.68
+        case .balanced: return 0.55
+        case .split: return 0.46
+        }
+    }
+}

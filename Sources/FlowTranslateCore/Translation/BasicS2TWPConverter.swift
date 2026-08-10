@@ -31,7 +31,7 @@ public struct BasicS2TWPConverter {
     }
 
     /// **Single source of truth** for the Taiwan vocabulary, shared with
-    /// `TraditionalChineseGuard` (edit here only — the two lists used to drift).
+    /// `TraditionalChineseGuard` — edit here only, or the two lists drift.
     /// Each entry: the Simplified spelling, the Mainland spelling in Traditional
     /// script (`nil` when a Traditional-script rewrite would be unsafe because
     /// the term is ALSO a legitimate Taiwan word, e.g. 程序/文件), and the
