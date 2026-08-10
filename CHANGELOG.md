@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/huang422/EdgeAI-Flow-Translate/compare/v1.3.0...v1.4.0) (2026-08-10)
+
+
+### Features
+
+* Prompt Composer, bottom-anchored caption band and permission rework ([f4c664f](https://github.com/huang422/EdgeAI-Flow-Translate/commit/f4c664f6c2201d0b3c906b2a19c94deb22fef64d))
+
+
+### Bug Fixes
+
+* split a prompt-optimizer expression the type checker could not solve in time ([6b1e16e](https://github.com/huang422/EdgeAI-Flow-Translate/commit/6b1e16e65a4ec6a3a028abd18bd472000da851b0))
+
 ## [1.3.0](https://github.com/huang422/EdgeAI-Flow-Translate/compare/v1.2.0...v1.3.0) (2026-08-02)
 
 
