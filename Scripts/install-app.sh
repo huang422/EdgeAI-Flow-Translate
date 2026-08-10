@@ -44,8 +44,13 @@ rm -rf "$DEST"
 # a new signature, so the old Microphone / Screen Recording entries go stale
 # (toggle looks ON but capture fails). Reset them so the new build prompts fresh.
 echo "==> Resetting stale privacy (TCC) entries"
+# Accessibility too, not just the two capture ones. A *denied* Accessibility
+# entry is permanent from the app's side: macOS answers
+# `AXIsProcessTrustedWithOptions` immediately and shows no dialog, so the app can
+# never ask again, and a denial recorded once would survive every reinstall.
 tccutil reset Microphone dev.flowtranslate.app 2>/dev/null || true
 tccutil reset ScreenCapture dev.flowtranslate.app 2>/dev/null || true
+tccutil reset Accessibility dev.flowtranslate.app 2>/dev/null || true
 
 echo "==> Installing new version"
 cp -R "$APP" "$DEST"

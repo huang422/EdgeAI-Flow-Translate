@@ -111,11 +111,13 @@ public struct PrefixStableText: Equatable, Sendable {
     }
 
     /// Whether a character belongs to the CJK blocks (no inter-word spaces).
+    ///
+    /// Extension A (U+3400–4DBF) is inside the first range; listing it again was
+    /// a case the compiler could never reach.
     static func isCJK(_ ch: Character) -> Bool {
         guard let scalar = ch.unicodeScalars.first else { return false }
         switch scalar.value {
-        case 0x2E80...0x9FFF,      // CJK radicals, ideographs, kana, hangul jamo
-             0x3400...0x4DBF,      // CJK extension A
+        case 0x2E80...0x9FFF,      // radicals, punctuation, ideographs, kana, ext. A
              0xAC00...0xD7AF,      // Hangul syllables
              0xF900...0xFAFF,      // CJK compatibility ideographs
              0xFF00...0xFFEF,      // full-width forms

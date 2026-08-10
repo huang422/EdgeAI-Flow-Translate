@@ -62,10 +62,38 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// preload or a pipeline load finished). Drives the UI's "warming" state so
     /// it can show an honest "model loading" instead of a premature "Listening".
     private var warm = false
-    private let diarizerConfig = DiarizerConfig(
-        minSpeechDuration: 0.5,
-        minEmbeddingUpdateDuration: 1.0,
-        chunkDuration: 5.0)
+    /// How readily the diarizer splits one voice into two. Applied on the next
+    /// `loadModels`, like every other segmentation setting.
+    public var diarizationSensitivity: DiarizationSensitivity = .balanced
+
+    /// pyannote/WeSpeaker tuning.
+    ///
+    /// The two failure modes pull in opposite directions — over-segmentation
+    /// ("two people, four speakers") and under-segmentation — so every value here
+    /// stays at the library's default rather than half of it:
+    ///
+    /// - `minSpeechDuration: 1.0` gates *creating* a speaker. Half a second does
+    ///   not produce a stable WeSpeaker embedding, and one that lands far from
+    ///   everything mints a brand-new person. At 1.0 a segment that short returns
+    ///   no speaker and inherits the previous label — what the aligner's
+    ///   `previousLabel` fallback is for.
+    /// - `minEmbeddingUpdateDuration: 2.0` so only substantial speech moves a
+    ///   stored centroid. Letting second-long fragments drag it makes an
+    ///   established speaker drift out from under their own later segments.
+    /// - `chunkDuration: 10.0`, because pyannote 3.1's segmentation model is
+    ///   trained on 10-second windows and halving that halves the context it has
+    ///   for deciding where one voice stops and another starts.
+    /// - `clusteringThreshold` comes from the sensitivity setting, because no
+    ///   single value serves both rooms. FluidAudio derives the speaker-assignment
+    ///   threshold from it, and its 0.7 default yields 0.84 — 29% looser than the
+    ///   0.65 `SpeakerManager` documents, which crowds five voices into two.
+    private var diarizerConfig: DiarizerConfig {
+        DiarizerConfig(
+            clusteringThreshold: diarizationSensitivity.clusteringThreshold,
+            minSpeechDuration: 1.0,
+            minEmbeddingUpdateDuration: 2.0,
+            chunkDuration: 10.0)
+    }
     private var diarizerModels: DiarizerModels?
     /// Audio captured while a source's pipeline is still being created, replayed
     /// once it's ready so the opening words are never dropped (cold-start fix).
@@ -174,6 +202,54 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
             await m.setForcedPrefix(true)
         }
         return m
+    }
+
+    /// Fetch and verify a variant **without touching the live configuration**.
+    ///
+    /// `loadModels` writes `currentLanguage`/`loadedKey` and tears down the
+    /// running pipelines, so it cannot be used to get ahead of a dictation that
+    /// has not started — it would reconfigure a recognizer a meeting may be
+    /// using. This only ensures the files are on disk and validated, which is the
+    /// part that makes the first ⌃⌥Space wait.
+    ///
+    /// Costs no memory: weights are loaded lazily on the first audio chunk.
+    public func prewarmVariant(language: String, tier: String) async {
+        guard let dir = try? await ensureVariant(
+            lang: language, chunkMs: Self.chunkMs(for: tier)
+        ) else { return }
+        // Files on disk are not the wait. The weights load into the ANE on the
+        // **first audio chunk** — several seconds — which is why the first
+        // ⌃⌥Space after idle misses the opening words while a meeting never
+        // does: a meeting shows "Loading" and the user waits for "Listening"
+        // before speaking, and its own preload has already run.
+        //
+        // Loading them here is what actually makes the hotkey ready. It is the
+        // same shared load every source adopts, so a meeting started afterwards
+        // reuses it rather than paying twice.
+        // `variantDir` and `loadedKey` are written together, to **this** variant.
+        // They are one fact in two fields — the files, and the language/tier that
+        // `loadModels` compares against — so setting either alone made them
+        // describe different variants, and clearing the key instead made the next
+        // `loadModels` tear down the weights this method had just compiled.
+        lock.withLock {
+            variantDir = dir
+            loadedKey = "\(language)|\(tier)"
+        }
+        startBackgroundPreload()
+    }
+
+    /// Wait until the weights are resident, so a caller can say "ready" honestly.
+    ///
+    /// `loadModels` only fetches files; the CoreML load and the ANE compile
+    /// happen on the first audio chunk, several seconds later. A meeting can
+    /// absorb that — it shows "載入模型", buffers the audio and replays it — but
+    /// dictation cannot: the user presses a key, sees "聆聽中", speaks, and the
+    /// recognizer is not there yet. Awaiting the preload moves that wait in front
+    /// of the panel's own loading state, where it is visible and expected.
+    public func warmUpWeights() async {
+        startBackgroundPreload()
+        let task = lock.withLock { sharedTask }
+        _ = await task?.value
     }
 
     private func ensureVariant(lang: String, chunkMs: Int) async throws -> URL {
@@ -303,13 +379,32 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         diarizerModels = nil
     }
 
-    public func stopStream() {
+    /// Stop consuming audio.
+    ///
+    /// - Parameter keepModelsResident: leave the loaded weights in memory for the
+    ///   next stream instead of freeing them.
+    ///
+    /// A meeting frees them: it is a long session, it ends deliberately, and the
+    /// ~600 MB is worth returning. **Dictation must not.** It is seconds long and
+    /// happens repeatedly, and tearing down at the end of one meant the next
+    /// ⌃⌥Space paid the CoreML load and the ANE compile again — several seconds
+    /// before the recognizer could hear a word, every single time. That is the
+    /// "第二次辨識又要再載入一次" report, and it is this line that caused it.
+    ///
+    /// What is torn down instead is the *pipeline* — the per-source decoder state
+    /// — which is cheap to rebuild and must not carry acoustic state from one
+    /// dictation into the next. Only the shared weights survive.
+    public func stopStream() { stopStream(keepModelsResident: false) }
+
+    public func stopStream(keepModelsResident: Bool) {
         running = false
-        // Meetings always release models at Stop (endMeeting → releaseModels), so
-        // there is no keep-alive path: tear the pipelines down here as well. The
-        // consumers' trailing finalize still runs (stop() only cancels the loop),
-        // and the caller's drain window collects that last sentence.
-        teardownAll()
+        // The consumers' trailing finalize still runs (`stop()` only cancels the
+        // loop), and the caller's drain window collects that last sentence.
+        if keepModelsResident {
+            teardownPipelines()
+        } else {
+            teardownAll()
+        }
     }
 
     // MARK: - Pipelines
@@ -389,14 +484,29 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
 
     /// Fully tear down all pipelines (used when language/tier changes).
     private func teardownAll() {
+        teardownPipelines(freeingWeights: true)
+    }
+
+    /// Drop the per-source decoders, and optionally the weights behind them.
+    ///
+    /// The two are separable and it matters which is which. A **pipeline** holds
+    /// one source's encoder state, caches and prediction buffers; it is cheap,
+    /// and it must not survive from one session to the next or the next one
+    /// starts mid-sentence in the previous one's acoustic context. The **shared
+    /// weights** are the ~600 MB and the seconds of ANE compile; they are
+    /// identical for every session on the same variant, so freeing them between
+    /// two dictations is pure loss.
+    private func teardownPipelines(freeingWeights: Bool = false) {
         let all = lock.withLock { () -> [SourceASR] in
             let v = Array(pipelines.values)
             pipelines.removeAll()
             creating.removeAll()
             pendingChunks.removeAll()
-            sharedTask?.cancel()
-            sharedTask = nil          // drops the shared weights → memory freed
-            warm = false
+            if freeingWeights {
+                sharedTask?.cancel()
+                sharedTask = nil      // drops the shared weights → memory freed
+                warm = false
+            }
             return v
         }
         for p in all { p.stop() }
@@ -407,7 +517,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     static func chunkMs(for tier: String) -> Int {
         switch tier {
         case "560ms": return 560
-        case "2240ms": return 2240   // FluidAudio's recommended quality tier
+        // FluidAudio's own default: highest throughput, and WER neutral against
+        // the other two on its benchmark. Not a "quality tier" — see
+        // `PromptDictation.tier` for the numbers.
+        case "2240ms": return 2240
         default: return 1120         // "1120ms" (and any legacy value) → balanced tier
         }
     }
@@ -456,6 +569,15 @@ private final class SourceASR: @unchecked Sendable {
     private var diarizationAudioStartTime: TimeInterval?
     private var asrAudioStartTime: TimeInterval?
     private let diarizationBufferSamples = 12 * 16_000
+    /// How far a chunk's timestamp may sit from the end of the buffered audio
+    /// before the run is treated as broken.
+    ///
+    /// Wider than one chunk at any tier (2240 ms is the longest) so ordinary
+    /// jitter never re-origins the buffer, and far below the gap a dropped chunk
+    /// opens.
+    private static let diarizationContinuityTolerance: TimeInterval = 2.5
+    /// Holds the current speaker across an utterance pyannote could not label.
+    private var continuity = SpeakerContinuity()
 
     /// Experimental: carry the encoder's acoustic context across sentences.
     private let keepAcousticContext: Bool
@@ -553,6 +675,9 @@ private final class SourceASR: @unchecked Sendable {
         diarizer?.speakerManager.reset()
         diarizationAudio.removeAll(keepingCapacity: true)
         diarizationAudioStartTime = nil
+        // The speaker database is gone, so the name held over from the last
+        // meeting refers to nobody.
+        continuity.reset()
     }
 
     /// Load the Silero VAD once. Fail loud: on failure warn the caller (no silent
@@ -566,8 +691,28 @@ private final class SourceASR: @unchecked Sendable {
         }
     }
 
+    /// How many audio chunks may wait for the recognizer.
+    ///
+    /// `AsyncStream` defaults to `.unbounded`, and the producer here is a
+    /// real-time audio callback that can never block: every chunk the recognizer
+    /// has not consumed yet is simply queued. Under normal operation the queue is
+    /// one or two deep, but the recognizer stalls for real — a model load, a
+    /// diarizer inference, thermal throttling — and an unbounded queue turns a
+    /// stall into permanent lag, because the backlog is audio the app must still
+    /// process before it can reach the present. Captions would drift further
+    /// behind for the rest of the meeting and never recover, while the queue
+    /// itself grows without limit.
+    ///
+    /// 256 chunks is roughly 20–60 seconds of audio depending on the capture
+    /// buffer size — far beyond any stall the app recovers from, so it never
+    /// engages in normal use. Past it the **oldest** audio is dropped, which is
+    /// the right end to lose: a live caption for speech a minute old has no value,
+    /// and holding it delays every word after it.
+    private static let audioQueueLimit = 256
+
     private func launchConsumer() {
-        let stream = AsyncStream<AudioChunk> { cont in
+        let stream = AsyncStream<AudioChunk>(bufferingPolicy: .bufferingNewest(Self.audioQueueLimit)) {
+            cont in
             self.lock.withLock { self.continuation = cont }
         }
         task = Task { [weak self] in await self?.consume(stream) }
@@ -581,7 +726,35 @@ private final class SourceASR: @unchecked Sendable {
             // Keep a rolling PCM window for pyannote (independent of Nemotron's
             // chunk tier; its 5 s inference windows need raw audio context).
             if diarizer != nil {
-                if diarizationAudioStartTime == nil { diarizationAudioStartTime = chunk.timestamp }
+                // Re-origin the buffer whenever the incoming audio is not
+                // contiguous with what is already in it.
+                //
+                // `diarizationTurns` converts an absolute time to a sample index
+                // by assuming the buffer is one unbroken run starting at
+                // `diarizationAudioStartTime`. The **microphone stream is not**:
+                // `CaptureViewModel`'s echo suppression drops every mic chunk that
+                // arrives while system audio is playing, and the pipeline's
+                // bounded queue drops chunks under load. Timestamps are wall
+                // clock, so each dropped chunk widens the gap between "seconds
+                // since the buffer started" and "samples in the buffer".
+                //
+                // Once that gap exceeds the buffer's own span, the computed
+                // `startIndex` reaches `count`, the `endIndex > startIndex` guard
+                // fails and the whole utterance comes back with **no turns** —
+                // which is the speaker label silently disappearing. It gets worse
+                // the longer a meeting runs and the more the other side talks,
+                // which is exactly the reported "sometimes, and then more often".
+                //
+                // Restarting the run costs the diarizer some left context for one
+                // utterance; carrying on with a corrupt index costs the label
+                // outright, for every utterance after the drift sets in.
+                let expectedNext = (diarizationAudioStartTime ?? chunk.timestamp)
+                    + Double(diarizationAudio.count) / 16_000.0
+                if diarizationAudioStartTime == nil
+                    || abs(chunk.timestamp - expectedNext) > Self.diarizationContinuityTolerance {
+                    diarizationAudio.removeAll(keepingCapacity: true)
+                    diarizationAudioStartTime = chunk.timestamp
+                }
                 diarizationAudio.append(contentsOf: chunk.samples)
                 if diarizationAudio.count > diarizationBufferSamples {
                     let removed = diarizationAudio.count - diarizationBufferSamples
@@ -599,8 +772,9 @@ private final class SourceASR: @unchecked Sendable {
             // (lastPartial is non-empty only within an active, unfinalized utterance).
             // The partial-text trigger keeps the wall-clock maxSpeech firing — so
             // captions still split — even when Silero emits no start (degraded /
-            // VAD-unavailable mode), WITHOUT opening an empty utterance during silence
-            // (which used to backdate the segment's start time). VAD end splits earlier.
+            // VAD-unavailable mode), WITHOUT opening an empty utterance during
+            // silence, which would backdate the segment's start time. VAD end
+            // splits earlier.
             var sawStart = false, ended = false
             if let silero {
                 for e in await silero.events(for: chunk.samples) {
@@ -612,9 +786,14 @@ private final class SourceASR: @unchecked Sendable {
             let dt = Double(chunk.samples.count) / 16_000.0
             let sentenceEnded = Endpointer.endsSentence(lastPartial)
             let sentenceIncomplete = SemanticEndpoint.isIncomplete(lastPartial)
+            // A fragment that is complete-sounding but too short to be a sentence
+            // — "然後", "好的" before a thinking pause — buys the same one-window
+            // grace as an unfinished thought. An *empty* partial buys nothing:
+            // see `isTooShortToClose`.
+            let tooShort = Endpointer.isTooShortToClose(lastPartial)
             for event in endpointer.process(
                 speechStarted: started, speechEnded: ended, sentenceEnded: sentenceEnded,
-                sentenceIncomplete: sentenceIncomplete, dt: dt
+                sentenceIncomplete: sentenceIncomplete, tooShort: tooShort, dt: dt
             ) {
                 switch event {
                 case .start:
@@ -649,10 +828,16 @@ private final class SourceASR: @unchecked Sendable {
         // unavailable; token-piece reconstruction is only needed to split turns.
         let aligned = turns.isEmpty ? [] : SpeakerTurnAligner.align(tokens: tokens, turns: turns)
 
+        // Every label leaves through `continuity`, so a short utterance the
+        // diarizer declined to segment inherits the current speaker instead of
+        // going out unlabelled. See `SpeakerContinuity`: pyannote returns no
+        // speaker below `minSpeechDuration`, which is exactly what "對" / "OK" /
+        // a backchannel is, and those were losing their name every time.
         if aligned.isEmpty {
+            let resolved = dominantSpeaker(in: turns, from: utteranceStart, to: endTime)
             onEvent?(.finalized(segment: ASRSegment(
                 text: trimmed, source: source, startTime: utteranceStart, endTime: endTime,
-                speakerLabel: dominantSpeaker(in: turns, from: utteranceStart, to: endTime)
+                speakerLabel: continuity.label(resolved, from: utteranceStart, to: endTime)
             )))
         } else {
             for group in aligned {
@@ -661,14 +846,15 @@ private final class SourceASR: @unchecked Sendable {
                     source: source,
                     startTime: group.startTime,
                     endTime: group.endTime,
-                    speakerLabel: group.speakerLabel
+                    speakerLabel: continuity.label(
+                        group.speakerLabel, from: group.startTime, to: group.endTime)
                 )))
             }
         }
         await endUtterance()
     }
 
-    /// pyannote consumes raw PCM around the utterance; its five-second inference
+    /// pyannote consumes raw PCM around the utterance; its ten-second inference
     /// windows are independent of Nemotron's chunk tier and finalization points.
     private func diarizationTurns(from startTime: TimeInterval, to endTime: TimeInterval) -> [SpeakerTurn] {
         guard diarizationEnabled else { return [] }
@@ -676,7 +862,7 @@ private final class SourceASR: @unchecked Sendable {
             return []
         }
 
-        let contextStart = max(bufferStart, startTime - 1.0)
+        let contextStart = max(bufferStart, startTime - Self.diarizationPreRoll)
         let startIndex = min(diarizationAudio.count, max(0, Int((contextStart - bufferStart) * 16_000)))
         let endIndex = min(diarizationAudio.count, max(startIndex, Int((endTime - bufferStart) * 16_000)))
         guard endIndex > startIndex else { return [] }
@@ -684,14 +870,79 @@ private final class SourceASR: @unchecked Sendable {
         guard let result = try? diarizer.performCompleteDiarization(
             audio, sampleRate: 16_000, atTime: contextStart) else { return [] }
 
-        return result.segments.map { segment in
-            SpeakerTurn(
+        // Resolve the labels BEFORE compacting the database.
+        //
+        // `mergeSpeaker` deletes the source speaker, so a segment id resolved
+        // afterwards would come back nil and fall through to `"Speaker <id>"` —
+        // a raw numeric label that the naming layer reads as a speaker it has
+        // never seen. A pass meant to remove a phantom would have minted one.
+        let turns = result.segments.compactMap { segment -> SpeakerTurn? in
+            // Turns lying entirely inside the pre-roll belong to whoever spoke
+            // *before* this utterance. They are fed to the model on purpose —
+            // segmentation needs some left context — but attributing this
+            // utterance's words to them is exactly backwards, and the aligner's
+            // midpoint fallback will happily do it when a token has no overlap.
+            let turnStart = Double(segment.startTimeSeconds)
+            let turnEnd = Double(segment.endTimeSeconds)
+            guard turnEnd > startTime, turnStart < endTime else { return nil }
+            return SpeakerTurn(
                 label: diarizer.speakerManager.getSpeaker(for: segment.speakerId)?.name
                     ?? "Speaker \(segment.speakerId)",
-                startTime: Double(segment.startTimeSeconds),
-                endTime: Double(segment.endTimeSeconds))
+                startTime: turnStart,
+                endTime: turnEnd)
+        }
+
+        compactSpeakers(diarizer)
+        return turns
+    }
+
+    /// Fold back together speakers that have since converged.
+    ///
+    /// Without this an over-segmentation is permanent: a phantom speaker minted
+    /// from one bad embedding stays in the database for the whole meeting, even
+    /// once its centroid has drifted onto the person it was split from and
+    /// `findMergeablePairs` would say the two are the same voice. This is what
+    /// lets a meeting recover from a bad first minute.
+    ///
+    /// Merging uses the **embedding** threshold, not the assignment one. They
+    /// answer different questions: assignment asks whether one short segment
+    /// belongs to a known voice, and is deliberately generous because the
+    /// alternative is inventing a speaker. Merging asks whether two speakers who
+    /// have each accumulated minutes of audio are the same person, and being
+    /// wrong there silently attributes one person's words to another for the rest
+    /// of the meeting. The tighter threshold is the one FluidAudio already uses
+    /// to decide an embedding is trustworthy enough to update a stored centroid.
+    /// The direction of each merge is chosen here rather than taken from
+    /// `findMergeablePairs`, which picks it from dictionary key order: the
+    /// survivor keeps its name, so an arbitrary direction can delete the name the
+    /// user has been reading for ten minutes. Keeping whichever speaker has more
+    /// audio folds the phantom into the established person — the better embedding
+    /// and the name already on screen.
+    private func compactSpeakers(_ diarizer: DiarizerManager) {
+        let threshold = diarizer.speakerManager.embeddingThreshold
+        for pair in diarizer.speakerManager.findMergeablePairs(speakerThreshold: threshold) {
+            let candidate = diarizer.speakerManager.getSpeaker(for: pair.speakerToMerge)
+            let destination = diarizer.speakerManager.getSpeaker(for: pair.destination)
+            // A pair may already be gone: the list is computed against one
+            // snapshot and an earlier merge in this loop can delete a member.
+            // `mergeSpeaker` no-ops on a missing id, so this stays safe.
+            guard let candidate, let destination else { continue }
+            if candidate.duration > destination.duration {
+                diarizer.speakerManager.mergeSpeaker(destination.id, into: candidate.id)
+            } else {
+                diarizer.speakerManager.mergeSpeaker(candidate.id, into: destination.id)
+            }
         }
     }
+
+    /// Audio before the utterance handed to pyannote as left context.
+    ///
+    /// The segmentation model needs some, but every extra second is another
+    /// second of the *previous* speaker being re-embedded into the database — and
+    /// in a two-person conversation the previous speaker is always the other
+    /// person. One second was enough to re-embed a whole turn boundary on every
+    /// single utterance.
+    private static let diarizationPreRoll: TimeInterval = 0.5
 
     private func dominantSpeaker(
         in turns: [SpeakerTurn], from startTime: TimeInterval, to endTime: TimeInterval

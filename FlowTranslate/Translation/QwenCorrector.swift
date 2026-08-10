@@ -48,20 +48,48 @@ final class QwenCorrector {
     /// Output cap just above the input's own length: a repair is the same
     /// sentence, so anything materially longer is a runaway generation the gate's
     /// length check would throw away regardless.
+    ///
+    /// Measured in **estimated tokens**, not in `SpokenTextMetrics.units`. This is
+    /// the same defect `PromptTextRepairer.tokenCap` was fixed for and it was
+    /// never back-ported here, which is why AI transcript correction looked like
+    /// it did nothing on Chinese while working on English:
+    ///
+    /// A 40-character Chinese line is ~32 estimated tokens but only 13 `units`,
+    /// and `units * 3` gave it 39 → clamped to the floor of 48. Forty-eight tokens
+    /// is barely enough to echo the line back and nothing more, so any leading
+    /// space, quote or label pushed the real answer past the cap; the truncated
+    /// result then failed the gate's length-ratio or edit-distance rule and was
+    /// discarded. Every Chinese sentence, every time — indistinguishable from the
+    /// feature being switched off.
+    ///
+    /// English was unaffected because `units` counts its words directly, so a
+    /// 15-word sentence already got a cap of 90 for a ~20-token answer.
     static func tokenCap(for text: String) -> Int {
-        min(256, max(48, SpokenTextMetrics.units(text) * 3))
+        min(256, max(64, TokenEstimator.estimate(text) * 2))
     }
 
     // MARK: - Prompts
 
     /// Deliberately negative-heavy: the job is repair, and every instruction here
     /// exists to stop the model doing something more interesting than that.
+    ///
+    /// The Traditional-Chinese rule is the one both dictation prompts have had
+    /// from the start and this one did not. "Write it in the SAME language" is
+    /// *satisfied* by Simplified — they are one language — so the instruction as
+    /// written permitted precisely the drift this model is most prone to, and
+    /// `TranscriptCorrectionGate` had no check to catch it either. A Chinese
+    /// meeting with correction on could have its recorded transcript converted
+    /// sentence by sentence, and the transcript is what the summary and every
+    /// export are built from.
     static let systemPrompt = """
         You repair the raw output of a speech recognizer. The line after "Line:" \
         is what the recognizer heard.
         Rules:
         - Output ONLY the repaired line. No quotes, labels, notes or explanations.
         - Write it in the SAME language as the input. Never translate.
+        - If the input is Chinese, write Traditional Chinese as used in Taiwan \
+        (台灣正體中文). NEVER output Simplified characters — 简体字 is wrong output \
+        here even though it is the same language.
         - Fix ONLY mis-heard words, names and punctuation/capitalization.
         - NEVER rephrase, summarize, shorten, expand or complete the sentence.
         - NEVER change any number, date or unit.

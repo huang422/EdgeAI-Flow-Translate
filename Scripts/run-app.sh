@@ -34,5 +34,21 @@ xcodebuild \
 APP="build/dev/Build/Products/Debug/FlowTranslate.app"
 [ -d "$APP" ] || { echo "error: build product not found at $APP"; exit 1; }
 
+# Quit any running copy first. `open` on an app bundle activates an instance
+# that is already running instead of launching the one just built — so every
+# edit appeared to have no effect, because the window brought to the front was
+# the old binary. Quitting is the right move rather than `open -n`: two
+# instances would contend for the microphone, the global hotkey and the model.
+if pgrep -x FlowTranslate >/dev/null 2>&1; then
+    echo "==> Quitting the running copy"
+    osascript -e 'quit app "FlowTranslate"' >/dev/null 2>&1 || true
+    for _ in $(seq 1 25); do
+        pgrep -x FlowTranslate >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+    # A hung instance must not silently leave the old build in front.
+    pgrep -x FlowTranslate >/dev/null 2>&1 && killall -9 FlowTranslate 2>/dev/null || true
+fi
+
 echo "==> Launching $APP"
 open "$APP"

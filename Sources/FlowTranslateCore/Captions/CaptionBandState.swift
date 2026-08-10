@@ -117,12 +117,17 @@ public struct CaptionBandState: Equatable, Sendable {
     /// When `utteranceId` matches the slot, the LAST sentence morphs the slot in
     /// place and earlier ones insert above it; otherwise (a background source, or
     /// no interim ever shown) everything inserts into history directly.
+    /// - Parameter provisional: the live translation, split to match
+    ///   `sentences`, keyed by translation key. Shown until each sentence's
+    ///   accurate translation arrives, so the second caption never blanks for
+    ///   text that has already been translated once.
     public mutating func commit(
         utteranceId: UUID?,
         source: AudioSourceType,
         sentences: [(key: UUID, english: String)],
         expectsTranslation: Bool,
-        speakerLabel: String? = nil
+        speakerLabel: String? = nil,
+        provisional: [UUID: String] = [:]
     ) {
         guard !sentences.isEmpty else { return }
         if isPinned { pendingWhilePinned += sentences.count }
@@ -131,6 +136,7 @@ public struct CaptionBandState: Equatable, Sendable {
             for s in sentences.dropLast() {
                 committed.append(BandLine(
                     id: s.key, translationKey: s.key, english: s.english,
+                    chinese: provisional[s.key],
                     source: source, isFinal: true, expectsTranslation: expectsTranslation,
                     speakerLabel: speakerLabel))
             }
@@ -141,6 +147,18 @@ public struct CaptionBandState: Equatable, Sendable {
             slot?.expectsTranslation = expectsTranslation
             slot?.source = source
             slot?.speakerLabel = speakerLabel
+            // The slot keeps its live translation across the morph on purpose —
+            // that is what stops the second caption blanking for the second or
+            // two before the accurate one lands.
+            //
+            // When the utterance split into several sentences, that live text
+            // covers all of them, so it cannot stand as the translation of the one
+            // left in the slot. It is split to match instead — see
+            // `InterimTranslationPairing` — and dropped only when the two cannot
+            // be paired honestly.
+            if sentences.count > 1 {
+                slot?.chinese = provisional[last.key]
+            }
         } else {
             // Background commit: roll a finalized slot up first so ordering stays
             // chronological, then append these sentences as history.
@@ -148,6 +166,7 @@ public struct CaptionBandState: Equatable, Sendable {
             for s in sentences {
                 committed.append(BandLine(
                     id: s.key, translationKey: s.key, english: s.english,
+                    chinese: provisional[s.key],
                     source: source, isFinal: true, expectsTranslation: expectsTranslation,
                     speakerLabel: speakerLabel))
             }

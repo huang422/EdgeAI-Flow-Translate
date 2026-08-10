@@ -28,8 +28,16 @@ final class CaptureViewModel: ObservableObject {
     // Audio sources
     @Published var micEnabled = false
     @Published var systemEnabled = false
-    @Published var micLevel: Float = 0
-    @Published var systemLevel: Float = 0
+    /// Input levels, in their own observable object.
+    ///
+    /// Separate because they update at 12 Hz **per source**: on the view model
+    /// they invalidate every observing view ~24 times a second while a meeting
+    /// runs, including the whole Settings window — one block of which renders the
+    /// 52-rule markdown to show a token count.
+    ///
+    /// Only the two meters observe this, so a level change now repaints two small
+    /// views and nothing else.
+    let levels = LevelMeters()
 
     // Recognition / captions
     @Published var asrState: ASRState = .idle {
@@ -38,7 +46,16 @@ final class CaptureViewModel: ObservableObject {
     @Published var interimText = ""
     @Published var interimChinese = ""
     @Published var lines: [CaptionLine] = []
-    @Published var statusMessage = "Idle"
+    /// Clearing `statusAction` here rather than at every write site: this is set
+    /// from dozens of places and only two of them offer a button, so a stale
+    /// "開啟設定" would otherwise outlive the message that justified it and sit
+    /// beside something unrelated.
+    @Published var statusMessage = "Idle" {
+        didSet { statusAction = nil }
+    }
+    /// A privacy pane offered alongside `statusMessage`, or nil. Set *after* the
+    /// message it belongs to.
+    @Published var statusAction: PermissionPane?
 
     // Meeting / summary / overlay
     /// Single source of truth for overlay visibility. Both the UI switch and the
@@ -94,6 +111,210 @@ final class CaptureViewModel: ObservableObject {
     /// Single shared Qwen model, reused by live translation and the post-meeting
     /// summary — loaded into memory at most once.
     private let qwenHost = QwenModelHost()
+
+    /// Everything that currently owns the shared ASR service or the Qwen host,
+    /// other than the prompt features themselves.
+    ///
+    /// `asrState != .idle` alone is **not** enough. `generateSummary()` runs at
+    /// `.idle` and calls `releaseQwen()` → `unload()` → `MLXMemory.reclaim()`;
+    /// a prompt compile generating at that moment is exactly the
+    /// `GPU.clearCache()`-mid-generation crash the rest of this file is written
+    /// to avoid. `downloadAllModels()` also runs at `.idle` and drives the same
+    /// `MLXModelDownloader` a compile would.
+    private var isSharedModelBusy: Bool {
+        asrState != .idle || isSummarizing || isDownloadingModels
+    }
+
+    /// The three prompt workloads that contend for the shared model.
+    enum PromptWorkload { case composer, hotkey, eval }
+
+    /// Names what is holding the shared models, or nil when nothing is.
+    ///
+    /// A bare "models are busy" reads as a stuck UI: the one thing the user needs
+    /// in order to unblock themselves is *which* work to stop, and that is
+    /// exactly what the message left out.
+    private func sharedModelBlocker(excluding consumer: PromptWorkload) -> String? {
+        if asrState != .idle { return "會議進行中 Meeting in progress" }
+        if isSummarizing { return "產生摘要中 Generating summary" }
+        if isDownloadingModels { return "下載模型中 Downloading models" }
+        if consumer != .composer, isComposerLoaded, composer.isBusy {
+            return "Prompt 分頁工作中 Prompt tab is working"
+        }
+        if consumer != .hotkey, isQuickDictationLoaded, quickDictation.isRunning {
+            return "快捷鍵口述中 Hotkey dictation running"
+        }
+        if consumer != .eval, isPromptEvalLoaded, promptEval.isRunning {
+            return "評測進行中 Eval running"
+        }
+        return nil
+    }
+
+    /// The Prompt tab's view model. Shares this object's ASR service and Qwen
+    /// host — the feature adds no resident model memory. `lazy` because it
+    /// captures `self`.
+    /// Whether the composer has been built yet, so settings changes can reach it
+    /// without being the thing that creates it.
+    private var isComposerLoaded = false
+    /// The settings as they were at the last `applySettings`, so the composer can
+    /// tell what actually changed.
+    private var previousSettings = CaptionSettings()
+
+    /// The three prompt workloads are separate `ObservableObject`s, and the busy
+    /// banner is derived from all three at once: the Prompt tab is blocked while
+    /// the hotkey or the eval runs, and vice versa. A view observing one of them
+    /// is not redrawn when another changes, so the banner appeared when a
+    /// workload started and then stayed after it stopped — until an unrelated
+    /// edit happened to force a redraw. Re-emitting each child's *phase* (not its
+    /// text, which changes per keystroke) through this object gives every view a
+    /// single thing to observe, and the banner clears the moment work ends.
+    private var workloadObservers: [AnyCancellable] = []
+
+    /// Delivery is deferred by one hop because a child's `objectWillChange` can
+    /// fire while SwiftUI is evaluating a body, and sending ours synchronously
+    /// from there is the "Publishing changes from within view updates" trap.
+    private func republishPhase<P: Publisher>(_ publisher: P) where P.Failure == Never {
+        publisher
+            .dropFirst()
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &workloadObservers)
+    }
+
+    lazy var composer: PromptComposerViewModel = {
+        isComposerLoaded = true
+        return makeComposer()
+    }()
+
+    private func makeComposer() -> PromptComposerViewModel {
+        let composer = PromptComposerViewModel(
+            asr: asr,
+            router: router,
+            qwenHost: qwenHost,
+            settings: { [weak self] in self?.settings ?? CaptionSettings() },
+            // Also blocked by the hotkey flow: both borrow `asr.onEvent` and open
+            // a `MicCapture`, so running them together corrupts the handler chain.
+            blockedBy: { [weak self] in
+                guard let self else { return "已結束 Cancelled" }
+                return self.sharedModelBlocker(excluding: .composer)
+            },
+            didFinishWork: { [weak self] in self?.schedulePromptModelRelease() },
+            // `self?.method() ?? default` collapses BOTH optionals: the method
+            // returns nil for success, and `??` replaced that nil with the
+            // failure string — so every successful load was reported as a
+            // failure. The two cases have to be separated explicitly.
+            prepareModel: { [weak self] in
+                guard let self else { return "已結束 Cancelled" }
+                return await self.ensureQwenReadyForPrompt()
+            }
+        )
+        republishPhase(composer.$phase)
+        return composer
+    }
+
+    /// The ⌃⌥Space flow. Kept separate from `composer` so a hotkey dictation
+    /// never overwrites a draft the user has open in the Prompt tab.
+    lazy var quickDictation: QuickDictationController = {
+        isQuickDictationLoaded = true
+        let controller = makeQuickDictation()
+        republishPhase(controller.$phase)
+        return controller
+    }()
+
+    /// Whether `quickDictation` has ever been built, so a check that only needs
+    /// to know "is one running" does not construct one to find out — the same
+    /// guard `isComposerLoaded` provides. Reading the lazy value opens a
+    /// `MicCapture` for a user who may never press the key.
+    private var isQuickDictationLoaded = false
+
+    private func makeQuickDictation() -> QuickDictationController { QuickDictationController(
+        asr: asr,
+        router: router,
+        qwenHost: qwenHost,
+        blockedBy: { [weak self] in
+            guard let self else { return "已結束 Cancelled" }
+            return self.sharedModelBlocker(excluding: .hotkey)
+        },
+        settings: { [weak self] in self?.settings ?? CaptionSettings() },
+        rulebook: { [weak self] in self?.activePromptRulebook ?? PromptStdlib.all },
+        didFinishWork: { [weak self] in self?.schedulePromptModelRelease() },
+        didMoveHUD: { [weak self] origin in self?.settings.promptHUDPosition = origin },
+        didChangeInsertMode: { [weak self] mode in self?.settings.promptQuickInsertMode = mode },
+        prepareModel: { [weak self] in
+            guard let self else { return "已結束 Cancelled" }
+            return await self.ensureQwenReadyForPrompt()
+        }
+    ) }
+
+    /// Grades the prompt pipeline against the real model. Shares the same host,
+    /// and is mutually exclusive with everything else that uses it.
+    lazy var promptEval: PromptEvalRunner = {
+        isPromptEvalLoaded = true
+        let runner = makePromptEval()
+        republishPhase(runner.$progress)
+        return runner
+    }()
+
+    /// Whether `promptEval` has ever been built.
+    private var isPromptEvalLoaded = false
+
+    /// Ask each prompt workload whether it is busy **without building it**.
+    ///
+    /// Every one of these objects is expensive to exist: a
+    /// `PromptComposerViewModel` is a `DictationSession` plus a 52-rule
+    /// `RulebookStore.load()` decode, and a `QuickDictationController` adds a
+    /// second session and an `NSPanel`. They are `lazy` for that reason, so a user
+    /// who never opens the Prompt tab must not pay for them — one accessor, so a
+    /// future check cannot forget the guard.
+    private var busyPromptWorkloads: Bool {
+        (isComposerLoaded && composer.isBusy)
+            || (isQuickDictationLoaded && quickDictation.isRunning)
+            || (isPromptEvalLoaded && promptEval.isRunning)
+    }
+
+    /// The rulebook that will actually be installed, read without building the
+    /// composer to get it.
+    ///
+    /// The user's edited book, never `PromptStdlib.all`, so Settings, the Prompt
+    /// page and the file on disk cannot give three answers for one file. Filtered
+    /// by the enabled categories: a category that is off does not exist for this
+    /// project. Falls back to the store rather than the composer — the hotkey, the
+    /// eval and Settings all need this, and none is a reason to build one.
+    var activePromptRulebook: PromptRulebook {
+        activePromptRulebookIgnoringCategories.filtered(to: settings.promptRuleCategories)
+    }
+
+    /// The same book with every category still in it — what the category picker
+    /// needs in order to say how many rules each row would add.
+    var activePromptRulebookIgnoringCategories: PromptRulebook {
+        isComposerLoaded ? composer.rulebook : RulebookStore.load()
+    }
+
+    /// Cancel and await whatever prompt work exists. Never builds one to cancel
+    /// it: an object that does not exist has nothing on the GPU.
+    private func drainPromptWorkloads() async {
+        if isComposerLoaded { await composer.cancelAndDrain() }
+        if isQuickDictationLoaded { await quickDictation.cancelAndDrain() }
+        if isPromptEvalLoaded { await promptEval.cancelAndDrain() }
+    }
+
+    private func makePromptEval() -> PromptEvalRunner { PromptEvalRunner(
+        qwenHost: qwenHost,
+        blockedBy: { [weak self] in
+            guard let self else { return "已結束 Cancelled" }
+            return self.sharedModelBlocker(excluding: .eval)
+        },
+        settings: { [weak self] in self?.settings ?? CaptionSettings() },
+        rulebook: { [weak self] in self?.activePromptRulebook ?? PromptStdlib.all },
+        didFinishWork: { [weak self] in self?.schedulePromptModelRelease() },
+        prepareModel: { [weak self] in
+            guard let self else { return "已結束 Cancelled" }
+            return await self.ensureQwenReadyForPrompt()
+        }
+    ) }
+
+    /// Debounced release of the shared Qwen model after prompt work goes idle.
+    private var promptIdleReleaseTask: Task<Void, Never>?
+
     private lazy var mlxTranslator = MLXTranslator(host: qwenHost)
     /// Rolling bilingual context (source→translation pairs) for the on-device Qwen
     /// translator so the second caption stays coherent across lines (pronouns,
@@ -178,47 +399,54 @@ final class CaptureViewModel: ObservableObject {
     private var qwenDownloadPct: Int?
     private var diarDownloadPct: Int?
 
-    /// Free the Qwen model from **memory** and reset its load state. The disk
-    /// prefetch is intentionally left running — the summary needs those files even
-    /// after translation switches to Apple or the meeting ends. Waiting queued
-    /// sentences are dropped (they belonged to the previous backend/session).
-    ///
-    /// This is a *translation-side* release, so it must not pull the model out
-    /// from under the transcript corrector, which shares the same host: switching
-    /// the engine to Apple mid-meeting calls this while a correction may be
-    /// generating, and `unload()` → `GPU.clearCache()` mid-generation is the
-    /// documented crash. While correction is live the model stays resident —
-    /// exactly what the setting warns about — and `endMeeting` frees it after
-    /// `drainCorrections()`.
     /// Release the shared Qwen model from **memory**. Safe from any call site.
     ///
-    /// Two things must hold before the model can go, and both were previously
-    /// only enforced at `endMeeting`:
+    /// Two things must hold before the model can go:
     ///
     /// 1. **Nothing may still be generating.** `unload()` → `MLXMemory.reclaim()`
     ///    → `GPU.clearCache()` during a live generation is a documented crash.
-    ///    Switching the translation engine to Apple mid-meeting reached the
-    ///    unload without draining anything, so a sentence being translated on the
-    ///    GPU at that moment took the cache out from under itself.
     /// 2. **No other consumer may still need it.** Transcript correction shares
     ///    the same host, so the model stays resident while correction is live —
-    ///    including while a correction is mid-generation but the user has just
-    ///    switched the setting off, which a setting-only check would miss.
+    ///    including mid-generation after the setting has just been switched off,
+    ///    which a setting-only check would miss.
     ///
     /// The disk prefetch is deliberately left running: the summary needs those
     /// files even after translation switches to Apple or the meeting ends.
     private func releaseQwen() async {
         mlxQueue.removeAll()
         // Only a consumer that will still be GIVEN work keeps the model. A
-        // generation that merely happens to be running right now must not block
-        // the release — draining it is what the next two lines are for, and
-        // treating it as "still needed" would leave the 2.5 GB resident forever
-        // whenever a meeting ended mid-repair.
+        // generation merely running right now must not block the release —
+        // draining it is what the calls below are for — or 2.3 GB stays resident
+        // forever whenever a meeting ends mid-repair.
         guard !(settings.transcriptCorrectionEnabled && acceptingCorrections) else { return }
+        // The prompt features hold this same host, and unloading under a live
+        // compile is the `GPU.clearCache` hazard above.
+        await drainPromptWorkloads()
         await drainInflightTranslations()
         await drainCorrections()
         qwenHost.unload()         // frees the container + returns the MLX cache to the OS
         qwenLoadTask?.cancel(); qwenLoadTask = nil
+    }
+
+    /// Free the shared Qwen model once the prompt features have been idle for a
+    /// while.
+    ///
+    /// Without this, a user who only ever uses the Prompt tab loads ~2.3 GB on
+    /// their first compile and it stays resident until the app quits — the
+    /// meeting paths were the only ones that ever released it. Debounced rather
+    /// than immediate because compiling twice in a row is the normal case, and
+    /// reloading between them would cost more than it saves.
+    func schedulePromptModelRelease() {
+        promptIdleReleaseTask?.cancel()
+        promptIdleReleaseTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(90))
+            guard !Task.isCancelled, let self else { return }
+            guard self.asrState == .idle, !self.isSummarizing, !self.isDownloadingModels,
+                  !self.busyPromptWorkloads
+            else { return }
+            await self.releaseQwen()
+            self.modelStatus = ""
+        }
     }
 
     /// Cancel and await every in-flight on-device translation so no GPU generation
@@ -231,11 +459,80 @@ final class CaptureViewModel: ObservableObject {
         for t in tasks { await t.value }
     }
 
-    /// At meeting Start, download the Qwen model files to disk in the background
-    /// (like the ASR model). Always runs: even if translation uses Apple, the
-    /// end-of-meeting **summary** uses the same Qwen model. Memory load stays lazy.
-    /// The translator and summarizer share the same model id, so this one download
-    /// serves both. Download-only — no memory is used until something loads it.
+    /// What the prompt features can say about the shared model right now.
+    ///
+    /// Two stages, and they are not the same wait: entering the tab downloads
+    /// ~2.3 GB to disk, and the first compile loads it into memory. Compiling
+    /// without either is possible — the compile does both — but it turns a
+    /// button press into a multi-minute silence, which is why the state is
+    /// surfaced rather than hidden inside the first compile.
+    enum PromptModelState: Equatable {
+        case downloading(Double?)
+        case onDisk
+        case loaded
+        case unavailable(String)
+    }
+
+    var promptModelState: PromptModelState {
+        if qwenHost.isLoaded { return .loaded }
+        if qwenPrefetchTask != nil {
+            return .downloading(qwenDownloadPct.map { Double($0) / 100 })
+        }
+        if !qwenHost.isComplete { return .unavailable("模型尚未下載 Model not downloaded") }
+        return .onDisk
+    }
+
+    /// The `"<engine>|<language>|<tier>"` the dictation variant was last prepared
+    /// for. Keyed, not latched: the variant is derived from settings the user can
+    /// edit between visits to the Prompt tab, so a "done once per launch" flag
+    /// leaves the new variant unfetched.
+    private var prewarmedDictationKey: String?
+
+    /// Get the recognizer's files ready while the user is looking at the Prompt
+    /// tab, so the first ⌃⌥Space does not pay for fetching and validating the
+    /// variant before it can hear anything — seconds of silence that is
+    /// indistinguishable from the hotkey not working.
+    ///
+    /// Tied to the tab rather than to the hotkey switch, because the tab is where
+    /// intent is declared and where the model is released again on leaving. It is
+    /// also the download-only path: no shared recognizer state is touched, so it
+    /// is safe beside a running meeting, and it costs no memory — weights load
+    /// lazily on the first audio chunk and are freed with everything else.
+    private func prewarmDictationASR() {
+        guard !isDownloadingModels, asrState == .idle else { return }
+        // **Whichever engine is selected.** The built-in recognizer's assets are
+        // the system's, but the system fetches them on first use — and first use
+        // is the user waiting.
+        let engine = DictationEngineFactory.resolved(settings)
+        let language = PromptDictation.language(for: settings, engine: engine)
+        let key = "\(engine.rawValue)|\(language)|\(PromptDictation.tier)"
+        guard key != prewarmedDictationKey else { return }
+        prewarmedDictationKey = key
+        Task { [weak self] in
+            guard let self else { return }
+            switch engine {
+            case .nemotron:
+                // Fetches the variant *and* loads the weights, which then stay
+                // resident: `stopStream(keepModelsResident:)` no longer frees them
+                // between dictations, so this is paid once per tab visit rather
+                // than once per sentence.
+                await self.asr.prewarmVariant(language: language, tier: PromptDictation.tier)
+            case .appleSpeech:
+                if #available(macOS 26.0, *) {
+                    await AppleDictationEngine.prewarm(language: language)
+                }
+            }
+        }
+    }
+
+    func prepareForPromptWork() {
+        guard !isSharedModelBusy else { return }
+        prewarmDictationASR()
+        promptIdleReleaseTask?.cancel()
+        promptIdleReleaseTask = nil
+        prefetchQwen()
+    }
+
     private func prefetchQwen() {
         guard !qwenHost.isComplete, qwenPrefetchTask == nil else { return }
         qwenPrefetchTask = Task { @MainActor [weak self] in
@@ -276,7 +573,7 @@ final class CaptureViewModel: ObservableObject {
     /// model is ready.
     ///
     /// Every consumer — live translation and the transcript corrector — comes
-    /// through here, so the ~2.5 GB model is loaded once regardless of which one
+    /// through here, so the ~2.3 GB model is loaded once regardless of which one
     /// needs it first.
     ///
     /// A failed load clears the task handle so the NEXT sentence retries (a
@@ -299,6 +596,11 @@ final class CaptureViewModel: ObservableObject {
                         Task { @MainActor in report(.loading(p)) }
                     }
                     self.qwenLoadFailures = 0
+                    // Clear on success too. A finished task left in the handle
+                    // makes the next caller `await` something already done and
+                    // then read `isLoaded` — which is false if anything unloaded
+                    // the model in between, so the load is never re-attempted.
+                    self.qwenLoadTask = nil
                     report(.ready)
                 } catch {
                     Self.log.error("Qwen load failed: \(String(reflecting: error), privacy: .public)")
@@ -342,6 +644,42 @@ final class CaptureViewModel: ObservableObject {
     /// Await the shared model for transcript correction. Reported on `modelStatus`,
     /// not `translationStatus`: correction can be on while Apple handles
     /// translation, and a translation-flavoured message would be a lie there.
+    /// Load the shared model for a prompt compile, narrating on `modelStatus`.
+    ///
+    /// Returns `nil` on success, or a message to show when the model cannot be
+    /// had. Routed through `ensureQwenReady` like every other consumer, so the
+    /// prompt features inherit the consecutive-failure budget, the single shared
+    /// load task, and the wait on the at-Start prefetch.
+    func ensureQwenReadyForPrompt() async -> String? {
+        // A user-initiated compile is a retry request. The budget exists to stop
+        // a broken install being retried on every caption of a meeting — it was
+        // never meant to outlive that meeting, but it was only ever reset at the
+        // next Start, so two failed loads left every prompt compile reporting
+        // "model unavailable" indefinitely with no way back.
+        if !qwenHost.isLoaded, qwenLoadFailures >= qwenLoadFailureLimit {
+            qwenLoadFailures = 0
+        }
+        var failure: String?
+        let ready = await ensureQwenReady { [weak self] phase in
+            guard let self else { return }
+            switch phase {
+            case .loading(nil):    self.modelStatus = "Prompt：Qwen 模型載入中…"
+            case .loading(let p?): self.modelStatus = "Prompt：Qwen 模型載入中… \(Int(p * 100))%"
+            case .ready:           self.flashModelStatus("Prompt：模型已就緒")
+            case .failedRetryable:
+                self.modelStatus = "Prompt：模型載入失敗，可再試一次"
+                failure = "模型載入失敗，可再試一次 Model load failed — try again"
+            case .failedFinal:
+                self.modelStatus = "Prompt：模型載入連續失敗，已停用（請檢查網路或磁碟空間）"
+                failure = "模型連續載入失敗，已停止重試 Model load failed repeatedly"
+            }
+        }
+        if ready { return nil }
+        // A budget already spent reports no phase at all, so give the caller a
+        // reason rather than a silent nil-success.
+        return failure ?? "模型無法載入 Model unavailable"
+    }
+
     private func ensureQwenReadyForCorrection() async -> Bool {
         await ensureQwenReady { [weak self] phase in
             guard let self else { return }
@@ -419,10 +757,39 @@ final class CaptureViewModel: ObservableObject {
     /// REUSED as the last sentence's transcript id on finalize, so the overlay
     /// slot morphs in place (same identity) instead of jumping.
     private var utteranceIds: [AudioSourceType: UUID] = [:]
+    /// Audio time of the newest partial per source.
+    ///
+    /// The pipeline gives a partial no utterance identity, so this view model
+    /// infers the boundary from "the previous utterance has finalized". That
+    /// inference is wrong whenever a finalize arrives *after* the next utterance
+    /// has already started producing partials — which is the ordinary case when
+    /// someone keeps talking, because the decode lags the speech. The finalize
+    /// then claimed the partial that was on screen, overwrote the sentence being
+    /// spoken with the previous one, and cleared its live translation.
+    ///
+    /// Comparing audio times settles it without needing an identity: a partial
+    /// covering audio past the segment's end cannot be part of that segment.
+    private var lastInterimAudioTime: [AudioSourceType: TimeInterval] = [:]
     private var interimArbiter = InterimSourceArbiter(holdInterval: 1.0)
     /// Display-side stabilizer for the overlay's live translation (prefix-freeze:
     /// only ever extends, never rewrites the head; resyncs after 3 conflicts).
     private var interimZhStable = PrefixStableText()
+
+    /// Turns the diarizer's `Speaker 1` into `Claude Mango`.
+    ///
+    /// Lives here, at the point where labels are *consumed*, rather than inside
+    /// either source pipeline. Mic and system audio keep separate speaker
+    /// databases on purpose — the same voice on both would otherwise merge — so
+    /// each pipeline numbers its speakers from 1 independently, and only this
+    /// object sees both. Naming per pipeline would hand two different people the
+    /// same name. The key carries the source for exactly that reason.
+    private var speakerNamer = SpeakerNamer()
+
+    /// The named form of a raw diarizer label, or nil when there is none.
+    private func speakerName(for rawLabel: String?, source: AudioSourceType) -> SpeakerName? {
+        guard let rawLabel, !rawLabel.trimmingCharacters(in: .whitespaces).isEmpty else { return nil }
+        return speakerNamer.name(for: "\(source.rawValue)#\(rawLabel)")
+    }
 
     init() {
         // Bound the MLX Metal cache up front so freed Qwen weights / KV caches are
@@ -509,10 +876,7 @@ final class CaptureViewModel: ObservableObject {
         // Persist a dragged overlay position / font step made from the overlay's own
         // hover controls.
         overlay.onPositionChanged = { [weak self] origin in
-            self?.settings.overlayPosition = origin
-        }
-        overlay.onFontStep = { [weak self] delta in
-            self?.stepOverlayFont(delta)
+            self?.settings.overlayBottomAnchor = origin
         }
         overlay.onReset = { [weak self] in
             self?.resetOverlaySettings()
@@ -538,6 +902,90 @@ final class CaptureViewModel: ObservableObject {
         center.register(keyCode: kVK_ANSI_P, modifiers: mod) { [weak self] in
             Task { @MainActor in self?.overlay.togglePin() }
         }
+        // ⌃⌥Space is registered from `applySettings`, not here: it is the one
+        // shortcut with a switch, and a Carbon hot key holds the combination for
+        // the whole process. Registering it unconditionally and checking the
+        // setting on dispatch meant switching it off still swallowed ⌃⌥Space in
+        // every other application — the switch changed nothing a user could
+        // observe except that nothing happened.
+        applyDictationHotkey()
+    }
+
+    /// The name the dictation shortcut is registered under.
+    private static let dictationHotkeyName = "prompt.dictation"
+
+    /// Whether the "⌃⌥Space is taken" message has already been shown this launch,
+    /// so a failing registration reports once instead of on every settings write.
+    private var didReportHotkeyConflict = false
+
+    /// Hold or release ⌃⌥Space to match the setting.
+    private func applyDictationHotkey() {
+        let center = GlobalHotKeyCenter.shared
+        guard settings.promptHotkeyEnabled else {
+            center.unregister(Self.dictationHotkeyName)
+            didReportHotkeyConflict = false
+            // A session running right now could no longer be finished — the key
+            // that finishes it has just been handed back to the system — so it is
+            // cancelled rather than left holding the microphone with no way to
+            // stop it. Cancelled, not finished: inserting text at the cursor is
+            // not what switching a feature off asks for.
+            if isQuickDictationLoaded, quickDictation.isRunning {
+                Task { [weak self] in await self?.quickDictation.cancelAndDrain() }
+            }
+            return
+        }
+        guard !center.isRegistered(Self.dictationHotkeyName) else { return }
+        // Carbon hot keys only deliver key-down, so this toggles rather than
+        // being push-to-talk.
+        let registered = center.register(
+            Self.dictationHotkeyName, keyCode: kVK_Space, modifiers: controlKey | optionKey
+        ) { [weak self] in
+            Task { @MainActor in self?.toggleQuickDictation() }
+        }
+        // Said out loud, because the failure is otherwise invisible and looks
+        // exactly like a broken feature: `RegisterEventHotKey` refuses a
+        // combination another process already owns, and ⌃⌥Space is a popular one.
+        // The switch then reads ON while the key does nothing at all, with the
+        // app's own logs the only place the refusal was recorded.
+        guard !registered else {
+            didReportHotkeyConflict = false
+            return
+        }
+        guard !didReportHotkeyConflict else { return }
+        didReportHotkeyConflict = true
+        statusMessage = "⌃⌥Space 已被其他程式佔用，口述快捷鍵無法註冊"
+            + " — ⌃⌥Space is taken by another app"
+    }
+
+    /// Turn the ⌃⌥Space hotkey on or off, asking for what it needs **on the way
+    /// on**.
+    ///
+    /// The same shape as `toggleMic` and `toggleSystem`: the user presses the
+    /// control, the control checks what it needs, and a missing permission is
+    /// asked for there and then. Bound to the switch rather than reached from
+    /// `applySettings`, because only a press is a moment the user is expecting to
+    /// be asked — `applySettings` also runs at launch and on every unrelated
+    /// settings write.
+    ///
+    /// Asked here rather than at the first ⌃⌥Space because that key is pressed
+    /// from *another* application, with this one in the background: TCC's dialog
+    /// then opens behind whatever the user is looking at, which is the same as not
+    /// asking at all.
+    func setDictationHotkey(_ on: Bool) {
+        settings.promptHotkeyEnabled = on
+        guard on else { return }
+        Permissions.requestAccessibilityOnce()
+        if !Permissions.accessibilityAuthorized {
+            statusMessage = "口述插入游標需要「輔助使用」權限 Accessibility required"
+            statusAction = .accessibility
+        }
+    }
+
+    /// Start or finish a hotkey dictation. Ignored while a meeting is running,
+    /// for the same mutual-exclusion reason the Prompt tab's buttons are.
+    func toggleQuickDictation() {
+        guard settings.promptHotkeyEnabled else { return }
+        quickDictation.toggle()
     }
 
     /// Step the overlay font size by ±2pt (clamped), persisting via settings.
@@ -554,8 +1002,8 @@ final class CaptureViewModel: ObservableObject {
     /// so the check runs once per change instead of on every settings tick.
     private var lastVariantKey = ""
     /// Translation-relevant settings snapshot: the (async) backend-availability
-    /// resolution only re-runs when one of THESE fields changes — an overlay
-    /// font/opacity slider tick used to cancel + relaunch it on every step.
+    /// resolution only re-runs when one of THESE fields changes, so an overlay
+    /// font/opacity slider tick does not cancel and relaunch it on every step.
     private var lastTranslationKey = ""
 
     private func applySettings() {
@@ -573,6 +1021,14 @@ final class CaptureViewModel: ObservableObject {
                 manualGainDb: settings.micInputGainDb,
                 autoEnabled: settings.autoGainEnabled))
         overlay.applySettings(settings)
+        applyDictationHotkey()
+        // Only if it already exists. `applySettings()` runs from `init`, so an
+        // unconditional call would construct the composer — a `MicCapture`, an
+        // `AVAudioEngine` and a rulebook decode — at launch for a user who may
+        // never open the Prompt tab. Values are read live through a closure, so
+        // this is only a re-render nudge.
+        if isComposerLoaded { composer.apply(previous: previousSettings) }
+        previousSettings = settings
         // Turning correction off mid-meeting drops the backlog so it can't keep
         // the model busy. A generation already in flight is left to finish and
         // land — it is a valid repair, and cancelling it would waste the work.
@@ -681,7 +1137,7 @@ final class CaptureViewModel: ObservableObject {
         case .mlx:
             // Don't start new GPU generations once the meeting is stopping — a late
             // one could run while the model is being unloaded (clearCache crash) or
-            // reload the whole 2.5 GB model after we just freed it.
+            // reload the whole 2.3 GB model after we just freed it.
             guard acceptingTranslations else { return }
             // Common short utterances ("Okay.", "Can you hear me?") are answered
             // instantly from a lookup table — 0 ms, no GPU, no queue slot — and
@@ -835,8 +1291,8 @@ final class CaptureViewModel: ObservableObject {
         // while the model finishes loading.
         guard asrState.isMeetingActive else { return }
         switch event {
-        case .interim(let text, let source, _):
-            handleInterim(text: text, source: source)
+        case .interim(let text, let source, let at):
+            handleInterim(text: text, source: source, at: at)
         case .finalized(let segment):
             handleFinalized(segment)
         }
@@ -844,8 +1300,25 @@ final class CaptureViewModel: ObservableObject {
 
     /// Live partial. Both sources record their partial; only the arbiter's owner
     /// drives the displayed interim (main window + overlay slot).
-    private func handleInterim(text: String, source: AudioSourceType) {
+    private func handleInterim(text: String, source: AudioSourceType, at: TimeInterval) {
+        // The audio time this partial covers, kept so a *late* finalize can tell
+        // whether the partial on screen still belongs to it. Same clock as
+        // `ASRSegment.endTime` — both are the capture chunk's timestamp.
+        lastInterimAudioTime[source] = at
         let now = Date().timeIntervalSinceReferenceDate
+        // Same script normalization the finalize path does, and for the same
+        // reason — done here so every consumer below sees one form of the text.
+        //
+        // Only `handleFinalized` had it, and the model has exactly one Mandarin
+        // tag (`zh-CN`, writing Simplified), so selecting 中文 gave a live caption
+        // in Simplified that flipped to Traditional the instant the sentence
+        // ended. Nothing downstream could compensate: `sourceIsTraditionalChinese`
+        // is true for any `zh` prefix, so `needsTranslation` is false and there is
+        // no second caption to carry the Traditional text either.
+        //
+        // Cheap enough for the partial rate: the detector skips any scalar outside
+        // the Han range before it asks ICU anything, and caches per character.
+        let text = TraditionalChineseGuard.normalizingScript(text)
         interimBySource[source] = text
         let isNewUtterance = utteranceIds[source] == nil
         if isNewUtterance { utteranceIds[source] = UUID() }
@@ -883,18 +1356,36 @@ final class CaptureViewModel: ObservableObject {
     private func handleFinalized(_ segment: ASRSegment) {
         let now = Date().timeIntervalSinceReferenceDate
         let source = segment.source
-        let uttId = utteranceIds[source]
-        utteranceIds[source] = nil
-        interimBySource[source] = nil
-        let wasDisplayed = interimArbiter.current == source
-        let nextOwner = interimArbiter.end(source, at: now)
+        // Whether the partial currently on screen is *this* segment's, or already
+        // belongs to the sentence after it. See `lastInterimAudioTime`.
+        let partialIsNewer = (lastInterimAudioTime[source] ?? -.infinity) > segment.endTime
+        let uttId = partialIsNewer ? nil : utteranceIds[source]
+        if !partialIsNewer {
+            utteranceIds[source] = nil
+            interimBySource[source] = nil
+            lastInterimAudioTime[source] = nil
+        }
+        // A segment that no longer owns the live line is history, not the thing
+        // being displayed — so it must not take the interim's slot or blank the
+        // translation being shown for the sentence still in progress.
+        let wasDisplayed = !partialIsNewer && interimArbiter.current == source
+        // The arbiter is told the source stopped only when it actually did. A
+        // source still emitting partials for the next sentence has not finished
+        // speaking, and handing the live line to the other source here made the
+        // caption flip mid-utterance.
+        let nextOwner = partialIsNewer ? interimArbiter.current : interimArbiter.end(source, at: now)
 
         // No active session (extreme timing edge) → nothing to attribute the
         // segment to; never invent a random session id (FR-008 integrity).
         guard let session = currentSession else { return }
         // Split a (possibly multi-sentence) utterance into individual sentences,
         // so captions appear one sentence at a time — not one big block.
-        let sentences = SentenceSplitter.split(cleaner.cleanup(segment.text))
+        // Script-normalized before splitting, for the same reason the dictation
+        // path does it: the recognizer writes Mandarin in Simplified — that is
+        // the only Mandarin tag it has — and this app's output is Traditional.
+        // Only the script changes; no word is rewritten.
+        let recognized = TraditionalChineseGuard.normalizingScript(cleaner.cleanup(segment.text))
+        let sentences = SentenceSplitter.split(recognized)
         guard !sentences.isEmpty else {
             // Nothing usable — pure filler, or punctuation the recognizer emitted
             // with no words behind it. Clear the displayed interim AND the band
@@ -905,18 +1396,37 @@ final class CaptureViewModel: ObservableObject {
             return
         }
 
+        // Carry the live translation across the finalize, so the second caption
+        // does not vanish for the second or two before the accurate one arrives.
+        //
+        // Paired to the sentences rather than dropped: a translation of two
+        // sentences is two translations, so splitting it the same way gives each
+        // sentence its own. When the two cannot be paired — merged clauses,
+        // differing counts — this is nil and the pending marker is right.
+        let provisionalTexts = wasDisplayed
+            ? InterimTranslationPairing.pair(
+                interim: interimChinese, toSentenceCount: sentences.count)
+            : nil
+
         if wasDisplayed {
             // Stop live-translating; the accurate finalized translation takes over.
             clearDisplayedInterim()
         }
+        // `Speaker 1` → `Claude Mango`, once per raw label per meeting. The same
+        // full name goes everywhere — transcript, stored segment, caption band —
+        // and each view decides how to lay it out.
+        let speaker = speakerName(for: segment.speakerLabel, source: source)
         var pairs: [(key: UUID, english: String)] = []
+        var provisional: [UUID: String] = [:]
         for (i, sentence) in sentences.enumerated() {
             let isLast = i == sentences.count - 1
             let id = (isLast && wasDisplayed && uttId != nil) ? uttId! : UUID()
             pairs.append((key: id, english: sentence))
-            lines.append(CaptionLine(id: id, english: sentence, chinese: nil,
+            if let text = provisionalTexts?[i], !text.isEmpty { provisional[id] = text }
+            lines.append(CaptionLine(id: id, english: sentence,
+                                     chinese: provisional[id],
                                      source: source, timestamp: Date(),
-                                     speakerLabel: segment.speakerLabel))
+                                     speakerLabel: speaker?.full))
             let seg = TranscriptSegment(
                 id: id,
                 sessionId: session.id,
@@ -924,7 +1434,7 @@ final class CaptureViewModel: ObservableObject {
                 startTime: segment.startTime,
                 endTime: segment.endTime,
                 source: source,
-                speakerLabel: segment.speakerLabel,
+                speakerLabel: speaker?.full,
                 sourceText: sentence
             )
             segmentIndex += 1
@@ -942,7 +1452,11 @@ final class CaptureViewModel: ObservableObject {
             source: source,
             sentences: pairs,
             expectsTranslation: settings.needsTranslation,
-            speakerLabel: segment.speakerLabel)
+            // The full name. The band wraps it at the join and reserves only the
+            // wider half's width, so it no longer has to be shortened to fit —
+            // and a shortened name stopped identifying anyone past ten speakers.
+            speakerLabel: speaker?.full,
+            provisional: provisional)
 
         promoteNextInterim(nextOwner)
     }
@@ -1074,6 +1588,8 @@ final class CaptureViewModel: ObservableObject {
         interimChinese = ""
         interimBySource = [:]
         utteranceIds = [:]
+        lastInterimAudioTime = [:]
+        speakerNamer.reset()
         interimArbiter.reset()
         interimZhStable.reset()
         mlxContext.reset()
@@ -1150,6 +1666,14 @@ final class CaptureViewModel: ObservableObject {
         // while the launch-time bulk download runs (two concurrent downloads of
         // the same ASR variant would corrupt the cache).
         guard asrState == .idle, !isSummarizing, !isDownloadingModels else { return }
+        // The Prompt tab shares this ASR service and the Qwen host, so a compile
+        // in flight has to be cancelled AND awaited before the meeting touches
+        // either — unloading the Qwen container mid-generation is the known
+        // GPU.clearCache crash, and the composer also owns `asr.onEvent` while
+        // it dictates. The eval runner too: it is 22 consecutive generations on
+        // the same host, so starting a meeting without draining it left the
+        // longest of the three running straight into `loadModels`.
+        await drainPromptWorkloads()
         asrState = .loading
         asrDownloadPct = nil
         composeLoadingStatus()
@@ -1172,6 +1696,7 @@ final class CaptureViewModel: ObservableObject {
             asr.currentLanguage = settings.firstLanguage
             asr.scenario = settings.scenario
             asr.diarizationEnabled = settings.diarizationEnabled
+            asr.diarizationSensitivity = settings.diarizationSensitivity
             asr.keepAcousticContext = settings.keepAcousticContext
             asr.onLoadProgress = { [weak self] p in
                 Task { @MainActor in
@@ -1323,6 +1848,7 @@ final class CaptureViewModel: ObservableObject {
         prefetchQwen()
         asr.currentLanguage = settings.firstLanguage
         asr.diarizationEnabled = settings.diarizationEnabled
+        asr.diarizationSensitivity = settings.diarizationSensitivity
         asr.keepAcousticContext = settings.keepAcousticContext
         asr.onLoadProgress = { [weak self] p in
             Task { @MainActor in self?.statusMessage = "下載 ASR 模型… \(Int(p * 100))%" }
@@ -1357,18 +1883,25 @@ final class CaptureViewModel: ObservableObject {
         NSApplication.shared.terminate(nil)
     }
 
-    /// Manually clear this app's Microphone / Screen Recording privacy entries
-    /// (Settings → Maintenance). Fixes the stale-permission state after replacing
-    /// the app with a new build: the Privacy toggle looks ON but capture fails
-    /// until the old entry is removed. Stops active sources first, since their
-    /// grants are being revoked.
-    func resetPrivacyPermissions() async {
+    /// Manually clear this app's privacy entries — Microphone, Screen Recording
+    /// and Accessibility (Settings → Maintenance). Fixes the
+    /// stale-permission state after replacing the app with a new build: the
+    /// Privacy toggle looks ON but capture fails until the old entry is removed.
+    /// Stops active sources first, since their grants are being revoked.
+    @discardableResult
+    func resetPrivacyPermissions() async -> Permissions.ResetReport {
         if micEnabled { await toggleMic() }
         if systemEnabled { await toggleSystem() }
-        let ok = Permissions.resetPrivacyPermissions()
-        statusMessage = ok
-            ? "已重設權限 Permissions reset · Relaunch the app; enabling a source will ask again"
-            : "重設失敗 Reset failed · Run manually: tccutil reset Microphone / ScreenCapture"
+        // The report's own summary, not a verdict derived from it: collapsing the
+        // services into one boolean is wrong when only some fail, and a fixed "run
+        // these by hand" line is useless when the reason is that `tccutil` cannot
+        // resolve the bundle identifier.
+        //
+        // Returned as well as posted to the status line: the caller is a sheet
+        // that stays open, and the status line is on the window behind it.
+        let report = Permissions.resetPrivacyPermissions()
+        statusMessage = report.summary
+        return report
     }
 
     /// True while `endMeeting` is inside its drain window, so a second Stop
@@ -1408,7 +1941,15 @@ final class CaptureViewModel: ObservableObject {
     /// Whether a finished-meeting transcript is available to summarize on demand
     /// (drives the Summary button: only after a meeting has ended, with content).
     var canSummarize: Bool {
-        asrState == .idle && !isSummarizing && currentSession != nil && !lines.isEmpty
+        // The prompt checks are not optional: those features hold the same Qwen
+        // host, and summarizing while one is generating would unload the
+        // container mid-flight. `busyPromptWorkloads` answers without building
+        // anything, so this no longer depends on evaluation order to stay lazy —
+        // which is what the previous version needed a paragraph to explain and
+        // three other call sites broke anyway.
+        guard asrState == .idle, !isSummarizing, currentSession != nil, !lines.isEmpty
+        else { return false }
+        return !busyPromptWorkloads
     }
 
     /// Manually generate the bilingual summary for the just-ended meeting. Loads the
@@ -1525,7 +2066,7 @@ final class CaptureViewModel: ObservableObject {
         s.interimStyle = d.interimStyle
         s.clickThrough = d.clickThrough
         s.autoCloseOverlayOnStop = d.autoCloseOverlayOnStop
-        s.overlayPosition = nil
+        s.overlayBottomAnchor = nil
         settings = s
     }
 
@@ -1543,9 +2084,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     /// Export the transcript. The format follows the extension the user picks in
-    /// the save panel — `TranscriptExporter` has always produced all five, but
-    /// the panel used to be locked to `.md`, so SRT/VTT/TXT/JSON were written,
-    /// tested and unreachable.
+    /// the save panel, so all five `TranscriptExporter` produces are reachable.
     func exportTranscript() {
         guard let session = currentSession else { return }
 
@@ -1581,21 +2120,21 @@ final class CaptureViewModel: ObservableObject {
 
     func toggleMic() async {
         if micEnabled {
-            router.disable(.microphone); micEnabled = false; micLevel = 0
+            router.disable(.microphone); micEnabled = false; levels.mic = 0
             return
         }
-        // If permission was previously denied, requestAccess won't prompt again —
-        // guide the user to System Settings instead.
-        switch Permissions.microphoneStatus {
-        case .denied, .restricted:
-            statusMessage = "麥克風權限被拒。請到系統設定 > 隱私權與安全性 > 麥克風 開啟 Flow Translate"
-            Permissions.openMicrophoneSettings()
+        // One shared rule with the dictation path: asked once when macOS has
+        // never been asked, never again after a grant.
+        guard await Permissions.ensureMicrophone() else {
+            // Offered, not opened. Once macOS has recorded a denial,
+            // `requestAccess` returns false without ever showing a dialog again,
+            // so System Settings is the only thing that can change the answer —
+            // but going there is the user's decision to make, not a side effect of
+            // flipping a switch. The button is right beside the message.
+            statusMessage = "麥克風權限被拒 Microphone denied — "
+                + "系統設定 → 隱私權與安全性 → 麥克風"
+            statusAction = .microphone
             return
-        default:
-            break
-        }
-        guard await Permissions.requestMicrophone() else {
-            statusMessage = "麥克風權限被拒"; Permissions.openMicrophoneSettings(); return
         }
         do {
             try await router.enable(.microphone); micEnabled = true
@@ -1607,15 +2146,21 @@ final class CaptureViewModel: ObservableObject {
 
     func toggleSystem() async {
         if systemEnabled {
-            router.disable(.system); systemEnabled = false; systemLevel = 0
+            router.disable(.system); systemEnabled = false; levels.system = 0
             echoLock.withLock { systemSourceOn = false }
         } else {
-            guard await Permissions.requestScreenRecording() else {
-                // Also covers a stale grant after reinstall (toggle ON but capture
-                // fails) — Settings → Maintenance → Reset permissions fixes that.
-                statusMessage = "需要螢幕錄製權限 Screen Recording permission needed · "
-                    + "If the toggle is already ON, use 設定 Settings → Reset permissions"
-                Permissions.openScreenRecordingSettings()
+            guard await Permissions.requestScreenRecordingOnce() else {
+                // The advice changes after the first attempt. A grant is resolved
+                // when the process starts, so "I turned it on and it still says
+                // this" is the expected second attempt and the answer is a
+                // relaunch — not the reset, which is for the different case where
+                // a rebuilt binary no longer matches its TCC entry.
+                //
+                // Offered rather than opened, for the same reason `toggleMic`
+                // offers: the pane is what unblocks this, and the trip there is
+                // the user's to take.
+                statusMessage = Permissions.screenRecordingHint
+                statusAction = .screenRecording
                 return
             }
             do {
@@ -1627,8 +2172,8 @@ final class CaptureViewModel: ObservableObject {
 
     private func updateLevel(_ source: AudioSourceType, _ rms: Float) {
         switch source {
-        case .microphone: micLevel = rms
-        case .system: systemLevel = rms
+        case .microphone: levels.mic = rms
+        case .system: levels.system = rms
         }
     }
 

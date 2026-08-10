@@ -238,12 +238,27 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
 
     // MARK: - Prompts
 
+    /// The speaker-label clause is not decoration.
+    ///
+    /// Speakers are labelled `Claude Mango`, `Gemini Peach` — randomly paired
+    /// placeholders, because a name is easier to follow across a meeting than
+    /// `Speaker 1`. The half drawn from model names is a real hazard for *this*
+    /// app's users specifically: a technical meeting that genuinely discusses
+    /// Claude or Gemini reads to a 4B model exactly like a transcript prefixed
+    /// with those words, and the notes come back describing the tool instead of
+    /// the person. Saying what the prefix is costs a dozen tokens per chunk and
+    /// removes the ambiguity.
     private static let mapSystemPrompt = """
     You are an expert note-taker. Below is part of a transcript of spoken audio — it \
     may be a meeting, lecture, video, podcast, interview or casual conversation. Write \
     concise, factual bullet notes in English that capture the topics, key information, \
     names, numbers, decisions and any action items. Keep every concrete detail and drop \
     filler. Output only the notes.
+
+    A line beginning "Name: " is a SPEAKER LABEL. These names are randomly assigned \
+    placeholders for the people talking — they are never the subject of the discussion, \
+    even when they look like the name of a product or a model. Attribute the words to \
+    them; never write notes about them.
     """
 
     private static func reduceSystemPrompt(_ language: Lang) -> String {

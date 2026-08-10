@@ -21,9 +21,14 @@ public enum SupportedASRLanguages {
     public static let `default` = "en-US"
 
     /// Transcription-ready (19 locales) — best recognition quality.
+    ///
+    /// This is the model's own quality grouping. What the picker shows is `all`,
+    /// which reorders for the user rather than for the benchmark.
     public static let transcriptionReady: [LanguageLocale] = [
         .init(code: "en-US", displayName: "英文 (美國)"),
         .init(code: "en-GB", displayName: "英文 (英國)"),
+        .init(code: "ja-JP", displayName: "日文"),
+        .init(code: "ko-KR", displayName: "韓文"),
         .init(code: "es-US", displayName: "西班牙文 (美洲)"),
         .init(code: "es-ES", displayName: "西班牙文 (西班牙)"),
         .init(code: "fr-FR", displayName: "法文 (法國)"),
@@ -37,16 +42,28 @@ public enum SupportedASRLanguages {
         .init(code: "ru-RU", displayName: "俄文"),
         .init(code: "ar-AR", displayName: "阿拉伯文"),
         .init(code: "hi-IN", displayName: "印地文"),
-        .init(code: "ja-JP", displayName: "日文"),
-        .init(code: "ko-KR", displayName: "韓文"),
         .init(code: "vi-VN", displayName: "越南文"),
         .init(code: "uk-UA", displayName: "烏克蘭文"),
     ]
 
-    /// Broad-coverage (14 locales) — usable recognition quality.
+    /// Broad-coverage (13 locales) — usable recognition quality.
+    ///
+    /// Mandarin sits here on the model's own numbers: NVIDIA reports 19.3% CER
+    /// for `zh-CN` against 7.9% WER for `en-US` at the same chunk size. See
+    /// `promotedInPicker` for why it is still drawn near the top.
     public static let broadCoverage: [LanguageLocale] = [
-        .init(code: "pl-PL", displayName: "波蘭文"),
+        // One Mandarin entry, because the model has one.
+        //
+        // `zh-TW` was offered on the assumption that Nemotron prompts the two
+        // locales separately. It does not: every shipped variant's
+        // `tokenizer.json` contains `<zh-CN>` and no `<zh-TW>`, so selecting it
+        // left the language lock searching for a tag that does not exist and the
+        // decoder produced garbage. Recognition happens under the tag the model
+        // has; Traditional output is produced afterwards by
+        // `TraditionalChineseGuard`, which is where script conversion belongs.
+        .init(code: "zh-CN", displayName: "中文 (中文/普通話)"),
         .init(code: "sv-SE", displayName: "瑞典文"),
+        .init(code: "pl-PL", displayName: "波蘭文"),
         .init(code: "cs-CZ", displayName: "捷克文"),
         .init(code: "nb-NO", displayName: "挪威文 (Bokmål)"),
         .init(code: "da-DK", displayName: "丹麥文"),
@@ -54,20 +71,43 @@ public enum SupportedASRLanguages {
         .init(code: "fi-FI", displayName: "芬蘭文"),
         .init(code: "hr-HR", displayName: "克羅埃西亞文"),
         .init(code: "sk-SK", displayName: "斯洛伐克文"),
-        // The model ships SEPARATE prompts for the two Mandarin locales
-        // (`zh-CN` → 4, `zh-TW` → 5), exactly as it does for en-US/en-GB and
-        // pt-BR/pt-PT. Offering only zh-CN meant Taiwanese Mandarin was
-        // recognized under the Mainland prompt, and its output needed a
-        // Simplified→Traditional pass that zh-TW doesn't.
-        .init(code: "zh-CN", displayName: "中文 (簡體/普通話)"),
-        .init(code: "zh-TW", displayName: "中文 (台灣/繁體)"),
         .init(code: "hu-HU", displayName: "匈牙利文"),
         .init(code: "ro-RO", displayName: "羅馬尼亞文"),
         .init(code: "et-EE", displayName: "愛沙尼亞文"),
     ]
 
-    /// All directly transcribable languages (33 locales).
-    public static var all: [LanguageLocale] { transcriptionReady + broadCoverage }
+    /// Locales lifted to the top of the picker regardless of their quality tier.
+    ///
+    /// The tier lists say how well the model transcribes a language; the picker
+    /// has to answer a different question — how likely is *this* user to pick it.
+    /// Mandarin and Swedish sit in `broadCoverage`, so ordering by tier buried
+    /// them under nineteen rows that get scrolled past every time.
+    ///
+    /// Order here is the requested one: 英文 · 中文 · 瑞典文 · 韓文 · 日文, then
+    /// everything else in tier order.
+    public static let promotedInPicker = ["zh-CN", "sv-SE", "ko-KR", "ja-JP"]
+
+    /// All directly transcribable languages (32 locales), **in picker order**.
+    ///
+    /// English first, then the promoted pair directly under it, then everything
+    /// else in tier order. The quality tiers stay exactly as they are — this
+    /// changes where a row is drawn, never what the model is told.
+    ///
+    /// 32, not 33: `zh-TW` was removed once it turned out that no shipped model
+    /// variant carries that tag. The counts and this ordering are asserted in
+    /// `SupportedLanguagesTests`, so a future addition cannot leave them stale
+    /// the way the count did.
+    public static let all: [LanguageLocale] = {
+        let tiered = transcriptionReady + broadCoverage
+        let english = tiered.filter { $0.code.hasPrefix("en") }
+        let promoted = promotedInPicker.compactMap { code in
+            tiered.first { $0.code == code }
+        }
+        let rest = tiered.filter {
+            !$0.code.hasPrefix("en") && !promotedInPicker.contains($0.code)
+        }
+        return english + promoted + rest
+    }()
 
     public static func locale(for code: String) -> LanguageLocale? {
         all.first { $0.code == code }
