@@ -1,6 +1,7 @@
 import AVFoundation
 import FluidAudio
 import FlowTranslateCore
+import OSLog
 
 /// Streaming ASR over FluidAudio's multilingual Nemotron‑3.5 model (CoreML/ANE).
 ///
@@ -13,15 +14,23 @@ import FlowTranslateCore
 ///   per-stream state (encoder state, caches, prediction buffers) is what must be
 ///   private, not the ~633 MB of read-only weights.
 /// - **Memory policy.** The downloaded variant is cached on disk (no re-download),
-///   but the in-memory models are RELEASED at meeting end (16 GB budget) and
-///   lazily reloaded on the next Start — incoming audio is ring-buffered during
-///   the load and replayed, so the opening words are never lost. `isWarm` +
+///   and shared weights are reused between meetings. A summary or a changed
+///   variant releases them (16 GB budget). Incoming audio is ring-buffered during
+///   a cold load and replayed. `isWarm` +
 ///   `onModelLoading` let the UI show an honest "model loading" state meanwhile.
 /// - **Language:** `setLanguage("en-US" / "sv-SE" / "auto" …)`. `en-US` (and other
 ///   Latin langs) use the lighter, faster "latin" ship; others/`auto` use the
 ///   "multilingual" ship. `auto` detects per sentence (mixed-language audio).
 public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
-    public var onEvent: ((TranscriptEvent) -> Void)?
+    private static let modelLog = Logger(subsystem: "dev.flowtranslate.app", category: "ModelStartup")
+    public var onEvent: (@MainActor @Sendable (TranscriptEvent) -> Void)?
+    private let delivery = TranscriptEventDelivery()
+    private var creationTasks: [AudioSourceType: Task<Void, Never>] = [:]
+    private var stopTask: Task<Void, Never>?
+    private var stopping = false
+    private var generation: UInt64 = 0
+    private var weightsGeneration: UInt64 = 0
+    private var configurationRequest: UInt64 = 0
 
     /// First-caption language hint (Nemotron locale, e.g. "en-US", or "auto").
     public var currentLanguage: String = SupportedASRLanguages.default
@@ -62,6 +71,7 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// preload or a pipeline load finished). Drives the UI's "warming" state so
     /// it can show an honest "model loading" instead of a premature "Listening".
     private var warm = false
+    private var sharedLoadFailure: String?
     /// How readily the diarizer splits one voice into two. Applied on the next
     /// `loadModels`, like every other segmentation setting.
     public var diarizationSensitivity: DiarizationSensitivity = .balanced
@@ -96,21 +106,31 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     }
     private var diarizerModels: DiarizerModels?
     /// Audio captured while a source's pipeline is still being created, replayed
-    /// once it's ready so the opening words are never dropped (cold-start fix).
+    /// once ready. A prolonged cold load retains only the most recent audio.
     private var pendingChunks: [AudioSourceType: [AudioChunk]] = [:]
     private let maxPendingChunks = 200   // ~recent audio kept while the model loads
     /// Background-preloaded CoreML weights, shared by every source's manager — so
     /// running mic + system audio together costs one copy of the model, not two.
     private var sharedTask: Task<SharedNemotronMultilingualModels?, Never>?
+    // Core ML may finish a cancelled load before returning. The next variant
+    // waits for that native work without blocking Start or keeping old weights.
+    private var nativeLoadFence: Task<Void, Never>?
     private var running = false
     private let lock = NSLock()
 
-    public init() {}
+    private let sharedLoader: @Sendable (URL) async throws -> SharedNemotronMultilingualModels
+
+    public init(sharedLoader: @escaping @Sendable (URL) async throws -> SharedNemotronMultilingualModels = {
+        try await StreamingNemotronMultilingualAsrManager.preloadShared(from: $0)
+    }) {
+        self.sharedLoader = sharedLoader
+    }
 
     /// Whether at least one streaming model is loaded in memory. When `false`
     /// right after `startStream()`, the first captions will lag behind by the
-    /// model-load time (incoming audio is buffered, so no words are lost).
+    /// model-load time. Audio buffering during that load is bounded.
     public var isWarm: Bool { lock.withLock { warm } }
+    public var modelLoadFailure: String? { lock.withLock { sharedLoadFailure } }
 
     // MARK: - ASRStreaming
 
@@ -118,37 +138,48 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// (re-downloads a partial/corrupt cache). Fast when already cached. The model
     /// is loaded into memory lazily on first audio. No-op if already prepared.
     public func loadModels(tier: String) async throws {
-        await prepareDiarizationIfNeeded()
-        let key = "\(currentLanguage)|\(tier)"
-        if loadedKey == key, variantDir != nil { return }   // already prepared, no re-download
-
-        // Settings changed → drop any models loaded for the old settings.
-        teardownAll()
+        let request = lock.withLock { configurationRequest &+= 1; return configurationRequest }
+        let language = currentLanguage
+        await waitForStopUnlessCancelled()
+        try Task.checkCancellation()
+        await prepareDiarizationIfNeeded(request: request)
+        try Task.checkCancellation()
+        guard lock.withLock({ configurationRequest == request }) else { throw CancellationError() }
+        let key = "\(language)|\(tier)"
+        if lock.withLock({ loadedKey == key && variantDir != nil }) { return }
 
         // Only DOWNLOAD here (fast when cached). The model is loaded into memory
         // lazily on the first audio chunk, while incoming audio is buffered — so
-        // Start stays fast and the opening words are never dropped.
-        variantDir = try await ensureVariant(lang: currentLanguage, chunkMs: Self.chunkMs(for: tier))
-        loadedKey = key
+        // Start stays responsive; the UI asks users to wait for readiness.
+        let directory = try await ensureVariant(lang: language, chunkMs: Self.chunkMs(for: tier))
+        try Task.checkCancellation()
+        guard selectVariant(directory: directory, key: key, request: request) else { throw CancellationError() }
         onLoadProgress?(1.0)
     }
 
     /// Download and load the pyannote 3.1 pipeline independently of ASR. Diarization
     /// is optional, so a model failure is surfaced to the UI but never prevents
     /// captions (fail-open).
-    private func prepareDiarizationIfNeeded() async {
+    private func prepareDiarizationIfNeeded(request: UInt64) async {
         guard diarizationEnabled else {
-            diarizerModels = nil
+            lock.withLock {
+                if configurationRequest == request { diarizerModels = nil }
+            }
             return
         }
-        guard diarizerModels == nil else { return }
+        guard lock.withLock({ configurationRequest == request && diarizerModels == nil }) else { return }
         do {
             let progress: DownloadUtils.ProgressHandler = { [weak self] p in
                 self?.onDiarizationLoadProgress?(p.fractionCompleted)
             }
-            diarizerModels = try await DiarizerModels.downloadIfNeeded(
-                progressHandler: progress)
-            onDiarizationLoadProgress?(1.0)
+            let models = try await DiarizerModels.downloadIfNeeded(progressHandler: progress)
+            guard !Task.isCancelled else { return }
+            let installed = lock.withLock {
+                guard configurationRequest == request else { return false }
+                diarizerModels = models
+                return true
+            }
+            if installed { onDiarizationLoadProgress?(1.0) }
         } catch {
             onDiarizationUnavailable?("pyannote diarization unavailable: \(error.localizedDescription)")
         }
@@ -159,23 +190,60 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// first-caption delay). Every source that needs a pipeline shares them.
     private func startBackgroundPreload() {
         lock.withLock {
+            if sharedLoadFailure != nil {
+                weightsGeneration &+= 1
+                sharedLoadFailure = nil
+                sharedTask = nil
+            }
             guard sharedTask == nil, pipelines.isEmpty else { return }
-            sharedTask = Task { [weak self] in await self?.loadShared() ?? nil }
+            _ = sharedLoadLocked()
         }
+    }
+
+    /// Called under `lock`, so all sources and presets use one native loader.
+    private func sharedLoadLocked() -> Task<SharedNemotronMultilingualModels?, Never> {
+        if let sharedTask { return sharedTask }
+        let previous = nativeLoadFence
+        let load = Task { [weak self] () -> SharedNemotronMultilingualModels? in
+            await previous?.value
+            guard !Task.isCancelled else { return nil }
+            return await self?.loadShared()
+        }
+        sharedTask = load
+        nativeLoadFence = Task { _ = await load.value }
+        return load
     }
 
     /// Load the CoreML weights once, for every source to share. Respects task
     /// cancellation (a cancelled warm preload stops early instead of finishing a
     /// multi-second CoreML load whose result is discarded).
     private func loadShared() async -> SharedNemotronMultilingualModels? {
-        guard let dir = variantDir, !Task.isCancelled else { return nil }
+        let (directory, token) = lock.withLock { (variantDir, weightsGeneration) }
+        guard let dir = directory, !Task.isCancelled else { return nil }
+        let began = ContinuousClock.now
+        Self.modelLog.notice("Core ML weight load started")
         onModelLoading?(true)
-        defer { onModelLoading?(false) }
-        guard let shared = try? await StreamingNemotronMultilingualAsrManager
-            .preloadShared(from: dir)                    // CoreML load + ANE warm-up
-        else { return nil }
+        defer {
+            if lock.withLock({ weightsGeneration == token }) { onModelLoading?(false) }
+        }
+        let shared: SharedNemotronMultilingualModels
+        do {
+            shared = try await sharedLoader(dir)
+        } catch {
+            guard !Task.isCancelled else { return nil }
+            lock.withLock {
+                if weightsGeneration == token { sharedLoadFailure = error.localizedDescription }
+            }
+            Self.modelLog.error("Core ML weight load failed after \(String(describing: ContinuousClock.now - began), privacy: .public)")
+            return nil
+        }
         guard !Task.isCancelled else { return nil }
-        lock.withLock { warm = true }
+        guard lock.withLock({ () -> Bool in
+            guard weightsGeneration == token else { return false }
+            warm = true
+            return true
+        }) else { return nil }
+        Self.modelLog.notice("Core ML weights ready after \(String(describing: ContinuousClock.now - began), privacy: .public)")
         return shared
     }
 
@@ -204,16 +272,10 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         return m
     }
 
-    /// Fetch and verify a variant **without touching the live configuration**.
-    ///
-    /// `loadModels` writes `currentLanguage`/`loadedKey` and tears down the
-    /// running pipelines, so it cannot be used to get ahead of a dictation that
-    /// has not started — it would reconfigure a recognizer a meeting may be
-    /// using. This only ensures the files are on disk and validated, which is the
-    /// part that makes the first ⌃⌥Space wait.
-    ///
-    /// Costs no memory: weights are loaded lazily on the first audio chunk.
+    /// Prepare a dictation variant only while idle. A newer preparation or
+    /// stream invalidates this request, so a late download cannot reconfigure it.
     public func prewarmVariant(language: String, tier: String) async {
+        guard let request = beginIdlePreparation() else { return }
         guard let dir = try? await ensureVariant(
             lang: language, chunkMs: Self.chunkMs(for: tier)
         ) else { return }
@@ -231,11 +293,44 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
         // `loadModels` compares against — so setting either alone made them
         // describe different variants, and clearing the key instead made the next
         // `loadModels` tear down the weights this method had just compiled.
-        lock.withLock {
-            variantDir = dir
-            loadedKey = "\(language)|\(tier)"
-        }
+        guard !Task.isCancelled,
+              selectVariant(directory: dir, key: "\(language)|\(tier)", request: request) else { return }
         startBackgroundPreload()
+    }
+
+    /// Prepare the selected installed variant without starting capture.
+    /// Missing files are handled by the app's download prompt.
+    @discardableResult
+    func prewarmCachedVariant(language: String, tier: String) -> Bool {
+        let directory = Self.variantDirectory(language: language, tier: tier)
+        guard Self.variantComplete(directory), let request = beginIdlePreparation(),
+              selectVariant(directory: directory, key: "\(language)|\(tier)", request: request)
+        else { return false }
+        startBackgroundPreload()
+        return true
+    }
+
+    private func beginIdlePreparation() -> UInt64? {
+        lock.withLock {
+            guard !running, !stopping else { return nil }
+            configurationRequest &+= 1
+            return configurationRequest
+        }
+    }
+
+    private func selectVariant(directory: URL, key: String, request: UInt64) -> Bool {
+        let selection = lock.withLock { () -> (Bool, [SourceASR]) in
+            guard configurationRequest == request, !running, !stopping else { return (false, []) }
+            // Language selection belongs to each decoder. The on-disk variant
+            // identifies the weights shared by languages in the same ship/tier.
+            let old = variantDir != directory
+                ? removePipelinesLocked(freeingWeights: true) : []
+            variantDir = directory
+            loadedKey = key
+            return (true, old)
+        }
+        for pipeline in selection.1 { pipeline.stop() }
+        return selection.0
     }
 
     /// Wait until the weights are resident, so a caller can say "ready" honestly.
@@ -249,7 +344,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     public func warmUpWeights() async {
         startBackgroundPreload()
         let task = lock.withLock { sharedTask }
-        _ = await task?.value
+        if let task, await CancellableTaskWait.wait(for: task), await task.value == nil {
+            // A failed load is not a reusable model. Keep an in-progress load
+            // on caller cancellation, but let the next attempt retry a failure.
+            lock.withLock { if sharedTask == task { sharedTask = nil } }
+        }
     }
 
     private func ensureVariant(lang: String, chunkMs: Int) async throws -> URL {
@@ -307,12 +406,14 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// switches the first-caption language or the ASR tier, the next Start may
     /// still need a ~600 MB download; this is the check that predicts it.
     public static func variantPresent(language: String, tier: String) -> Bool {
-        let ship = shipDirectory(for: language)
-        let dir = fluidModels
+        variantComplete(variantDirectory(language: language, tier: tier))
+    }
+
+    private static func variantDirectory(language: String, tier: String) -> URL {
+        fluidModels
             .appendingPathComponent("nemotron-multilingual", isDirectory: true)
-            .appendingPathComponent(ship, isDirectory: true)
+            .appendingPathComponent(shipDirectory(for: language), isDirectory: true)
             .appendingPathComponent("\(chunkMs(for: tier))ms", isDirectory: true)
-        return variantComplete(dir)
     }
 
     /// Mirror of FluidAudio's ship-selection rule (latin vs. multilingual), kept
@@ -346,7 +447,15 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     }
 
     public func startStream() async throws {
-        running = true
+        await waitForStopUnlessCancelled()
+        try Task.checkCancellation()
+        lock.withLock {
+            stopTask = nil
+            stopping = false
+            generation &+= 1
+            configurationRequest &+= 1
+            running = true
+        }
         // Preload one model in the background so it's ready by the time the user
         // speaks (overlaps the multi-second load with user prep). Pipelines are
         // created lazily per source on the first audio chunk.
@@ -354,11 +463,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     }
 
     public func feed(_ chunk: AudioChunk) {
-        guard running else { return }
         let pipeline: SourceASR? = lock.withLock {
+            guard running, sharedLoadFailure == nil else { return nil }
             if let p = pipelines[chunk.source] { return p }
             // Pipeline still loading → ring-buffer the most recent audio so the
-            // opening words aren't lost (drop oldest if the load runs long).
+            // recent audio can be replayed (drop oldest if the load runs long).
             var buf = pendingChunks[chunk.source] ?? []
             buf.append(chunk)
             if buf.count > maxPendingChunks { buf.removeFirst(buf.count - maxPendingChunks) }
@@ -375,8 +484,11 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// Release the in-memory ASR models (frees ~1 GB), e.g. before loading the
     /// summarization LLM. The next Start reloads them lazily; download is kept.
     public func releaseModels() {
+        lock.withLock {
+            configurationRequest &+= 1
+            diarizerModels = nil
+        }
         teardownAll()
-        diarizerModels = nil
     }
 
     /// Stop consuming audio.
@@ -384,101 +496,135 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// - Parameter keepModelsResident: leave the loaded weights in memory for the
     ///   next stream instead of freeing them.
     ///
-    /// A meeting frees them: it is a long session, it ends deliberately, and the
-    /// ~600 MB is worth returning. **Dictation must not.** It is seconds long and
-    /// happens repeatedly, and tearing down at the end of one meant the next
-    /// ⌃⌥Space paid the CoreML load and the ANE compile again — several seconds
-    /// before the recognizer could hear a word, every single time. That is the
-    /// "第二次辨識又要再載入一次" report, and it is this line that caused it.
-    ///
-    /// What is torn down instead is the *pipeline* — the per-source decoder state
-    /// — which is cheap to rebuild and must not carry acoustic state from one
-    /// dictation into the next. Only the shared weights survive.
+    /// Interactive sessions retain shared weights to avoid another native load.
+    /// Their per-source decoder state is always discarded after draining; a new
+    /// variant, summary, or explicit release frees the shared weights as well.
     public func stopStream() { stopStream(keepModelsResident: false) }
 
     public func stopStream(keepModelsResident: Bool) {
-        running = false
-        // The consumers' trailing finalize still runs (`stop()` only cancels the
-        // loop), and the caller's drain window collects that last sentence.
-        if keepModelsResident {
-            teardownPipelines()
-        } else {
-            teardownAll()
+        lock.withLock {
+            guard stopTask == nil else { return }
+            running = false
+            stopping = true
+            let token = generation
+            for pipeline in pipelines.values { pipeline.finishInput() }
+            stopTask = Task { [self] in
+                // A cold pipeline may still own the opening audio. Let setup
+                // finish and replay it before closing its consumer.
+                let creating = lock.withLock { Array(creationTasks.values) }
+                for task in creating { await task.value }
+                guard !Task.isCancelled else { return }
+                let active = lock.withLock { generation == token ? Array(pipelines.values) : [] }
+                for pipeline in active { await pipeline.finishAndDrain() }
+                await delivery.drain()
+                teardownPipelines(freeingWeights: !keepModelsResident, expectedGeneration: token)
+            }
         }
+    }
+
+    public func drain() async {
+        let task = lock.withLock { stopTask }
+        await task?.value
+    }
+
+    private func waitForStopUnlessCancelled() async {
+        let task = lock.withLock { stopTask }
+        if let task { _ = await CancellableTaskWait.wait(for: task) }
+    }
+
+    /// Cancellation discards abandoned input. It never joins a cold CoreML
+    /// load, and generation checks reject every late pipeline/event from it.
+    /// Deliberate meeting Stop continues to use stopStreamAndDrain instead.
+    public func cancelStream(keepModelsResident: Bool = false) {
+        teardownPipelines(freeingWeights: !keepModelsResident, cancellingSession: true)
+    }
+
+    public func stopStreamAndDrain() async {
+        stopStream()
+        await drain()
     }
 
     // MARK: - Pipelines
 
     private func ensurePipeline(for source: AudioSourceType) {
-        let shouldCreate: Bool = lock.withLock {
-            guard running, variantDir != nil, pipelines[source] == nil, !creating.contains(source) else {
-                return false
+        lock.withLock {
+            guard running, variantDir != nil, sharedLoadFailure == nil,
+                  pipelines[source] == nil, !creating.contains(source) else {
+                return
             }
             creating.insert(source)
-            return true
-        }
-        guard shouldCreate else { return }
-
-        Task { [weak self] in
+            let token = generation
+            creationTasks[source] = Task { [weak self] in
             guard let self else { return }
             // Every source awaits the SAME weight-load task: the first one starts
             // it (or reuses the warm preload), later ones adopt the result instead
             // of loading a second copy of the model.
-            let load = self.lock.withLock { () -> Task<SharedNemotronMultilingualModels?, Never> in
-                if let t = self.sharedTask { return t }
-                let t = Task { [weak self] in await self?.loadShared() ?? nil }
-                self.sharedTask = t
-                return t
+            let load = self.lock.withLock { () -> Task<SharedNemotronMultilingualModels?, Never>? in
+                guard !Task.isCancelled, self.generation == token else { return nil }
+                return self.sharedLoadLocked()
             }
+            guard let load else { return }
             let shared = await load.value
-            if shared == nil {
-                // Drop the failed task so the NEXT source (or the next chunk that
-                // re-triggers this path) actually retries. Caching a completed
-                // task that yielded nil would keep handing every later attempt
-                // the same failure — one transient CoreML hiccup would leave the
-                // whole meeting with no captions at all.
-                self.lock.withLock { if self.sharedTask == load { self.sharedTask = nil } }
-            }
+            guard !Task.isCancelled, self.lock.withLock({ self.generation == token }) else { return }
             guard let shared, let manager = await self.makeManager(from: shared) else {
-                self.lock.withLock { _ = self.creating.remove(source) }
+                self.lock.withLock {
+                    if self.generation == token { _ = self.creating.remove(source) }
+                }
                 return
             }
+            guard !Task.isCancelled, self.lock.withLock({ self.generation == token }) else { return }
 
             let pipeline = SourceASR(
                 source: source, manager: manager,
                 tuning: .forSource(source, scenario: self.scenario),
                 keepAcousticContext: self.keepAcousticContext)
             pipeline.configureDiarization(enabled: self.diarizationEnabled,
-                                          models: self.diarizerModels,
+                                          models: self.lock.withLock { self.diarizerModels },
                                           config: self.diarizerConfig)
-            pipeline.onEvent = { [weak self] event in self?.onEvent?(event) }
+            pipeline.onEvent = { [weak self] event in
+                guard let self else { return }
+                self.delivery.send(event) { [weak self] event in
+                    guard let self, self.lock.withLock({ self.generation == token }),
+                          let handler = self.onEvent else { return }
+                    handler(event)
+                }
+            }
             pipeline.onVadUnavailable = { [weak self] msg in self?.onVadUnavailable?(msg) }
             await pipeline.start()
+            guard !Task.isCancelled, self.lock.withLock({ self.generation == token }) else {
+                pipeline.stop()
+                return
+            }
 
             // Replay audio buffered during setup, then publish the pipeline
             // atomically (so chunks stay in order and none are dropped).
             while true {
                 let batch: [AudioChunk] = self.lock.withLock {
+                    guard self.generation == token else { return [] }
                     let b = self.pendingChunks[source] ?? []
                     self.pendingChunks[source] = []
                     return b
                 }
                 if batch.isEmpty {
                     let done: Bool = self.lock.withLock {
+                        guard self.generation == token else { return true }
                         guard self.pendingChunks[source]?.isEmpty ?? true else { return false }
-                        if self.running { self.pipelines[source] = pipeline }
+                        if self.running || self.stopping { self.pipelines[source] = pipeline }
                         self.pendingChunks[source] = nil
                         self.creating.remove(source)
                         return true
                     }
                     if done {
-                        if !self.running { pipeline.stop() }
+                        let state = self.lock.withLock { (self.generation == token, self.running) }
+                        if !state.0 { pipeline.stop() }
+                        else if !state.1 { pipeline.finishInput() }
                         break
                     }
                 } else {
                     for c in batch { pipeline.feed(c) }
                 }
             }
+        }
         }
     }
 
@@ -496,20 +642,43 @@ public final class NemotronStreamingService: ASRStreaming, @unchecked Sendable {
     /// weights** are the ~600 MB and the seconds of ANE compile; they are
     /// identical for every session on the same variant, so freeing them between
     /// two dictations is pure loss.
-    private func teardownPipelines(freeingWeights: Bool = false) {
+    private func teardownPipelines(freeingWeights: Bool = false,
+                                   expectedGeneration: UInt64? = nil,
+                                   cancellingSession: Bool = false) {
         let all = lock.withLock { () -> [SourceASR] in
-            let v = Array(pipelines.values)
-            pipelines.removeAll()
-            creating.removeAll()
-            pendingChunks.removeAll()
-            if freeingWeights {
-                sharedTask?.cancel()
-                sharedTask = nil      // drops the shared weights → memory freed
-                warm = false
+            if let expectedGeneration, generation != expectedGeneration { return [] }
+            generation &+= 1
+            if cancellingSession {
+                configurationRequest &+= 1
+                running = false
+                stopping = false
+                stopTask?.cancel()
+                stopTask = nil
             }
-            return v
+            if expectedGeneration != nil { stopping = false }
+            return removePipelinesLocked(freeingWeights: freeingWeights)
         }
         for p in all { p.stop() }
+    }
+
+    /// Caller holds `lock`; identity and the actual shared weights change as one
+    /// operation. Prewarming must never relabel old weights as a new variant.
+    private func removePipelinesLocked(freeingWeights: Bool) -> [SourceASR] {
+        generation &+= 1
+        let v = Array(pipelines.values)
+        pipelines.removeAll()
+        creating.removeAll()
+        for task in creationTasks.values { task.cancel() }
+        creationTasks.removeAll()
+        pendingChunks.removeAll()
+        if freeingWeights {
+            weightsGeneration &+= 1
+            sharedTask?.cancel()
+            sharedTask = nil      // drops the shared weights → memory freed
+            warm = false
+            sharedLoadFailure = nil
+        }
+        return v
     }
 
     // MARK: - Helpers
@@ -558,17 +727,18 @@ private final class SourceASR: @unchecked Sendable {
 
     private var lastTimestamp: TimeInterval = 0
     private var utteranceStart: TimeInterval = 0
+    private var utteranceId = UUID()
     private var hasSpeech = false
     private var lastPartial = ""   // live partial, for terminal-punctuation close
 
     // Optional speaker diarization (pyannote 3.1 + WeSpeaker). Each source keeps
     // its own diarizer + speaker database so mic and system identities never mix.
-    private var diarizationEnabled = false
     private var diarizer: DiarizerManager?
+    private let speakerFinalizer = SpeakerFinalizationQueue()
     private var diarizationAudio: [Float] = []
     private var diarizationAudioStartTime: TimeInterval?
     private var asrAudioStartTime: TimeInterval?
-    private let diarizationBufferSamples = 12 * 16_000
+    private var diarizationBufferSamples: Int { Int((tuning.maxSpeech + 2) * 16_000) }
     /// How far a chunk's timestamp may sit from the end of the buffered audio
     /// before the run is treated as broken.
     ///
@@ -589,7 +759,9 @@ private final class SourceASR: @unchecked Sendable {
         self.tuning = tuning
         self.keepAcousticContext = keepAcousticContext
         self.endpointer = Endpointer(
-            config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech))
+            config: .init(minSpeech: tuning.minSpeech, maxSpeech: tuning.maxSpeech,
+                          semanticGrace: max(0.45, tuning.minSilence),
+                          extendUnpunctuatedSpeech: tuning == .video))
     }
 
     func start() async {
@@ -602,13 +774,11 @@ private final class SourceASR: @unchecked Sendable {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !trimmed.isEmpty else { return }
             self.lastPartial = trimmed
-            self.onEvent?(.interim(text: trimmed, source: self.source, at: self.lastTimestamp))
+            self.onEvent?(.interim(text: trimmed, source: self.source, at: self.lastTimestamp,
+                                   utteranceId: self.utteranceId))
         }
         launchConsumer()
     }
-
-    // (The old resume()/pause() keep-alive pair was removed: endMeeting always
-    // releases the models on a 16 GB budget, so the path was unreachable.)
 
     func feed(_ chunk: AudioChunk) {
         let cont = lock.withLock { continuation }
@@ -618,7 +788,6 @@ private final class SourceASR: @unchecked Sendable {
     /// Each source pipeline owns its speaker database so labels remain stable
     /// without mixing microphone and system-audio identities.
     func configureDiarization(enabled: Bool, models: DiarizerModels?, config: DiarizerConfig) {
-        diarizationEnabled = enabled
         guard enabled, let models else {
             diarizer = nil
             diarizationAudio.removeAll(keepingCapacity: false)
@@ -640,6 +809,20 @@ private final class SourceASR: @unchecked Sendable {
         }
         task?.cancel()
         task = nil
+        speakerFinalizer.cancel()
+    }
+
+    func finishInput() {
+        lock.withLock {
+            continuation?.finish()
+            continuation = nil
+        }
+    }
+
+    func finishAndDrain() async {
+        finishInput()
+        await task?.value
+        await speakerFinalizer.drain()
     }
 
     // MARK: - Private
@@ -665,6 +848,7 @@ private final class SourceASR: @unchecked Sendable {
 
     private func resetState(keepingAudioOrigin: Bool = false) {
         utteranceStart = 0
+        utteranceId = UUID()
         hasSpeech = false
         lastPartial = ""
         if !keepingAudioOrigin { asrAudioStartTime = nil }
@@ -721,7 +905,7 @@ private final class SourceASR: @unchecked Sendable {
     private func consume(_ stream: AsyncStream<AudioChunk>) async {
         for await chunk in stream {
             if Task.isCancelled { break }
-            lastTimestamp = chunk.timestamp
+            lastTimestamp = chunk.timestamp + Double(chunk.samples.count) / 16_000
 
             // Keep a rolling PCM window for pyannote (independent of Nemotron's
             // chunk tier; its 5 s inference windows need raw audio context).
@@ -781,42 +965,45 @@ private final class SourceASR: @unchecked Sendable {
                     if e.isStart { sawStart = true } else if e.isEnd { ended = true }
                 }
             }
-            let started = sawStart || !lastPartial.isEmpty
-
+            let started = sawStart || (!endpointer.inUtterance && !lastPartial.isEmpty)
             let dt = Double(chunk.samples.count) / 16_000.0
-            let sentenceEnded = Endpointer.endsSentence(lastPartial)
-            let sentenceIncomplete = SemanticEndpoint.isIncomplete(lastPartial)
-            // A fragment that is complete-sounding but too short to be a sentence
-            // — "然後", "好的" before a thinking pause — buys the same one-window
-            // grace as an unfinished thought. An *empty* partial buys nothing:
-            // see `isTooShortToClose`.
-            let tooShort = Endpointer.isTooShortToClose(lastPartial)
-            for event in endpointer.process(
-                speechStarted: started, speechEnded: ended, sentenceEnded: sentenceEnded,
-                sentenceIncomplete: sentenceIncomplete, tooShort: tooShort, dt: dt
-            ) {
+            let wasActive = endpointer.inUtterance
+            let events = endpointer.process(
+                speechStarted: started, speechEnded: ended, partial: lastPartial, dt: dt)
+            if wasActive, !endpointer.inUtterance, events.isEmpty {
+                await endUtterance()
+            }
+            for event in events {
                 switch event {
                 case .start:
                     utteranceStart = chunk.timestamp
                     hasSpeech = true
                 case .finalize:
-                    await finalizeUtterance(at: chunk.timestamp)
+                    await finalizeUtterance(at: lastTimestamp)
                 }
             }
         }
-        await finalizeUtterance(at: lastTimestamp)
+        if !Task.isCancelled { await finalizeUtterance(at: lastTimestamp) }
     }
 
     private func finalizeUtterance(at endTime: TimeInterval) async {
         guard hasSpeech else { return }
         let result = try? await manager.finishWithTokenTimings()
+        guard !Task.isCancelled else { return }
         let trimmed = (result?.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             await endUtterance()
             return
         }
 
-        let turns = diarizationTurns(from: utteranceStart, to: endTime)
+        let fallback = ASRSegment(text: trimmed, source: source, startTime: utteranceStart,
+                                  endTime: endTime, utteranceId: utteranceId)
+        guard diarizer != nil else {
+            onEvent?(.finalized(segment: fallback))
+            await endUtterance()
+            return
+        }
+        let audio = speakerAudio(from: utteranceStart, to: endTime)
         let origin = asrAudioStartTime ?? utteranceStart
         let tokens = (result?.timings ?? []).map {
             TimedTextToken(
@@ -824,51 +1011,78 @@ private final class SourceASR: @unchecked Sendable {
                 startTime: origin + $0.startTime,
                 endTime: origin + $0.endTime)
         }
-        // Preserve Nemotron's exact decoded text when diarization is disabled or
-        // unavailable; token-piece reconstruction is only needed to split turns.
+        onEvent?(.previewFinal(fallback))
+        speakerFinalizer.submit(fallback: fallback, analyze: { [weak self] in
+            self?.speakerSegments(for: fallback, audio: audio, tokens: tokens) ?? [fallback]
+        }, deliver: { [weak self] segments in
+            if segments.count == 1, let segment = segments.first {
+                self?.onEvent?(.finalized(segment: segment))
+            } else {
+                self?.onEvent?(.finalizedGroups(segments))
+            }
+        })
+        await endUtterance()
+    }
+
+    private func speakerSegments(
+        for fallback: ASRSegment, audio: SpeakerAudio?, tokens: [TimedTextToken]
+    ) -> [ASRSegment] {
+        let startTime = fallback.startTime, endTime = fallback.endTime
+        let turns = audio.map { diarizationTurns($0, from: startTime, to: endTime) } ?? []
+        // A diarization gap at the start of an utterance is common for short
+        // speech. Only two measured speakers justify splitting the decoded text.
         let aligned = turns.isEmpty ? [] : SpeakerTurnAligner.align(tokens: tokens, turns: turns)
+        let measuredSpeakers = Set(aligned.compactMap(\.speakerLabel))
 
         // Every label leaves through `continuity`, so a short utterance the
         // diarizer declined to segment inherits the current speaker instead of
         // going out unlabelled. See `SpeakerContinuity`: pyannote returns no
         // speaker below `minSpeechDuration`, which is exactly what "對" / "OK" /
         // a backchannel is, and those were losing their name every time.
-        if aligned.isEmpty {
-            let resolved = dominantSpeaker(in: turns, from: utteranceStart, to: endTime)
-            onEvent?(.finalized(segment: ASRSegment(
-                text: trimmed, source: source, startTime: utteranceStart, endTime: endTime,
-                speakerLabel: continuity.label(resolved, from: utteranceStart, to: endTime)
-            )))
-        } else {
-            for group in aligned {
-                onEvent?(.finalized(segment: ASRSegment(
-                    text: group.text,
-                    source: source,
-                    startTime: group.startTime,
-                    endTime: group.endTime,
-                    speakerLabel: continuity.label(
-                        group.speakerLabel, from: group.startTime, to: group.endTime)
-                )))
-            }
+        if measuredSpeakers.count <= 1 {
+            let start = aligned.first?.startTime ?? startTime
+            let end = aligned.last?.endTime ?? endTime
+            let resolved = measuredSpeakers.first
+                ?? dominantSpeaker(in: turns, from: startTime, to: endTime)
+            return [ASRSegment(
+                text: fallback.text, source: source, startTime: start, endTime: end,
+                speakerLabel: continuity.label(resolved, from: start, to: end),
+                utteranceEndTime: endTime, utteranceId: fallback.utteranceId
+            )]
         }
-        await endUtterance()
+        return aligned.enumerated().map { index, group in
+            ASRSegment(
+                text: group.text, source: source,
+                startTime: group.startTime, endTime: group.endTime,
+                speakerLabel: continuity.label(group.speakerLabel, from: group.startTime, to: group.endTime),
+                utteranceEndTime: endTime,
+                position: index == aligned.count - 1 ? .lastGroup : .earlierGroup,
+                utteranceId: fallback.utteranceId
+            )
+        }
+    }
+
+    private struct SpeakerAudio: Sendable {
+        let samples: [Float]
+        let startTime: TimeInterval
     }
 
     /// pyannote consumes raw PCM around the utterance; its ten-second inference
     /// windows are independent of Nemotron's chunk tier and finalization points.
-    private func diarizationTurns(from startTime: TimeInterval, to endTime: TimeInterval) -> [SpeakerTurn] {
-        guard diarizationEnabled else { return [] }
-        guard let diarizer, let bufferStart = diarizationAudioStartTime, !diarizationAudio.isEmpty else {
-            return []
-        }
-
+    private func speakerAudio(from startTime: TimeInterval, to endTime: TimeInterval) -> SpeakerAudio? {
+        guard let bufferStart = diarizationAudioStartTime else { return nil }
         let contextStart = max(bufferStart, startTime - Self.diarizationPreRoll)
         let startIndex = min(diarizationAudio.count, max(0, Int((contextStart - bufferStart) * 16_000)))
         let endIndex = min(diarizationAudio.count, max(startIndex, Int((endTime - bufferStart) * 16_000)))
-        guard endIndex > startIndex else { return [] }
-        let audio = Array(diarizationAudio[startIndex..<endIndex])
-        guard let result = try? diarizer.performCompleteDiarization(
-            audio, sampleRate: 16_000, atTime: contextStart) else { return [] }
+        guard endIndex > startIndex else { return nil }
+        return SpeakerAudio(samples: Array(diarizationAudio[startIndex..<endIndex]),
+                            startTime: bufferStart + Double(startIndex) / 16_000)
+    }
+
+    private func diarizationTurns(_ audio: SpeakerAudio, from startTime: TimeInterval,
+                                  to endTime: TimeInterval) -> [SpeakerTurn] {
+        guard let diarizer, let result = try? diarizer.performCompleteDiarization(
+            audio.samples, sampleRate: 16_000, atTime: audio.startTime) else { return [] }
 
         // Resolve the labels BEFORE compacting the database.
         //

@@ -6,7 +6,7 @@ help:
 	@echo "  make project     Generate FlowTranslate.xcodeproj (xcodegen)"
 	@echo "  make build       Build the FlowTranslateCore package"
 	@echo "  make test        Run core unit tests (works under CLT or Xcode)"
-	@echo "  make run         Build the app (Debug) and launch it in place (dev loop)"
+	@echo "  make run         Alias of make install (single installed Release)"
 	@echo "  make install     Build Release and install/update into /Applications"
 	@echo "  make dmg         Build a distributable .dmg (requires Xcode)"
 	@echo "  make clean       Remove build artifacts"
@@ -15,7 +15,7 @@ bootstrap:
 	bash Scripts/bootstrap.sh
 
 project:
-	xcodegen generate
+	bash Scripts/generate-project.sh
 
 run:
 	bash Scripts/run-app.sh
@@ -33,4 +33,4 @@ dmg:
 	bash Packaging/build_dmg.sh
 
 clean:
-	rm -rf .build Packaging/build DerivedData
+	rm -rf .build build Packaging/build DerivedData

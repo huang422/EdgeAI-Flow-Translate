@@ -65,20 +65,33 @@ struct PromptComposerView: View {
     /// scroll inside themselves; the inspector scrolls inside itself when the
     /// window is short.
     var body: some View {
-        HStack(alignment: .top, spacing: 16) {
-            editorColumn
-            inspectorColumn
-                .frame(width: Self.inspectorWidth)
+        GeometryReader { geometry in
+            if geometry.size.width >= 900 { // 940 pt window minus its padding
+                HStack(alignment: .top, spacing: 16) {
+                    ScrollView {
+                        editorColumn(inputHeight: composer.artifact == nil ? max(180, geometry.size.height - 100) : 130)
+                            .frame(minHeight: geometry.size.height, alignment: .topLeading)
+                    }
+                    inspectorColumn.frame(width: Self.inspectorWidth)
+                }
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        editorColumn(inputHeight: 180)
+                        inspectorContent
+                    }
+                    .frame(maxWidth: .infinity, alignment: .topLeading)
+                }
+            }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
         .sheet(isPresented: $showRulebook) {
             RulebookEditorView(rulebook: Binding(
                 get: { composer.rulebook },
                 set: { composer.rulebook = $0 }
             ))
         }
-        .task { await refreshDictationLanguages() }
-        .task(id: vm.settings.promptDictationEngine) { await refreshDictationLanguages() }
+        .task { if !AppEnvironment.isUIFixture { await refreshDictationLanguages() } }
+        .task(id: vm.settings.promptDictationEngine) { if !AppEnvironment.isUIFixture { await refreshDictationLanguages() } }
     }
 
     /// Wide enough for a segmented control of four options plus its explanation
@@ -89,17 +102,17 @@ struct PromptComposerView: View {
     // MARK: - Editor column
 
     /// What you do, top to bottom, in the order you do it.
-    private var editorColumn: some View {
+    private func editorColumn(inputHeight: CGFloat) -> some View {
         VStack(alignment: .leading, spacing: 10) {
             inputSection
-                .frame(maxHeight: composer.artifact == nil ? .infinity : Self.settledInputHeight)
+                .frame(height: inputHeight)
             // Directly under the request. These four act on the text immediately
             // above them and are the most-used controls on the page.
             actionRow
             if let message = installMessage { messageRow(message) }
             if let comparison = composer.comparison { savingsRow(comparison) }
             if !composer.findings.isEmpty { lintSection }
-            if composer.artifact != nil { outputSection }
+            if composer.artifact != nil { outputSection.frame(height: 260) }
             if !composer.statusMessage.isEmpty { statusRow }
         }
         .frame(maxWidth: .infinity, alignment: .topLeading)
@@ -121,15 +134,17 @@ struct PromptComposerView: View {
 
     /// Everything that changes what Compile produces, out of the way of using it.
     private var inspectorColumn: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 14) {
-                settingsGroup
-                syncHint
-                modelStateRow
-            }
-            .padding(.bottom, 4)
+        ScrollView { inspectorContent }
+            .scrollIndicators(.automatic)
+    }
+
+    private var inspectorContent: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            settingsGroup
+            syncHint
+            modelStateRow
         }
-        .scrollIndicators(.automatic)
+        .padding(.bottom, 4)
     }
 
     // MARK: - Input
@@ -397,7 +412,21 @@ struct PromptComposerView: View {
     /// follows — the row previously mixed bilingual labels with Chinese-only
     /// ones, so it read as two features bolted together.
     private var actionRow: some View {
-        HStack(spacing: 10) {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) { editorActionButtons; Spacer(); dictationToggle }
+            VStack(alignment: .leading, spacing: 10) {
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 10) { editorActionButtons }
+                    VStack(alignment: .leading, spacing: 8) { editorActionButtons }
+                }
+                dictationToggle
+            }
+        }
+        .font(.system(size: 12))
+        .fixedSize(horizontal: false, vertical: true)
+    }
+
+    @ViewBuilder private var editorActionButtons: some View {
             Button {
                 Task {
                     if composer.phase == .listening || composer.phase == .warming {
@@ -414,8 +443,8 @@ struct PromptComposerView: View {
             // live during compile and tidy, where the click is inert — and
             // `.finishing` belongs on the inert side too, since the drain is
             // already committed.
-            .disabled(!composer.canRecord && composer.phase != .listening
-                      && composer.phase != .warming)
+            .disabled(AppEnvironment.isUIFixture || (!composer.canRecord && composer.phase != .listening
+                      && composer.phase != .warming))
 
             Button {
                 composer.compile()
@@ -426,7 +455,7 @@ struct PromptComposerView: View {
             // Blocked while the model is still downloading. Compiling then does
             // work — it queues behind the download — but the button would sit
             // silent for minutes, which is indistinguishable from a hang.
-            .disabled(!composer.canCompile || isModelDownloading)
+            .disabled(!composer.canCompile || isModelDownloading || AppEnvironment.isUIFixture)
             .help(modelStateHelp)
 
             Button {
@@ -437,7 +466,7 @@ struct PromptComposerView: View {
             .help("Fixes typos, mangled terms and punctuation, and re-splits sentences — for typed input as well as dictated")
             // Tidy is a model pass over the passage, so it waits on the same
             // download Compile does.
-            .disabled(!composer.canCompile || isModelDownloading)
+            .disabled(!composer.canCompile || isModelDownloading || AppEnvironment.isUIFixture)
 
             Button {
                 composer.clear()
@@ -446,10 +475,9 @@ struct PromptComposerView: View {
             }
             .disabled(composer.inputText.isEmpty && composer.artifact == nil)
 
-            Spacer()
+    }
 
-            // The same control the captions page puts on its own action row, in
-            // the same place: this is one of the app's two headline features.
+    private var dictationToggle: some View {
             HotkeyToggle(
                 title: "口述快捷鍵 Dictate",
                 keys: "⌃⌥Space",
@@ -460,10 +488,7 @@ struct PromptComposerView: View {
                 help: "在任何 app 按 ⌃⌥Space 口述，結果直接插入游標位置（插入 "
                     + "\(vm.settings.promptQuickInsertMode.displayName)）。"
             )
-        }
-        .font(.system(size: 12))
-        .lineLimit(1)
-        .fixedSize(horizontal: false, vertical: true)
+            .disabled(AppEnvironment.isUIFixture)
     }
 
     /// Nudges towards syncing, but only when the prompt would actually benefit.

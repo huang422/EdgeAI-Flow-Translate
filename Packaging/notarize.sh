@@ -24,8 +24,8 @@ DMG_PATH="Packaging/build/FlowTranslate.dmg"
 [ -f "$DMG_PATH" ] || { echo "error: DMG not found at $DMG_PATH (run build_dmg.sh first)"; exit 1; }
 
 echo "==> Sanity check: app inside the staged export is Developer ID signed"
-codesign --verify --strict --verbose=1 "Packaging/build/export/FlowTranslate.app"
-if codesign -dv "Packaging/build/export/FlowTranslate.app" 2>&1 | grep -q "Signature=adhoc"; then
+codesign --verify --strict --verbose=1 "Packaging/build/export.noindex/FlowTranslate.app"
+if codesign -dv "Packaging/build/export.noindex/FlowTranslate.app" 2>&1 | grep -q "Signature=adhoc"; then
     echo "error: the staged app is ad-hoc signed — DEVELOPER_ID_APP was not set"
     echo "       when build_dmg.sh ran. Re-run build_dmg.sh with signing env."
     exit 1

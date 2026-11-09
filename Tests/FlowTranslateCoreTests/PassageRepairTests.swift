@@ -294,6 +294,89 @@ struct PassageChunkerTests {
         }
     }
 
+    /// A blank line is a piece whose *text is empty*, so "has this chunk taken a
+    /// piece yet?" cannot be answered by testing the accumulated string — it is
+    /// still empty after a blank line, and the piece that follows was treated as
+    /// the first one, dropping the newline between them. That silently deletes a
+    /// paragraph break the speaker made.
+    ///
+    /// Only reachable above the budget, and only at the very front of the text: a
+    /// blank line costs nothing, so it can never be the piece that overflows a
+    /// chunk, and every chunk after a boundary therefore starts on real content.
+    /// The round trip above has a blank line in it and stays green because it
+    /// sits in the middle. Every position is swept anyway rather than just the
+    /// front — which positions are reachable is the chunker's business, and the
+    /// test should not have to be re-derived when it changes.
+    @Test("a blank line at the start of a chunk survives the round trip")
+    func blankLinesAtChunkStartsRoundTrip() {
+        let body = (1...90).map { "This is line number \($0) of a dictated list." }
+        for position in 0...body.count {
+            var lines = body
+            lines.insert("", at: position)
+            let text = lines.joined(separator: "\n")
+            let chunks = PassageChunker.chunks(text)
+            #expect(
+                PassageChunker.rejoin(chunks.map(\.text), chunks: chunks) == text,
+                "round trip failed with a blank line at index \(position)"
+            )
+        }
+    }
+
+    /// The identity again, but over generated text rather than four hand-picked
+    /// shapes — because the hand-picked ones all sat under the budget or put
+    /// their blank line somewhere harmless, and the single-chunk fast path
+    /// returns the input unchanged, so a green result there proves nothing about
+    /// the splitting loop.
+    ///
+    /// Seeded, so a failure is reproducible rather than a rumour.
+    @Test("the rejoin identity holds over generated text")
+    func chunkRejoinIdentityOverGeneratedText() {
+        // Fragments chosen for the seams: blank lines, runs of newlines, CJK with
+        // no spaces to split on, trailing and leading whitespace, terminators.
+        let fragments = [
+            "", " ", "\n", "\n\n", "\t",
+            "This is a sentence in one long run.", "A short one.",
+            "no terminator here", "為何我開內建的字幕會這樣", "這是一個句子。",
+            "混合 mixed 中英 sentence.", "Line with trailing space ",
+            " leading space line", "Question? Yes! Really…", "a", "。", ".",
+        ]
+        let separators = ["", " ", "\n", "\n\n"]
+        // SplitMix64, so the sequence is the same on every machine and every run.
+        var state: UInt64 = 0xC0FF_EE12_3456_789A
+        func nextRandom(_ bound: Int) -> Int {
+            state &+= 0x9E37_79B9_7F4A_7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58_476D_1CE4_E5B9
+            z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
+            return Int((z ^ (z >> 31)) % UInt64(bound))
+        }
+
+        var overBudget = 0
+        for _ in 0..<400 {
+            // Up to 400 fragments: the budget is ~700 tokens, and a smaller
+            // ceiling never reaches it.
+            var text = ""
+            let pieces = nextRandom(401)
+            for index in 0..<pieces {
+                text += fragments[nextRandom(fragments.count)]
+                if index < pieces - 1 { text += separators[nextRandom(separators.count)] }
+            }
+            // A text that says nothing yields no chunks by design; callers treat
+            // that as "leave the original alone".
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
+            if TokenEstimator.estimate(text) > PassageChunker.budget { overBudget += 1 }
+
+            let chunks = PassageChunker.chunks(text)
+            #expect(
+                PassageChunker.rejoin(chunks.map(\.text), chunks: chunks) == text,
+                "round trip failed for \(String(reflecting: text.prefix(200)))"
+            )
+        }
+        // Guards the guard: if generation drifts back under the budget the loop
+        // silently stops testing the splitting path at all.
+        #expect(overBudget > 100, "only \(overBudget) samples exceeded the budget")
+    }
+
     @Test("a long input really does split")
     func longInputSplits() {
         let long = (1...90).map { "This is sentence number \($0) in one long run." }

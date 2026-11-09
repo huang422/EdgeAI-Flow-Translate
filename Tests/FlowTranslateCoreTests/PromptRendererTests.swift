@@ -169,6 +169,41 @@ import Testing
         #expect(!symbols.content.contains("NO_DEPS = "))
     }
 
+    /// `compact` is the default, and `off` is the mode that promises to keep the
+    /// user's wording — so this pair is the ordinary path, not a corner.
+    ///
+    /// Both `off` arms have to expand the **visible** IR. Expanding the un-gated
+    /// one printed `out_of_scope`, `risks` and `tools` — the three sections
+    /// `compact` exists to drop — while every other symbol mode dropped them, and
+    /// the savings meter compared a prompt that had different sections in it from
+    /// the one on screen.
+    @Test func compactDropsInferredSectionsInEveryOffArm() {
+        var ir = sampleIR()
+        ir.failureCases = ["The retry loop could mask a permanent failure"]
+
+        // Both ways into `off`: asked for directly, and reached by downgrade,
+        // which is what `expandsRecognisedConstraints` selects.
+        for expandsRules in [false, true] {
+            let content = PromptRenderer.render(ir, options: .init(
+                kind: .prompt, symbolMode: .off, detail: .compact,
+                expandsRecognisedConstraints: expandsRules)).content
+
+            #expect(!content.contains("out_of_scope"), "expandsRules=\(expandsRules)")
+            #expect(!content.contains("risks"), "expandsRules=\(expandsRules)")
+            #expect(!content.contains("<tools>"), "expandsRules=\(expandsRules)")
+            // Still a real prompt: only the inferred sections went.
+            #expect(content.contains("<task>"))
+            #expect(content.contains("<constraints>"))
+        }
+
+        // …and `full` still prints them, so the assertions above are testing the
+        // gate rather than an IR that never had the sections.
+        let full = PromptRenderer.render(ir, options: .init(
+            kind: .prompt, symbolMode: .off, detail: .full)).content
+        #expect(full.contains("out_of_scope"))
+        #expect(full.contains("risks"))
+    }
+
     @Test func bareSymbolsOnlyWhenTheRulebookIsSynced() {
         let ir = sampleIR()
 

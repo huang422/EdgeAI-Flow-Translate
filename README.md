@@ -12,16 +12,16 @@
 > **⬇️ [Download the latest FlowTranslate.dmg](../../releases/latest/download/FlowTranslate.dmg)** — macOS on Apple Silicon. Open the DMG and drag **Flow Translate** to **Applications**.
 
 Flow Translate turns the audio of online meetings (Zoom / Teams / Google Meet) and
-English videos into a floating, two-line caption overlay — the first line is the
-recognized speech, the second line is a live translation — while building a full
+English videos into a floating live caption overlay for recognized speech, with
+an optional live translation below it, while building a full
 bilingual transcript and an end-of-meeting summary. **Everything runs on-device**;
 the only network access is a one-time model download.
 
 - **Speech recognition** — NVIDIA **Nemotron‑3.5 Streaming ASR Multilingual (0.6B)** on the Apple Neural Engine via [FluidAudio](https://github.com/FluidInference/FluidAudio). 32 locales, or **Auto** for mixed-language audio.
 - **Live translation** — default English → Traditional Chinese, live on the in-progress sentence too. Engine: **Apple** (on-device Translation framework, Qwen fallback) or **Qwen** (MLX Qwen3-4B-Instruct-2507 with bilingual rolling context). The Qwen path is tuned for real time: a bounded queue keeps the newest sentences fresh, common phrases translate instantly from a lookup table, and a guard fixes Simplified-character leakage.
 - **Speaker diarization** (on by default) — Core ML `pyannote/speaker-diarization-3.1` + WeSpeaker, labelling mic and system audio independently. Names appear in captions, transcripts, summaries and exports.
-- **Floating, click-through overlay** — stacked caption units, original above translation. **Nothing moves or changes appearance when a sentence finalizes**: one weight, full brightness, the live line marked only by a breathing dot, caret and underline, and the speaker name in a fixed-width slot. The box is pinned by its bottom edge with a fixed width — the sentence being spoken always starts on the same line, and only the top edge moves, following the top of the oldest caption as sentences finalize. **⌃⌥P** pins it so the captions stop updating while you read. Stays above full-screen meetings and passes clicks through.
-- **System audio *and* microphone**, captured separately and tagged per source, with mic echo suppressed while system audio plays.
+- **Floating, click-through overlay** — original speech appears as it is recognized. Sentence ends and available width open new lines. Already read lines roll upward with their original line breaks while the transcript records final corrections. The lower edge stays anchored. **⌃⌥P** freezes the current captions for reading and lets you scroll when the full text exceeds the available height.
+- **System audio *and* microphone**, captured separately and tagged per source, with simultaneous recognition by default. Optional playback suppression is available for speakers; leave it off with headphones.
 - **Adjustable input gain / auto-gain** — lift a quiet speaker *before* recognition so they clear the voice-activity gate, with a soft limiter so boosted peaks never clip.
 - **Full bilingual transcript**, persisted crash-safe and exportable to Markdown / TXT / SRT / VTT / JSON.
 - **Optional AI transcript correction** (off by default) — a second, non-real-time quality track. Repairs land in the transcript, summary and exports; the overlay is never rewritten and captions never wait.
@@ -53,7 +53,7 @@ the only network access is a one-time model download.
     - [High-level architecture](#high-level-architecture)
     - [Real-time data flow](#real-time-data-flow)
     - [Module map](#module-map)
-    - [Model runtimes — why ASR uses the ANE and only the summarizer uses MLX](#model-runtimes--why-asr-uses-the-ane-and-only-the-summarizer-uses-mlx)
+    - [Model runtimes — why ASR uses the ANE and Qwen uses MLX](#model-runtimes--why-asr-uses-the-ane-and-qwen-uses-mlx)
   - [Prompt Composer](#prompt-composer)
     - [The pipeline](#the-pipeline)
     - [⌃⌥Space — dictate anywhere](#space--dictate-anywhere)
@@ -96,18 +96,18 @@ No terminal required.
 
 ## Build from source (developers)
 
-**Requirements:** macOS 15+ on Apple Silicon, **Xcode 16+**, and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
+**Requirements:** macOS 15+ on Apple Silicon, **Xcode 26+**, and [XcodeGen](https://github.com/yonaskolb/XcodeGen) (`brew install xcodegen`).
 
 ```bash
 git clone <this-repo> Flow-Translate
 cd Flow-Translate
-make bootstrap          # generates FlowTranslate.xcodeproj and opens it
+make install            # verified Release into /Applications/FlowTranslate.app
 ```
 
-Then in Xcode select the **FlowTranslate** scheme and press **Run** (⌘R).
+For an explicit Xcode debugging session, use `make bootstrap` to open the generated project.
 
 The Xcode project is **generated** from [`project.yml`](project.yml) — it is not
-checked in. Re-run `make project` (or `xcodegen generate`) after adding files.
+checked in. Re-run `make project` after adding files; it also restores the reviewed dependency lock.
 
 ### Run the app on your Mac
 
@@ -120,37 +120,62 @@ checked in. Re-run `make project` (or `xcodegen generate`) after adding files.
 > sudo xcode-select -s /Applications/Xcode.app
 > ```
 
-**One command — build and launch** (no terminal juggling):
+**One command after editing in VS Code:**
 
 ```bash
-make run        # regenerates the project, builds Debug, opens FlowTranslate.app
+make install    # test → build Release → verify → update /Applications/FlowTranslate.app → launch
+make run        # compatibility alias for the same installation; no separate Debug app
 ```
 
-Or do it inside Xcode: `make bootstrap` once, then press **⌘R**.
+Both commands regenerate the project, so new or renamed Swift files are included.
+The dependency graph is fixed in `Dependencies/Package.resolved`.
+They reuse `build/release`, validate the staged app before replacing an installation,
+and preserve models, transcripts and preferences. A failed build leaves the installed
+app intact. An active app is asked to finish and quit; it is never force-killed.
+The generated build-product app is removed after a verified launch so Spotlight
+keeps only the installed app; object files and dependency caches remain reusable.
+Privacy grants may need to be renewed after an ad-hoc rebuild: use the in-app
+**Settings → Maintenance → Reset permissions** only if needed.
 
-**After you change code — redeploy & relaunch:**
-
-| What changed | Command |
-|--------------|---------|
-| Edited existing Swift files | `make run` &nbsp;(or just ⌘R in Xcode) |
-| Added / removed / renamed files | `make run` &nbsp;(it runs `xcodegen` first, so new files are picked up) |
-| Edited `project.yml` / dependencies | `make project` then `make run` |
-
-`make run` is idempotent: rebuild and relaunch as many times as you like. To force
-a clean rebuild: `make clean && make run`.
-
-**Install it like a normal app** (build a signed-as-adhoc `.app` into `/Applications`):
+Install Apple's Metal compiler once if Xcode reports it missing:
 
 ```bash
-make dmg                                   # produces Packaging/build/FlowTranslate.dmg
-open Packaging/build/FlowTranslate.dmg     # then drag Flow Translate → Applications
+xcodebuild -downloadComponent MetalToolchain
 ```
 
-On first launch macOS will ask for **Microphone** and **Screen Recording**
-permission (plus **Accessibility** the first time you use ⌃⌥Space dictation), and
-FlowTranslate offers to download its models once (cached afterwards). A local
-build is signed ad-hoc, so macOS treats each rebuild as a different app and the
-grants have to be given again — see **Settings → Maintenance → Reset permissions**.
+The app requires a macOS 26+ SDK to compile its availability-guarded Speech APIs;
+the resulting app still supports **macOS 15+**. Conda/Python is not required to
+build or run the app. `make bootstrap` / Xcode remain available for debugging.
+
+`make dmg` packages the same Release build when a distributable installer is needed.
+Local `make install` does not create a Git tag or a GitHub Release.
+
+The main window starts at 1120 × 820 pt, constrained to the available display.
+Its minimum is 640 × 520 pt. Short windows scroll rather than clipping content;
+below 940 pt the Prompt Composer inspector moves below the editor. Floating
+caption presentation is independent of these main-window layout rules.
+
+### Shared model cache
+
+Rebuilding or replacing the app does not download another model set:
+
+- ASR / VAD / diarization: `~/Library/Application Support/FluidAudio/Models/`.
+- Qwen: `~/Library/Application Support/FlowTranslate/models/`.
+- Latin and Multilingual ASR each have distinct 560 / 1120 / 2240 ms builds.
+  Keeping all six preserves every language/tier switch (~3.6 GB total ASR).
+  These are functional variants, not duplicate app installations.
+- Qwen is one shared copy (~2.1 GiB on disk) for translation, summaries and prompts.
+  Apple's translation/dictation assets remain managed by macOS.
+
+`make clean` removes this checkout's build artifacts, never model caches or conda.
+
+### Isolated layout checks
+
+After building Release, `bash Scripts/prepare-ui-fixture.sh first-launch 640 520`
+prints a temporary app path. Open that app for a clean first-launch layout with
+separate preferences/transcripts and no model downloads or permission requests.
+Other scenarios are `summary`, `prompt-result` and `model-prompt`. Quit and remove
+the temporary fixture after checking it. It is never the installed application.
 
 ### The core package
 
@@ -316,7 +341,7 @@ sequenceDiagram
     R->>S: AudioChunk
     S->>S: Silero VAD + append/process
     S-->>O: interim text (line 1, immediate)
-    Note over S: silence > 0.3s (video) / 0.8s (meeting) or sentence end ⇒ finalize
+    Note over S: VAD pause 0.7s (video) / 0.8s (meeting), bounded grace if unfinished
     S->>C: finalized segment
     C->>O: cleaned text (line 1)
     C->>D: append TranscriptSegment (persisted)
@@ -354,7 +379,7 @@ lets the record improve without the captions jittering.
 | `Support/` | App | Permissions, settings persistence, global hotkeys, MLX memory governance |
 | `FlowTranslateCore` | Package | Models, protocols, transcript store, exporter, summarizer, text utils — pure & unit-tested |
 
-### Model runtimes — why ASR uses the ANE and only the summarizer uses MLX
+### Model runtimes — why ASR uses the ANE and Qwen uses MLX
 
 Flow Translate deliberately uses a **hybrid runtime**, picking the best accelerator
 per task rather than putting everything on MLX:
@@ -782,15 +807,16 @@ Open the **gear icon** in the top-right. Preferences are persisted automatically
 - **First caption (recognition) language** — any of Nemotron's 32 locales, or **Auto**. Default `en-US`. **Naming the language is an accuracy setting, not just a lock:** a Latin-script locale loads a vocabulary-pruned build (2,828 tokens instead of 13,087), so there are far fewer confusable words; Auto always loads the full multilingual one. Mandarin has one entry (`zh-CN`) because the model has one — no shipped variant's tokenizer contains a `zh-TW` tag — and the Traditional output is produced afterwards by the script guard, on the live line as well as the finalized one.
 - **口述引擎 Dictation engine** — `自動`(default) / `Mac 內建` / `Nemotron`. Automatic resolves to the built-in recognizer on macOS 26 and to Nemotron below it; a value stored on a newer Mac degrades safely on an older one, and the row says so on a Mac that cannot run it. The dictation language is **中文 / 英文** on both engines, plus **混說** on Nemotron only — the built-in `DictationTranscriber` takes exactly one locale for a whole session and has no multi-language form, so the option is not offered where it cannot be honoured. (It used to be, and resolved silently to the Mac's *interface* language, which is the single biggest reason this engine could recognize worse than the system's own dictation.) The transcriber is configured from Apple's own `progressiveLongDictation` preset rather than by hand, and it is fed 16 kHz mono — the rate it asks for, so nothing is resampled and no band is lost. **The built-in recognizer downloads nothing from this app**: the framework ships with macOS and its per-language assets are the system's, fetched once on first use and shared with system dictation, so a language already set up in *System Settings → Keyboard → Dictation* costs nothing. ⌃⌥Space finishes a running dictation, and abandons one that has not produced words yet (while a model is still downloading or loading); ⎋ cancels at any stage, including mid-compile, and the panel's **✕** does the same. Neither needs a permission: ⎋ is claimed as a global hot key for the length of the session (so it works from any application on any display, and is given back the moment the panel closes), and ✕ is a button on a window that is already on screen.
 - **Latency tier (advanced)** — `560ms` (default) / `1120ms` / `2240ms`. **Not an accuracy setting.** FluidAudio measures 2.28% / 2.28% / 2.46% WER across the three and states that "WER is neutral across tiers (within n=100 noise)"; what changes is chunk latency and throughput (42.1× / 65.0× / 93.6× RTFx). 560ms puts words on screen while the speaker is still talking; 2240ms is FluidAudio's own default and costs the least CPU. Dictation always uses `1120ms` — it holds the best measured WER jointly with 560ms at 1.5× the throughput, and its encoder is quicker to compile onto the ANE on first load, which is the wait you actually feel before the first word is recognized.
+- **Microphone playback suppression** — off by default. Enable only when using speakers; it suppresses all local speech during system playback and is not acoustic echo cancellation.
 - **AI transcript correction** — off by default. Finalized sentences are repaired by the shared Qwen model **in the transcript only**, on a queue behind live translation; the overlay is never rewritten. Every repair passes a safety gate (script preservation, length ratio, digit preservation, edit distance). Keeps the ~2.3 GB model resident for the meeting.
 - **Speaker diarization** — **on by default.** Core ML `pyannote/speaker-diarization-3.1` + WeSpeaker, run independently on each source, splitting text at measured speaker changes rather than ASR chunk boundaries. Costs ~60 MB and one inference per finalized sentence.
 
-  Speakers are named `Claude Mango`, not `Speaker 1` — a model name and a fruit, drawn without replacement so no two share either half. The band shows the model half alone (its speaker column is reserved on every row); the full name goes to transcript, summary and export. Past ten speakers the pools are exhausted and numbering resumes (`Speaker 11`).
+  Speakers are named `Claude Mango`, not `Speaker 1` — a model name and a fruit, drawn without replacement so no two share either half. The band shows the full name wrapped in a reserved speaker column; the same name goes to transcript, summary and export. Past ten speakers the pools are exhausted and numbering resumes (`Speaker 11`).
 
   **Sensitivity** exists because the two failure modes need opposite corrections. Two people on one mic sit far apart in embedding space and *over*-segment; five on a conference call are compressed through one channel and *under*-segment. `偏合併` for the first, `偏分離` for the second, `標準` on FluidAudio's documented 0.65.
 - **Carry acoustic context (experimental)** — off. The encoder's 3.36 s of history is normally cleared per sentence. Keeping it may sharpen opening words but skips the language-lock re-seed and can run one sentence into the next. No WER harness here, so it ships as a switch to compare on your own speech.
 - **Second caption** — on/off; target **Traditional Chinese** or **English**; engine **Apple** (fastest) or **Qwen** (context-aware; forced when the first caption is **Auto**).
-- **Overlay presentation** — font size (12–22), background opacity, primary line, visible lines (1–3), interim style, click-through, auto-close on stop. *Visible lines* sets how many finalized captions are kept. Inside the box there are two areas: the sentence being spoken has its own **reserved** area at the foot, so its first row always starts on the same line and it grows downward into space already set aside for it; the finalized lines sit above it at their own height, so the top edge of the box lands on the top of the oldest caption with no reserved blank above it. **Only the top edge ever moves, and only when a sentence finalizes** — the left, right and bottom edges are fixed, and nothing resizes while anybody is talking. Captions wrap rather than being shrunk — up to two rows each with one for the translation — and your caption size is never adjusted to make text fit. The live area reserves those rows whether or not the sentence uses them, which is what keeps the bottom edge and the translation row still while somebody is speaking; a short caption shows the reserved row as blank space, and that is the price of an overlay that does not move. All lines render at the same brightness; the live one is marked by its dot, caret and underline. **⌃⌥C** toggle · **⌃⌥P** pin · **⌃⌥=** / **⌃⌥-** font size.
+- **Overlay presentation** — font size (12–22), background opacity, primary language order, visible count (1–3 complete bilingual units), interim style, click-through and auto-close on stop. The count includes the live unit when shown. The bottom anchor stays fixed. The top can grow as a partial wraps and settles to the actual text height when the paragraph is finalized. Controls sit below the text. For captions taller than the space available, pin to scroll, or turn off click-through to scroll live. Reduce Motion removes roll and fade animations. **⌃⌥C** toggle · **⌃⌥P** pin · **⌃⌥=** / **⌃⌥-** font size.
 - **Audio input** — fixed **input gain** per source (0–30 dB) plus **Auto-gain** (rate-limited, noise-gated, boost-only) with a soft limiter. Off by default.
 
 Defaults match the primary use case: first caption **`en-US`** at the **560 ms** (most real-time) tier, second caption **on**, targeting **Traditional Chinese**, with **speaker diarization on**.
@@ -805,7 +831,7 @@ Defaults match the primary use case: first caption **`en-US`** at the **560 ms**
 | Translation after finalize | < 1 s |
 | ASR runtime | ANE-accelerated, RTFx ≫ 1× on M1 Pro |
 | Overlay | 60 fps, no stutter |
-| Memory | Real-time loop stays light: mic + system audio run independent streaming pipelines over **one shared copy** of the ASR weights (~633 MB, not two), and one shared Qwen (loaded on demand, freed after) + bounded MLX cache so memory returns near idle after a meeting |
+| Memory | Real-time loop stays light: mic + system audio run independent streaming pipelines over **one shared copy** of the ASR weights (~633 MB, not two), and one shared Qwen (loaded on demand, freed after) + bounded MLX cache. ASR weights stay resident between sessions; starting a summary or changing variants releases them |
 
 ---
 
@@ -880,11 +906,8 @@ PR** tags the version, creates the GitHub Release, and builds + uploads the DMG.
 # 0. Start from an up-to-date main
 git checkout main && git pull
 
-# 1. Verify locally (same checks CI runs)
-make test                                        # core unit tests
-make project                                     # regenerate the Xcode project (if project.yml changed)
-xcodebuild -project FlowTranslate.xcodeproj -scheme FlowTranslate \
-  -configuration Debug -destination 'platform=macOS' build
+# 1. Run core tests, verify the Release build, and install it locally
+make install
 
 # 2. Commit with a Conventional-Commit message — the type drives the next
 #    version: feat: → minor, fix: → patch, feat!: / BREAKING CHANGE → major
@@ -909,16 +932,21 @@ You can still build locally:
 make dmg                          # builds Release .app → FlowTranslate.dmg
 ```
 
-To notarize for distribution outside the App Store (optional), set
-`DEVELOPER_ID_APP` and a `NOTARY_PROFILE`, then:
+For a notarized download, install the Developer ID Application certificate and
+private key in the build Mac's keychain and set up a `notarytool` credential
+profile. Export both values **before** building the DMG:
 
 ```bash
+export DEVELOPER_ID_APP="Developer ID Application: Your Name (TEAMID)"
+export NOTARY_PROFILE="your-notary-profile"
+make dmg
 bash Packaging/notarize.sh
 ```
 
-The release workflow uploads the DMG to the GitHub Release that release-please
-created; if signing secrets (`DEVELOPER_ID_APP`, `NOTARY_PROFILE`) are configured
-it also notarizes.
+The release workflow uploads the DMG to the release created by release-please.
+Its unsigned build is labelled as such. The signing path requires the certificate
+with its private key and the notary profile to be provisioned on the build runner.
+The two secret names select those credentials on that runner.
 
 ---
 
@@ -928,10 +956,13 @@ it also notarizes.
 |---------|-----|
 | No system audio captions | Grant **Screen Recording** in System Settings → Privacy & Security, then relaunch. |
 | No microphone captions | Grant **Microphone** permission. |
+| ASR stays on “Loading model” | Opening the app or changing the recognition language or latency tier while idle starts loading the selected downloaded model in the background. Downloaded files still need a Core ML memory load and may need device specialization. Wait for Listening before speaking. A failed load shows an error and the next Start retries it. Consecutive sessions and languages sharing the same on-disk variant reuse weights. A summary frees the ASR weights and warms the selected variant again after releasing the summary model. |
+| Memory after closing the control window | Stop keeps ASR weights available for the next meeting. Closing the control window stops both audio sources, drains accepted captions and releases ASR and Qwen. Opening the control window again prewarms the selected cached ASR model. ⌘Q completes cleanup and exits the process. |
+| Overlay shortcut does nothing | Use `/Applications/FlowTranslate.app`; isolated QA bundles intentionally disable global shortcuts and are marked as tests. Close other running copies. Registration conflicts are reported in the status line. |
 | Permission toggle looks ON but capture still fails (after reinstalling/updating the app) | macOS keyed the old grant to the previous build's code signature. Open **Settings → Maintenance → Reset permissions** (or run `tccutil reset <service> dev.flowtranslate.app` for `Microphone`, `ScreenCapture` and `Accessibility`), relaunch, and grant again. The in-app **Uninstall** clears these entries automatically. |
 | Dictated text never reaches the cursor | **Accessibility** is missing — it is what lets the app type into another application. The text is put on the clipboard instead, so nothing is lost: paste it. The panel offers an **開啟設定** button, and **Settings → Prompt → 權限 Permissions** shows the same row. A grant made while the app is running is invisible to it, so relaunch afterwards. |
 | ⎋ does not cancel a dictation | Use the **✕** on the panel — it always works. ⎋ is claimed as a global hot key only while a dictation is live, so if it is dead another process already owns that key. |
-| First start sits on "Loading model…" | First run downloads the ~600 MB ASR model — wait for the progress to finish (needs network once). If interrupted, the app detects the partial download and re-fetches it automatically. |
+| First start shows model download progress | A missing ASR variant needs a one-time download of about 600 MB. The app detects and retries incomplete downloads. The separate Core ML load can still take time after the files are present. |
 | Translation line empty | Apple pairs download a one-time language pack on first use. For the **Qwen 模型** engine / **auto-detect** / Apple-unsupported pairs the status line shows the Qwen model loading — the second caption appears once it's ready. During very fast speech the Qwen engine keeps the newest sentences fresh and may skip the translation of an older line that has already scrolled away. |
 | Captions look garbled in noise | Silero VAD gates non-speech well, but heavy background music still reduces ASR quality. |
 | Overlay blocks clicks | Click-through is on by default; check the **Click-through** toggle in Settings. |

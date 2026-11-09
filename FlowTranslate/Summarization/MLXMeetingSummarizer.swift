@@ -54,12 +54,15 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
 
         // ---- Map: condense the transcript into compact English notes ----
         let condensed = try await condense(lines) { p in progress?(0.15 + 0.45 * p) }
+        try Task.checkCancellation()
         progress?(0.6)
 
         // ---- Reduce: one structured summary per language ----
         let english = try await summarizeOne(condensed, language: .english, sessionId: session.id)
+        try Task.checkCancellation()
         progress?(0.8)
         let chinese = try await summarizeOne(condensed, language: .chinese, sessionId: session.id)
+        try Task.checkCancellation()
         progress?(1.0)
         return (english, chinese)
     }
@@ -75,6 +78,7 @@ public final class MLXMeetingSummarizer: MeetingSummarizing {
 
         var notes: [String] = []
         for (i, chunk) in chunks.enumerated() {
+            try Task.checkCancellation()
             // On a per-chunk failure keep the raw chunk rather than aborting the
             // whole summary.
             let note = await host.generate(

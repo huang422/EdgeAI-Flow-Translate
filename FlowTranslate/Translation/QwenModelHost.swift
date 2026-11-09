@@ -40,8 +40,10 @@ final class QwenModelHost: @unchecked Sendable {
 
     /// Load the model into memory (idempotent). Downloads first if needed.
     func ensureLoaded(progress: ((Double) -> Void)? = nil) async throws {
+        try Task.checkCancellation()
         if container != nil { return }
         if !downloader.isComplete { try await downloader.download(progress: progress) }
+        try Task.checkCancellation()
         // `extraEOSTokens` is belt-and-suspenders: the Qwen3 chat turn terminator
         // `<|im_end|>` is already the tokenizer's `eos_token`, but registering it
         // explicitly guarantees generation stops at the end of the assistant turn
@@ -50,7 +52,9 @@ final class QwenModelHost: @unchecked Sendable {
             directory: downloader.directory,
             extraEOSTokens: ["<|im_end|>", "<|endoftext|>"]
         )
-        container = try await LLMModelFactory.shared.loadContainer(configuration: configuration)
+        let loaded = try await LLMModelFactory.shared.loadContainer(configuration: configuration)
+        try Task.checkCancellation()
+        container = loaded
     }
 
     /// Free the model from memory and return its buffers to the OS.
@@ -152,7 +156,7 @@ final class QwenModelHost: @unchecked Sendable {
             let result = try MLXLMCommon.generate(input: input, parameters: params, context: context) { tokens in
                 if tokens.count % Self.progressStride == 0 {
                     onProgress?(tokens.count)
-                    if shouldStop() { return .stop }
+                    if Task.isCancelled || shouldStop() { return .stop }
                 }
                 return tokens.count >= maxTokens ? .stop : .more
             }

@@ -59,8 +59,7 @@ final class DictationSession {
     private let router: AudioRouter
 
     private var engine: DictationEngine?
-    private var savedChunkHandler: ((AudioChunk) -> Void)?
-    private var didBorrowRouter = false
+    private var routerLease: MicrophoneRoutingLease?
 
     /// Audio chunks handed to the engine this session.
     ///
@@ -161,23 +160,29 @@ final class DictationSession {
             throw DictationEngineError.captureFailed
         }
 
-        savedChunkHandler = router.onChunk
-        didBorrowRouter = true
         feedLock.withLock { chunksFedStorage = 0 }
-        router.onChunk = { [weak self] chunk in
-            guard let self else { return }
-            self.countChunk()
-            self.engine?.feed(chunk)
+        let lease = MicrophoneRoutingLease(router: router) { [weak self] chunk in
+            self?.countChunk()
+            engine.feed(chunk)
         }
+        routerLease = lease
 
         do {
             try await engine.startStream()
+            guard state == .warming, self.engine === engine, !Task.isCancelled, !lease.isClosed else {
+                throw CancellationError()
+            }
             // Through the router, so this is byte-for-byte the path a meeting's
             // microphone takes: same capture, same gain, same source tag.
-            try await router.enable(.microphone)
+            try await lease.enableMicrophone()
+            guard state == .warming, self.engine === engine, !Task.isCancelled else {
+                lease.closeInput()
+                throw CancellationError()
+            }
             set(.listening)
         } catch {
-            teardown()
+            lease.closeInput()
+            if self.engine === engine { teardown() }
             Self.log.error("dictation capture failed: \(error.localizedDescription, privacy: .public)")
             throw DictationEngineError.captureFailed
         }
@@ -226,16 +231,13 @@ final class DictationSession {
     }
 
     private func closeInputStreams() {
-        if didBorrowRouter { router.disable(.microphone) }
+        routerLease?.closeInput()
         engine?.closeInput()
     }
 
     private func restoreBorrowedState() {
-        if didBorrowRouter {
-            router.onChunk = savedChunkHandler
-            savedChunkHandler = nil
-            didBorrowRouter = false
-        }
+        routerLease?.closeInput()
+        routerLease = nil
         engine?.release()
         engine = nil
     }

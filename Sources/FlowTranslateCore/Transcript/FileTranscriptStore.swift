@@ -3,8 +3,9 @@ import Foundation
 /// File-backed transcript store (FR-008): persists the session and its segments
 /// to a JSON file so an unexpectedly-closed App does not lose accumulated data.
 ///
-/// Every mutation (append / translation update / end) is written through to disk
-/// atomically. On launch the App can call `recoverIncompleteSession()` to detect
+/// Mutations are checkpointed atomically at most 2.5 seconds after the first
+/// pending change; continued activity cannot postpone the checkpoint. On launch
+/// the App can call `recoverIncompleteSession()` to detect
 /// a session that was never ended (i.e. a crash) and resume or export it.
 ///
 /// This is a dependency-free alternative to SQLite that is fully unit-testable in
@@ -19,9 +20,9 @@ public final class FileTranscriptStore: TranscriptStoring {
     private let fileURL: URL
     /// Serial queue so disk writes never block the caller (the main thread).
     private let ioQueue = DispatchQueue(label: "dev.flowtranslate.transcript.io", qos: .utility)
-    /// Debounced write so a busy meeting doesn't re-encode + rewrite every sentence.
+    /// One scheduled checkpoint, shared by all changes until it fires.
     private var pendingWrite: DispatchWorkItem?
-    private let writeDebounce: TimeInterval = 2.5
+    private let checkpointInterval: TimeInterval = 2.5
     private(set) public var session: Session?
     private var _segments: [TranscriptSegment] = []
     private var indexById: [UUID: Int] = [:]
@@ -54,8 +55,11 @@ public final class FileTranscriptStore: TranscriptStoring {
 
     @discardableResult
     public func beginSession(settings: CaptionSettings) -> Session {
-        // Never overwrite a crashed session's data: archive it first (FR-008).
+        // Only a recovery archive needs a synchronous barrier. Ended
+        // sessions are already durable and queued snapshots write in order.
         archiveIncompleteSnapshot()
+        pendingWrite?.cancel()
+        pendingWrite = nil
         let s = Session(
             firstLanguage: settings.firstLanguage,
             secondLanguage: settings.secondCaptionEnabled ? settings.secondLanguage.rawValue : "",
@@ -74,6 +78,7 @@ public final class FileTranscriptStore: TranscriptStoring {
     /// of overwriting it, so the transcript survives until the user deals with it.
     private func archiveIncompleteSnapshot() {
         guard let session, session.isActive, !_segments.isEmpty else { return }
+        flush()
         let fm = FileManager.default
         guard fm.fileExists(atPath: fileURL.path) else { return }
         let f = DateFormatter()
@@ -114,17 +119,17 @@ public final class FileTranscriptStore: TranscriptStoring {
         onChange?()
     }
 
-    /// Coalesce frequent updates into at most one write per `writeDebounce`,
+    /// Coalesce frequent updates into at most one write per `checkpointInterval`,
     /// instead of re-encoding the whole transcript on every sentence. Assumes
     /// mutations happen on the main thread (they do, from the capture pipeline).
     private func scheduleWrite() {
-        pendingWrite?.cancel()
+        guard pendingWrite == nil else { return }
         let work = DispatchWorkItem { [weak self] in
             self?.pendingWrite = nil
             self?.persist()
         }
         pendingWrite = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + writeDebounce, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + checkpointInterval, execute: work)
     }
 
     /// Flush any pending write and block until it's on disk (durability point).
@@ -137,10 +142,14 @@ public final class FileTranscriptStore: TranscriptStoring {
 
     /// Deletes the persisted snapshot and clears in-memory state.
     public func clear() {
+        pendingWrite?.cancel()
+        pendingWrite = nil
         session = nil
         _segments.removeAll()
         indexById.removeAll()
-        try? FileManager.default.removeItem(at: fileURL)
+        // A queued older snapshot must finish before deletion, or it can
+        // resurrect the session after the user discarded it.
+        ioQueue.sync { try? FileManager.default.removeItem(at: fileURL) }
     }
 
     // MARK: - Disk I/O

@@ -35,9 +35,7 @@ final class MLXModelDownloader: NSObject, URLSessionDownloadDelegate, @unchecked
 
     init(repoId: String) {
         self.repoId = repoId
-        directory = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appending(component: "FlowTranslate")
+        directory = AppEnvironment.dataDirectory
             .appending(component: "models")
             .appending(component: repoId.replacingOccurrences(of: "/", with: "_"))
     }

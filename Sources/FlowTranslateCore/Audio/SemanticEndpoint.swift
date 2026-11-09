@@ -23,22 +23,29 @@ public enum SemanticEndpoint {
         // A trailing comma (either script) is an explicit "more coming".
         if let last = trimmed.last, ",，、".contains(last) { return true }
 
-        // Terminal punctuation wins: the sentence IS complete.
-        if let last = trimmed.last, ".?!。！？…".contains(last) { return false }
-
-        // Chinese connective suffixes (multi-char words, checked as suffixes).
-        for suffix in Self.danglingChineseSuffixes where trimmed.hasSuffix(suffix) {
+        // A question/exclamation is meaningful. A provisional period or
+        // ellipsis can be inserted after a connective while the speaker pauses.
+        if let last = trimmed.last, "?!！？".contains(last) { return false }
+        let stem = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: ".。…"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        for suffix in Self.danglingChineseSuffixes where stem.hasSuffix(suffix) {
             return true
         }
-
-        // English: strip trailing punctuation from the last word and look it up.
-        guard let lastWord = trimmed.split(whereSeparator: { $0.isWhitespace }).last else {
+        guard let lastWord = stem.split(whereSeparator: { $0.isWhitespace }).last else {
             return false
         }
         let normalized = lastWord.lowercased().trimmingCharacters(
             in: CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "'")).inverted)
-        return Self.danglingEnglishWords.contains(normalized)
+        return stem == trimmed
+            ? Self.danglingEnglishWords.contains(normalized)
+            : Self.danglingDespitePeriod.contains(normalized)
     }
+
+    // Avoid treating legitimate endings like "That's what it is." as incomplete.
+    private static let danglingDespitePeriod: Set<String> = [
+        "and", "or", "but", "because", "if", "although", "to", "of", "with",
+        "from", "into", "the", "a", "an", "than"
+    ]
 
     /// English words that essentially never end a sentence (conjunctions,
     /// prepositions, articles, auxiliaries mid-clause).

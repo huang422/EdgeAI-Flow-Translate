@@ -1,0 +1,552 @@
+// Template compiled with the current production views by check-caption-layout.py.
+// Only SummaryVM, outer window chrome and translation responses are fixtures.
+// The caption pane, summary card, typography, band state and overlay are real.
+// Test-only block colours identify actual bilingual paragraph animation frames.
+private struct ProbeFrames: PreferenceKey {
+  static var defaultValue: [String: CGRect] = [:]
+  static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+    value.merge(nextValue(), uniquingKeysWith: { _, n in n })
+  }
+}
+private enum Probe { static var frames: [String: CGRect] = [:] }
+extension View {
+  fileprivate func measured(_ key: String) -> some View {
+    background(
+      GeometryReader { g in
+        Color.clear.preference(key: ProbeFrames.self, value: [key: g.frame(in: .named("probe"))])
+      })
+  }
+}
+private final class SummaryVM: ObservableObject {
+  @Published var summaryText = String(
+    repeating: "會議摘要。The team agreed to deliver the next milestone.\n", count: 24)
+}
+private struct SummaryHarness: View {
+  @ObservedObject var vm: SummaryVM
+  @State private var controlsHeight: CGFloat = 200
+  @State private var detailsHeight: CGFloat = 36
+  var sourcesSection: some View { Text("Sources").frame(height: 70) }
+  var actionRow: some View { Text("Start / Summary").frame(height: 44) }
+  var languageChip: some View { Text("Language").frame(height: 24) }
+  var transcriptArea: some View {
+    ScrollView { Text(String(repeating: "Transcript\n", count: 100)) }.measured("transcript")
+  }
+  var footer: some View { Text("已產生摘要 Summary ready").frame(height: 28) }
+  func sectionLabel(_ value: String) -> some View { Text(value).font(.system(size: 11)) }
+  // INSERT: captionsPane
+  // INSERT: summaryArea
+  var body: some View {
+    VStack(spacing: 16) {
+      Text("Title").frame(height: 26)
+      Text("Tabs").frame(height: 44)
+      captionsPane
+    }.padding(20).coordinateSpace(name: "probe").onPreferenceChange(ProbeFrames.self) {
+      Probe.frames = $0
+    }
+  }
+}
+// INSERT: preferenceKeys
+@MainActor private final class FinalizationOverlay { let model = OverlayModel() }
+@MainActor private final class FinalizationHarness {
+  var lastInterimAudioTime: [AudioSourceType: TimeInterval] = [:]
+  var utteranceIds: [AudioSourceType: UUID] = [:]
+  var interimBySource: [AudioSourceType: String] = [:]
+  var interimArbiter = InterimSourceArbiter(holdInterval: 1)
+  var currentSession: Session?
+  let cleaner = BasicTextCleaner()
+  var interimChinese = ""
+  let overlay = FinalizationOverlay()
+  var settings = CaptionSettings.default
+  var lines: [CaptionLine] = []
+  let store = InMemoryTranscriptStore()
+  let translation = TranslationService()
+  var segmentIndex = 0
+  var currentOverlayId: UUID?
+  private var speakerNamer = SpeakerNamer()
+  init() {
+    currentSession = store.beginSession(settings: settings)
+    translation.onResult = { [weak self] id, text in
+      guard let self else { return }
+      if let index = self.lines.firstIndex(where: { $0.id == id }) {
+        self.lines[index].chinese = text
+      }
+      self.store.updateTranslation(segmentId: id, translated: text)
+      self.overlay.model.applyTranslation(key: id, text: text)
+    }
+  }
+  func clearDisplayedInterim() { interimChinese = "" }
+  func promoteNextInterim(_ source: AudioSourceType?) {}
+  func enqueueCorrection(id: UUID, text: String) {}
+  func translateSentence(id: UUID, text: String) { translation.translate(id: id, text: text) }
+  func speakerName(for rawLabel: String?, source: AudioSourceType) -> SpeakerName? {
+    guard let rawLabel else { return nil }
+    return speakerNamer.name(for: "\(source.rawValue)#\(rawLabel)")
+  }
+  func finalize(_ segment: ASRSegment) { handleFinalized(segment) }
+  // INSERT: handleFinalized
+}
+
+private func pump(_ seconds: Double) async {
+  try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+}
+private final class DiagnosticWindow: NSWindow {
+  override func constrainFrameRect(_ rect: NSRect, to screen: NSScreen?) -> NSRect { rect }
+}
+private func hosted<V: View>(_ view: V, width: CGFloat, height: CGFloat) -> NSHostingView<V> {
+  let v = NSHostingView(rootView: view)
+  v.frame = NSRect(x: 0, y: 0, width: width, height: height)
+  v.layoutSubtreeIfNeeded()
+  return v
+}
+private var failed = 0
+private func check(_ ok: Bool, _ message: String) {
+  print("\(ok ? "PASS":"FAIL") \(message)")
+  if !ok { failed += 1 }
+}
+@MainActor private func runChecks() async {
+  await checkSettingsLayout()
+  await checkSettingsSheet()
+  await checkSelectiveReset()
+  let capture = FixtureCapture()
+  let vm = CaptureViewModel(router: AudioRouter(capturerFactory: { _ in capture }))
+  let enabling = Task { try await vm.router.enable(.system) }
+  while !(await capture.gate.entered) { await Task.yield() }
+  await capture.gate.resume()
+  try? await enabling.value
+  check(vm.router.activeSources.contains(.system), "resource close fixture starts an active source")
+  await vm.checkResourceClose()
+  do {
+    let names = ["Claude Mango", "DeepSeek Pineapple", "Speaker 11"]
+    let sizes = names.map {
+      hosted(CaptionSpeakerLabel(name: $0), width: 120, height: 80).fittingSize
+    }
+    let single = hosted(CaptionSpeakerLabel(name: "Claude"), width: 120, height: 80).fittingSize
+    check(sizes.allSatisfy { $0 == sizes.first && $0.height > single.height },
+      "short, long and numbered speaker names use the same two-line geometry")
+
+    let id = UUID()
+    var band = CaptionBandState()
+    band.interim(utteranceId: id, source: .system, english: "Ready? Yes, we are.",
+                 chinese: nil, expectsTranslation: false)
+    func overlaySize(_ line: BandLine, fontSize: Double) -> CGSize {
+      hosted(BandLineView(line: line, fontSize: fontSize, primaryOnTop: .original,
+                         showSecond: false, showSpeakerSlot: true, reduceMotion: true)
+        .frame(width: 580), width: 580, height: 200).fittingSize
+    }
+    let before = overlaySize(band.slot!, fontSize: 16)
+    band.addPresentedSpeakerGroup(utteranceId: id, key: UUID(), original: "Ready?",
+                                  speaker: names[0], isLast: false)
+    band.addPresentedSpeakerGroup(utteranceId: id, key: UUID(), original: "Yes, we are.",
+                                  speaker: names[1], isLast: true)
+    let after = overlaySize(band.slot!, fontSize: 16)
+    check(before == after && band.slot?.originalSpeakerLabels == [0: names[0], 1: names[1]],
+      "late second speaker occupies the reserved name column without resizing the subtitle rows")
+  }
+  for source in [AudioSourceType.system, .microphone] {
+    let vm = FinalizationHarness()
+    let paragraph = "First sentence. Second sentence. Third sentence."
+    let translated = "第一句完整翻譯。第二句完整翻譯。第三句完整翻譯，含尾端。"
+    let uid = UUID()
+    vm.utteranceIds[source] = uid
+    vm.interimArbiter.interim(from: source, at: Date().timeIntervalSinceReferenceDate)
+    vm.interimChinese = translated
+    vm.overlay.model.historyLineCount = 1
+    vm.overlay.model.applyInterim(
+      utteranceId: uid, source: source, english: paragraph, chinese: translated,
+      expectsTranslation: true)
+    let pair = vm.translation.languagePair
+    let stream = vm.translation.makeStream(for: pair)
+    var calls = 0
+    let host = Task { @MainActor in
+      for await request in stream {
+        if let cached = vm.translation.cachedTranslation(for: request) {
+          vm.translation.complete(request, translation: cached, from: pair)
+          continue
+        }
+        calls += 1
+        vm.translation.complete(request, translation: translated, from: pair)
+      }
+    }
+    vm.translation.translate(id: UUID(), text: paragraph)
+    await pump(0.03)
+    vm.finalize(
+      ASRSegment(
+        text: paragraph, source: source, startTime: 12, endTime: 18, speakerLabel: "Speaker 1"))
+    await pump(0.03)
+    let finalized = vm.overlay.model.band.visibleSlot
+    check(calls == 1, "three-sentence paragraph reuses its one completed translation (\(source))")
+    check(
+      finalized?.id == uid && finalized?.english == paragraph && finalized?.chinese == translated
+        && vm.overlay.model.band.committed.isEmpty,
+      "whole paragraph and translation retain their live identity at finalize (\(source))")
+    check(
+      vm.store.segments.count == 1 && vm.store.segments[0].sourceText == paragraph
+        && vm.store.segments[0].translatedText == translated && vm.store.segments[0].startTime == 12
+        && vm.store.segments[0].endTime == 18 && vm.store.segments[0].source == source,
+      "transcript keeps every sentence, source, full translation and original times (\(source))")
+    vm.overlay.model.applyInterim(
+      utteranceId: UUID(), source: source, english: "Next paragraph.", chinese: nil,
+      expectsTranslation: true)
+    check(
+      vm.overlay.model.band.visibleCommitted.last == finalized,
+      "next paragraph rolls the complete bilingual block into history (\(source))")
+    host.cancel()
+    await host.value
+  }
+  do {
+    let vm = FinalizationHarness()
+    let source = AudioSourceType.system
+    let first = UUID()
+    let next = UUID()
+    vm.settings.secondCaptionEnabled = false
+    vm.utteranceIds[source] = next
+    vm.lastInterimAudioTime[source] = 8
+    vm.interimArbiter.interim(from: source, at: Date().timeIntervalSinceReferenceDate)
+    vm.overlay.model.applyInterim(utteranceId: first, source: source, english: "We have a plan.",
+                                  chinese: nil, expectsTranslation: false)
+    vm.overlay.model.applyInterim(utteranceId: first, source: source, english: "We have a plan. Is it ready?",
+                                  chinese: nil, expectsTranslation: false)
+    let original = vm.overlay.model.band.slot?.originalRows.rows
+    vm.overlay.model.applyInterim(utteranceId: next, source: source, english: "Yes",
+                                  chinese: nil, expectsTranslation: false)
+    vm.finalize(ASRSegment(text: "We had a plan. Is it ready?", source: source, startTime: 1,
+                           endTime: 5, speakerLabel: "Speaker 1", utteranceEndTime: 6, utteranceId: first))
+    check(original == ["We have a plan.", "Is it ready?"]
+      && vm.overlay.model.band.line(for: first)?.originalRows.rows == original
+      && vm.overlay.model.band.line(for: first)?.speakerLabel != nil
+      && vm.overlay.model.band.slot?.id == next && vm.overlay.model.band.slot?.english == "Yes"
+      && vm.store.segments.first?.sourceText == "We had a plan. Is it ready?",
+      "late speaker analysis adds a label while the new speaker keeps streaming and old rows stay fixed")
+  }
+  do {
+    let vm = FinalizationHarness()
+    let source = AudioSourceType.system
+    let uid = UUID()
+    vm.utteranceIds[source] = uid
+    vm.lastInterimAudioTime[source] = 7
+    vm.interimArbiter.interim(from: source, at: Date().timeIntervalSinceReferenceDate)
+    vm.interimChinese = "整段的暫定翻譯。"
+    vm.overlay.model.applyInterim(utteranceId: uid, source: source, english: "Hello and welcome",
+      chinese: vm.interimChinese, expectsTranslation: true)
+    vm.finalize(ASRSegment(text: "Hello.", source: source, startTime: 2, endTime: 4,
+      speakerLabel: "Speaker 1", utteranceEndTime: 7.1, position: .earlierGroup, utteranceId: uid))
+    check(vm.overlay.model.band.visibleSlot?.id == uid && vm.utteranceIds[source] == uid,
+      "earlier speaker group leaves the shared partial in place")
+    vm.finalize(ASRSegment(text: "Welcome.", source: source, startTime: 5, endTime: 6,
+      speakerLabel: "Speaker 2", utteranceEndTime: 7.1, position: .lastGroup, utteranceId: uid))
+    check(vm.overlay.model.band.visibleSlot == nil && vm.utteranceIds[source] == nil
+      && vm.lines.map(\.chinese) == [nil, nil]
+      && vm.store.segments.map(\.endTime) == [4, 6],
+      "last group retires the partial without reusing its translation or changing export times")
+  }
+  for size in [
+    CGSize(width: 1120, height: 820), CGSize(width: 940, height: 620),
+    CGSize(width: 640, height: 520),
+  ] {
+    let vm = SummaryVM()
+    vm.summaryText = ""
+    Probe.frames = [:]
+    let view = hosted(SummaryHarness(vm: vm), width: size.width, height: size.height)
+    let window = DiagnosticWindow(
+      contentRect: NSRect(x: -20000, y: -20000, width: size.width, height: size.height),
+      styleMask: [.borderless], backing: .buffered, defer: false)
+    window.contentView = view
+    window.orderBack(nil)
+    await pump(0.35)
+    check(Probe.frames["summary"] == nil, "initial caption pane does not reserve a summary card")
+    vm.summaryText = String(
+      repeating: "會議摘要。The team agreed to deliver the next milestone.\n", count: 24)
+    view.rootView = SummaryHarness(vm: vm)
+    view.layoutSubtreeIfNeeded()
+    _ = view.fittingSize
+    await pump(0.15)
+    let summary = Probe.frames["summary"] ?? .zero
+    let visibleHeight = max(0, min(summary.maxY, size.height - 20) - max(summary.minY, 20))
+    // The summary must offer its original 150pt text viewport and its heading
+    // without being clipped by a second surrounding scroll viewport.
+    view.layoutSubtreeIfNeeded()
+    view.displayIfNeeded()
+    check(
+      (Probe.frames["footerViewport"]?.height ?? 0) >= 28,
+      "footer retains a complete status/permission row")
+    check(
+      (Probe.frames["controlsViewport"]?.height ?? 0) >= 44, "controls retain a complete button row"
+    )
+    check(
+      (Probe.frames["transcript"]?.height ?? 0) >= 60,
+      "transcript retains a finite readable viewport")
+    print(
+      "SUMMARY \(Int(size.width))x\(Int(size.height)) frame=\(summary) visibleHeight=\(visibleHeight)"
+    )
+    check(visibleHeight >= 175, "summary card visible at \(size), need heading + 150pt text")
+    window.orderOut(nil)
+  }
+  let model = OverlayModel()
+  model.listenState = .listening
+  model.reduceMotion = true
+  let root = OverlayRootView(model: model, actions: OverlayActions())
+  let overlay = hosted(root, width: 692, height: 600)
+  let window = DiagnosticWindow(
+    contentRect: NSRect(x: -20000, y: -20000, width: 692, height: 600), styleMask: [.borderless],
+    backing: .buffered, defer: false)
+  window.contentView = overlay
+  window.orderBack(nil)
+  await pump(0.25)
+  let first = UUID()
+  model.applyInterim(
+    utteranceId: first, source: .system, english: "First paragraph.", chinese: "第一段。",
+    expectsTranslation: true)
+  await pump(0.15)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  let sizeBefore = overlay.fittingSize
+  model.applyCommit(
+    utteranceId: first, source: .system, sentences: [(first, "First paragraph.")],
+    expectsTranslation: true)
+  model.applyInterim(
+    utteranceId: UUID(), source: .system, english: "Second paragraph.", chinese: nil,
+    expectsTranslation: true)
+  await pump(0.2)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  let sizeAfter = overlay.fittingSize
+  check(
+    sizeAfter.height > sizeBefore.height + 20,
+    "overlay top grows for the next bilingual unit: \(sizeBefore.height) → \(sizeAfter.height)")
+  model.clear()
+  model.historyLineCount = 2
+  model.fontSize = 22
+  model.showSpeakerSlot = true
+  let original = String(repeating: "This is a caption sentence with several words. ", count: 5)
+  let translated = String(repeating: "繁體中文的字幕翻譯要完整呈現，這是一個測試句子。", count: 4)
+  var requiredHeight: CGFloat = 24
+  let controller = OverlayController()
+  controller.model.reduceMotion = true
+  controller.model.historyLineCount = 2
+  controller.model.fontSize = 22
+  controller.model.showSpeakerSlot = true
+  controller.model.listenState = .listening
+  controller.show()
+  await pump(0.2)
+  let lowerEdge = controller.panel?.frame.minY
+  for index in 1...3 {
+    let id = UUID()
+    let line = BandLine(
+      id: id, english: "\(index) " + original, chinese: translated,
+      source: .system, isFinal: true, expectsTranslation: true, speakerLabel: "Claude Mango")
+    model.applyInterim(
+      utteranceId: id, source: line.source, english: line.english,
+      chinese: line.chinese, expectsTranslation: true)
+    model.applyCommit(
+      utteranceId: id, source: line.source, sentences: [(id, line.english)],
+      expectsTranslation: true, speakerLabel: line.speakerLabel)
+    controller.model.applyCommit(
+      utteranceId: nil, source: line.source,
+      sentences: [(id, line.english)], expectsTranslation: true,
+      speakerLabel: line.speakerLabel, provisional: [id: translated])
+    let row = hosted(
+      BandLineView(
+        line: line, fontSize: 22, primaryOnTop: .original,
+        showSecond: true, showSpeakerSlot: true, reduceMotion: true
+      ).frame(width: 600),
+      width: 600, height: 600)
+    requiredHeight += row.fittingSize.height
+  }
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  await pump(0.2)
+  check(
+    overlay.fittingSize.height >= requiredHeight,
+    "overlay reserves all three full bilingual units: \(overlay.fittingSize.height) / \(requiredHeight)pt"
+  )
+  let tallFrame = controller.panel?.frame
+  check(
+    tallFrame.map { $0.height >= requiredHeight && $0.minY == lowerEdge } ?? false,
+    "AppKit panel grows around the same lower edge: \(String(describing: tallFrame))")
+  controller.model.historyLineCount = 0
+  await pump(0.2)
+  let shortFrame = controller.panel?.frame
+  check(
+    shortFrame.map { $0.height < (tallFrame?.height ?? 0) && $0.minY == lowerEdge } ?? false,
+    "one unit shrinks the actual panel from the top")
+  controller.model.historyLineCount = 2
+  await pump(0.2)
+  check(
+    controller.panel?.frame == tallFrame,
+    "selecting three again restores the full panel without another ASR event")
+  controller.model.clear()
+  controller.model.historyLineCount = 0
+  controller.model.showSecondLine = false
+  let live = UUID()
+  controller.model.applyInterim(utteranceId: live, source: .system, english: original,
+    chinese: nil, expectsTranslation: false)
+  await pump(0.2)
+  let expanded = controller.panel?.frame
+  let lockedRows = Array((controller.model.band.slot?.originalRows.rows ?? []).dropLast())
+  controller.model.applyInterim(utteranceId: live, source: .system, english: "The meeting",
+    chinese: nil, expectsTranslation: false)
+  await pump(0.2)
+  check(controller.panel?.frame == expanded,
+    "same utterance reflow does not jump the actual panel: \(String(describing: expanded)) → \(String(describing: controller.panel?.frame))")
+  controller.model.applyCommit(utteranceId: live, source: .system,
+    sentences: [(live, "The meeting.")], expectsTranslation: false)
+  await pump(0.2)
+  let finalRows = controller.model.band.slot?.originalRows.rows ?? []
+  check(!lockedRows.isEmpty && finalRows.starts(with: lockedRows)
+    && controller.panel?.frame.minY == expanded?.minY,
+    "a late shorter final preserves already displayed rows at the same bottom anchor")
+  controller.model.applyInterim(utteranceId: UUID(), source: .system,
+    english: String(repeating: original, count: 25), chinese: nil, expectsTranslation: false)
+  await pump(0.2)
+  if let panel = controller.panel, let screen = panel.screen ?? NSScreen.main {
+    check(panel.frame.maxY <= screen.visibleFrame.maxY + 1 && panel.frame.minY == expanded?.minY,
+      "very long content stays on screen above the same bottom anchor")
+    if let content = panel.contentView {
+      let point = CGPoint(x: content.bounds.midX, y: content.bounds.midY)
+      check(content.hitTest(point) == nil, "long live caption remains click-through")
+      controller.togglePin()
+      await pump(0.2)
+      check(content.hitTest(point) != nil, "pinning lets the overflow text receive scroll input")
+    }
+    if let content = panel.contentView, let scroll = scrollView(in: content),
+       let document = scroll.documentView {
+      let clip = scroll.contentView
+      let lastOffset = document.frame.height - clip.bounds.height
+      clip.scroll(to: .zero)
+      scroll.reflectScrolledClipView(clip)
+      check(abs(clip.bounds.minY) < 1, "overflow can scroll to its first line")
+      clip.scroll(to: CGPoint(x: 0, y: lastOffset))
+      scroll.reflectScrolledClipView(clip)
+      check(abs(clip.bounds.minY - lastOffset) < 1, "overflow can scroll to its last line")
+    } else {
+      check(false, "long caption retains a scrollable document")
+    }
+  }
+  controller.hide()
+  model.clear()
+  model.fontSize = 16
+  model.showSpeakerSlot = false
+  model.historyLineCount = 1
+  model.showSecondLine = true
+  model.primaryLineOnTop = .original
+  let long = String(repeating: "這段翻譯必須完整顯示，不能把句尾截掉。", count: 5) + "完整尾端。"
+  let full = hosted(
+    Text(long).font(CaptionTheme.translationFont(16)).fixedSize(horizontal: false, vertical: true)
+      .frame(width: 586, alignment: .leading), width: 586, height: 600
+  ).fittingSize.height
+  func row(_ translation: String) -> CGFloat {
+    hosted(
+      BandLineView(
+        line: BandLine(
+          id: UUID(), english: "Caption.", chinese: translation, source: .system, isFinal: true,
+          expectsTranslation: true), fontSize: 16, primaryOnTop: .original, showSecond: true,
+        showSpeakerSlot: false, reduceMotion: true
+      ).frame(width: 600), width: 600, height: 600
+    ).fittingSize.height
+  }
+  let shortHeight = row("短譯文。")
+  let longHeight = row(long)
+  check(
+    longHeight - shortHeight >= full - 22,
+    "translation wraps to show tail: short=\(shortHeight), long=\(longHeight), fullTranslation=\(full)"
+  )
+  model.clear()
+  model.reduceMotion = false
+  let a = UUID()
+  let b = UUID()
+  let c = UUID()
+  model.applyInterim(
+    utteranceId: a, source: .system, english: "FIRST paragraph stays together.",
+    chinese: "第一段完整譯文。", expectsTranslation: true)
+  model.applyCommit(
+    utteranceId: a, source: .system, sentences: [(a, "FIRST paragraph stays together.")],
+    expectsTranslation: true)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  _ = overlay.fittingSize
+  await pump(0.3)
+  func bitmap(_ phase: String) -> (CGFloat, Int, Double) {
+    overlay.layoutSubtreeIfNeeded()
+    overlay.displayIfNeeded()
+    let rep = overlay.bitmapImageRepForCachingDisplay(in: overlay.bounds)!
+    overlay.cacheDisplay(in: overlay.bounds, to: rep)
+    if let directory = CommandLine.arguments.dropFirst().first {
+      try? rep.representation(using: .png, properties: [:])?.write(
+        to: URL(fileURLWithPath: directory).appendingPathComponent(phase + ".png"))
+    }
+    let x = rep.pixelsWide * 3 / 4
+    var points: [Int] = []
+    var strength = 0.0
+    for y in 0..<rep.pixelsHigh {
+      guard let color = rep.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB) else { continue }
+      let contrast = color.redComponent - max(color.greenComponent, color.blueComponent)
+      if contrast > 0.03 {
+        points.append(y)
+        strength = max(strength, contrast)
+      }
+    }
+    let center = points.isEmpty ? -1 : CGFloat(points.reduce(0, +)) / CGFloat(points.count)
+    print("PAINT \(phase) redY=\(center) redRows=\(points.count) strength=\(strength)")
+    return (center, points.count, strength)
+  }
+  let before = bitmap("paint-before")
+  model.applyInterim(
+    utteranceId: b, source: .system, english: "SECOND paragraph pushes the first one upward.",
+    chinese: "第二段完整譯文。", expectsTranslation: true)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  _ = overlay.fittingSize
+  await pump(0.02)
+  _ = bitmap("paint-early")
+  await pump(0.08)
+  let middle = bitmap("paint-middle")
+  await pump(0.25)
+  let after = bitmap("paint-after")
+  check(
+    before.0 >= 0 && after.0 >= 0 && after.0 < before.0 - 10,
+    "whole bilingual block moves upward inside fixed viewport")
+  check(
+    middle.0 > after.0 + 1 && middle.0 < before.0 - 1,
+    "paragraph has a measurable intermediate upward animation frame")
+  let secondSentence = "SECOND paragraph pushes the first one upward. A separate sentence follows."
+  model.applyInterim(
+    utteranceId: b, source: .system, english: secondSentence,
+    chinese: "第二段完整譯文。", expectsTranslation: true)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  _ = overlay.fittingSize
+  await pump(0.08)
+  let rowMiddle = bitmap("paint-line-middle")
+  await pump(0.26)
+  let rowAfter = bitmap("paint-line-after")
+  check(model.band.slot?.originalRows.rows == [
+    "SECOND paragraph pushes the first one upward.", "A separate sentence follows."
+  ] && rowMiddle.0 < after.0 && rowMiddle.0 > rowAfter.0
+    && rowAfter.1 == after.1 && rowAfter.2 == after.2,
+    "a new original sentence within the same ASR segment pushes the unchanged old block upward")
+  model.applyCommit(
+    utteranceId: b, source: .system,
+    sentences: [(b, secondSentence)], expectsTranslation: true)
+  model.applyInterim(
+    utteranceId: c, source: .system, english: "THIRD paragraph evicts the first.", chinese: "第三段。",
+    expectsTranslation: true)
+  overlay.rootView = OverlayRootView(model: model, actions: OverlayActions())
+  overlay.layoutSubtreeIfNeeded()
+  _ = overlay.fittingSize
+  await pump(0.06)
+  let fading = bitmap("paint-evict-middle")
+  await pump(0.3)
+  let evicted = bitmap("paint-evicted")
+  check(
+    fading.2 > 0.03 && fading.2 < before.2 * 0.95 && evicted.1 == 0,
+    "old paragraph fades upward before it is evicted")
+
+  window.orderOut(nil)
+  print("RESULT failures=\(failed)")
+  exit(failed == 0 ? 0 : 1)
+
+}
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+Task { @MainActor in await runChecks() }
+app.run()

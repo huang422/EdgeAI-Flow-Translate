@@ -42,6 +42,14 @@ final class PromptComposerViewModel: ObservableObject {
         var isBusy: Bool { self != .idle }
     }
 
+    /// Used only by the isolated fixture bundle, never a normal launch.
+    func prepareUIFixture() {
+        guard AppEnvironment.isUIFixture else { return }
+        inputText = "Fix the first-launch layout while preserving the floating caption window."
+        artifact = PromptArtifact(kind: .prompt, content: String(repeating: "## Task\nVerify responsive layout and preserve existing data.\n\n", count: 12))
+        statusMessage = "完成 Compiled — this isolated fixture uses no model and writes no project files."
+    }
+
     // MARK: - Published state
 
     /// The request. Filled by dictation, typing, or both.
@@ -162,6 +170,7 @@ final class PromptComposerViewModel: ObservableObject {
         }
         dictation.onFinalized = { [weak self] text in
             self?.interimText = ""
+            self?.drainFinalizedText = true
             self?.append(dictated: TraditionalChineseGuard.normalizingScript(text))
         }
         dictation.onStateChange = { [weak self] state in
@@ -267,6 +276,9 @@ final class PromptComposerViewModel: ObservableObject {
             // the hotkey loaded two different ~600 MB variants of the same model,
             // and `prewarmDictationASR` warmed the one the tab did not use.
             try await dictation.start(language: dictationLanguage)
+            // Read once the engine exists, so the joins below match how this
+            // recognizer segments.
+            segmentsCarryOwnSpacing = dictation.segmentsCarryTheirOwnSpacing ?? false
         } catch {
             phase = .idle
             statusMessage = error.localizedDescription
@@ -297,10 +309,24 @@ final class PromptComposerViewModel: ObservableObject {
         let pending = interimText.trimmingCharacters(in: .whitespacesAndNewlines)
         interimText = ""
         phase = .finishing
+        // Armed in the same breath as the interim, so "did the drain finalize
+        // anything?" is answered from exactly the moment it was set aside. A
+        // `contains` test cannot answer it: finalizing is where wording,
+        // punctuation and capitalization get revised, so a volatile result and
+        // the final it becomes are *supposed* to differ.
+        // `DictationTranscriptAssembler` owns this decision and is tested on it;
+        // `QuickDictationController.finish` takes the same path.
+        drainFinalizedText = false
         await dictation.settle()
-        // Only when the drain produced nothing for it. Appending unconditionally
-        // would duplicate the sentence the finalize just delivered.
-        if !pending.isEmpty, !inputText.contains(pending) { append(dictated: pending) }
+        let assembled = DictationTranscriptAssembler.assemble(
+            transcript: inputText,
+            carriedInterim: pending,
+            drainProducedText: drainFinalizedText,
+            segmentsCarryOwnSpacing: segmentsCarryOwnSpacing)
+        if assembled != inputText.trimmed {
+            noteDictatedOrigin()
+            inputText = assembled
+        }
         // The drain can deliver one more partial before it stops, and nothing
         // downstream clears it — the live line would sit under the request box
         // for the whole tidy pass.
@@ -439,13 +465,38 @@ final class PromptComposerViewModel: ObservableObject {
     }
 
     private func append(dictated text: String) {
-        origin = inputText.trimmed.isEmpty ? .speech : (origin == .typed ? .mixed : origin)
-        if inputText.trimmed.isEmpty {
-            inputText = text
-        } else {
-            inputText += inputText.hasSuffix(" ") ? text : " \(text)"
-        }
+        noteDictatedOrigin()
+        // A draft holding nothing but whitespace is an empty draft — the
+        // dictation starts it rather than being indented by what was left in the
+        // field.
+        let draft = inputText.trimmed.isEmpty ? "" : inputText
+        // The join is `DictationTranscriptAssembler`'s to make, for both callers
+        // of it. A second copy of the rule here is what put a space inside every
+        // Chinese sentence, and two copies cannot be kept agreeing.
+        inputText = DictationTranscriptAssembler.join(
+            draft, text, segmentsCarryOwnSpacing: segmentsCarryOwnSpacing)
     }
+
+    /// Record that some of what is now in the draft was spoken.
+    ///
+    /// Separate from `append` because the finish path assigns the assembled text
+    /// rather than appending to it, and still has to flip the origin.
+    private func noteDictatedOrigin() {
+        origin = inputText.trimmed.isEmpty ? .speech : (origin == .typed ? .mixed : origin)
+    }
+
+    /// Whether the running engine's segments already carry the spacing that
+    /// belongs between them. Remembered so it survives the engine being released
+    /// before the last join.
+    private var segmentsCarryOwnSpacing = false
+
+    /// Whether the engine finalized anything after the interim was set aside.
+    ///
+    /// Reported by the recognizer rather than inferred from the draft's length:
+    /// `inputText` is bound to an editable field, so a keystroke landing during
+    /// the drain would read as a finalize and silently discard the sentence the
+    /// user was still speaking.
+    private var drainFinalizedText = false
 
     /// Which locale the dictation session runs in.
     ///

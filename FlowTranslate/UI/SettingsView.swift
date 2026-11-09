@@ -33,11 +33,14 @@ struct SettingsView: View {
     /// caption settings after pressing ⌘, from the Prompt tab means finding the
     /// right pane before reading anything, every time.
     @State private var pane: Pane
+    private let presentationSize: CGSize
 
-    init(settings: Binding<CaptionSettings>, vm: CaptureViewModel, initialPane: Pane = .captions) {
+    init(settings: Binding<CaptionSettings>, vm: CaptureViewModel, initialPane: Pane = .captions,
+         presentationSize: CGSize = CGSize(width: 560, height: 660)) {
         self._settings = settings
         self.vm = vm
         self._pane = State(initialValue: initialPane)
+        self.presentationSize = presentationSize
     }
 
     /// Latency tiers whose model is already on disk for the selected language.
@@ -278,7 +281,7 @@ struct SettingsView: View {
     /// land in the same ship rather than on which one you picked.
     private var dictationLanguageHint: String {
         guard DictationEngineFactory.resolved(settings) == .nemotron else {
-            return "The built-in recognizer ships with macOS — nothing is downloaded here. Its "
+            return "The built-in recognizer ships with macOS. Its "
                 + "per-language assets are the system's, fetched once on first use and shared "
                 + "with system dictation; a language already set up in System Settings → "
                 + "Keyboard → Dictation costs nothing. The Prompt page marks the ones still "
@@ -287,18 +290,14 @@ struct SettingsView: View {
                 + "code-switch."
         }
         let dictation = PromptDictation.language(for: settings)
-        if dictation == "auto" {
-            return "Mixed speech uses the multilingual weights. Free if the captions language is "
-                + "already non-Latin; if it is English, this is a second ~600 MB variant plus a "
-                + "model reload every time you switch between a meeting and dictation."
-        }
         let captionShip = NemotronStreamingService.shipDirectory(for: settings.firstLanguage)
         let dictationShip = NemotronStreamingService.shipDirectory(for: dictation)
-        if captionShip == dictationShip {
-            return "Shares the captions language's weights. No extra download."
+        if captionShip == dictationShip, settings.asrTier == PromptDictation.tier {
+            return "Shares the captions model and latency tier. No extra download."
         }
-        return "A different variant from the captions language: an extra ~600 MB download, and a "
-            + "model reload (2–4 s) every time you switch between a meeting and dictation."
+        return "Dictation uses the \(dictationShip) \(PromptDictation.tier) variant. If it is "
+            + "missing, the one-time download is about 600 MB. Switching variants reloads Core ML "
+            + "weights even when the files are cached."
     }
 
     /// Explains the segmentation trade-off of the selected scenario. The mic is
@@ -314,25 +313,25 @@ struct SettingsView: View {
         }
     }
 
-    /// A sheet has no title bar, so it has nowhere to put a `.toolbar`. Asking
-    /// for one anyway laid the Done button over the `TabView`'s tab strip and
-    /// pushed both past the top edge. The standard macOS sheet shape is used
-    /// instead: content, a divider, and the dismissing button on its own row.
     var body: some View {
         VStack(spacing: 0) {
-            TabView(selection: $pane) {
-                captionsPane
-                    .tabItem { Label("即時字幕 Live captions", systemImage: "captions.bubble") }
-                    .tag(Pane.captions)
-                promptPane
-                    .tabItem { Label("提示詞編譯 Prompt composer", systemImage: "wand.and.stars") }
-                    .tag(Pane.prompt)
+            Picker("設定分類 Settings section", selection: $pane) {
+                Text("即時字幕 Captions").tag(Pane.captions)
+                Text("提示詞編譯 Prompts").tag(Pane.prompt)
             }
-            // The tab strip is drawn inside the TabView's own bounds and sits
-            // flush against the sheet's rounded top corners without this.
-            .padding(.top, 10)
-            .padding(.horizontal, 10)
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            .padding(12)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
 
+            Group {
+                switch pane {
+                case .captions: captionsPane
+                case .prompt: promptPane
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
             Divider()
 
             HStack {
@@ -342,8 +341,11 @@ struct SettingsView: View {
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
+            .fixedSize(horizontal: false, vertical: true)
+            .layoutPriority(1)
         }
-        .frame(width: 560, height: 660)
+        .frame(minWidth: 0, idealWidth: presentationSize.width, maxWidth: presentationSize.width,
+               minHeight: 0, idealHeight: presentationSize.height, maxHeight: presentationSize.height)
         .onAppear {
             refreshRulebookCost()
         }
@@ -364,10 +366,10 @@ struct SettingsView: View {
             )
         ) { _ in refreshRulebookCost() }
         .confirmationDialog("解除安裝 FlowTranslate？", isPresented: $confirmUninstall, titleVisibility: .visible) {
-            Button("移到垃圾桶並刪除模型 Uninstall") { vm.uninstall() }
+            Button("移除 App 與私有資料 Uninstall") { vm.uninstall() }
             Button("取消 Cancel", role: .cancel) {}
         } message: {
-            Text("Removes downloaded models, transcripts, settings and this app's privacy-permission entries, then moves the app to the Trash.")
+            Text("Removes private Qwen models, transcripts, settings and this app's privacy entries, then moves the app to the Trash. Shared speech models are kept for reuse by other apps.")
         }
     }
 
@@ -396,6 +398,7 @@ struct SettingsView: View {
                         Text("\(locale.displayName) (\(locale.code))").tag(locale.code)
                     }
                 }
+                .disabled(vm.asrState != .idle)
                 if settings.firstLanguage == "auto" {
                     // Auto isn't just "no language lock" — it loads a different,
                     // larger build. Worth saying plainly, because picking the
@@ -422,6 +425,7 @@ struct SettingsView: View {
                     Text("Smoothest 2240ms").tag("2240ms")
                 }
                 .pickerStyle(.segmented)
+                .disabled(vm.asrState != .idle)
                 // Re-checked whenever the language changes — Latin and
                 // multilingual ships have independent per-tier caches.
                 .task(id: settings.firstLanguage) {
@@ -436,7 +440,7 @@ struct SettingsView: View {
                     + "updates and how much CPU it costs. 560ms updates while the speaker "
                     + "is still talking; 2240ms is FluidAudio's default and is 2.2× the "
                     + "throughput. Each tier is a separate ~600 MB model. "
-                    + "Applies on the next Start.")
+                    + "The selected downloaded model warms up while idle and applies on the next Start.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let tierStatus {
                     Text(tierStatus.text)
@@ -479,6 +483,14 @@ struct SettingsView: View {
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
+            }
+
+            Section("麥克風與系統聲 Microphone + system audio") {
+                Toggle("播放系統聲時抑制麥克風 Suppress microphone during playback",
+                       isOn: $settings.suppressMicDuringSystemAudio)
+                Text("Default off: both sources remain audible to recognition, including simultaneous speech with headphones. Enable only for speaker playback; local speech during playback will also be suppressed. This is not acoustic echo cancellation.")
+                    .font(.caption).foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             Section("翻譯 Translation") {
@@ -552,7 +564,7 @@ struct SettingsView: View {
                 Toggle(isOn: $settings.clickThrough) {
                     VStack(alignment: .leading, spacing: 1) {
                         Text("點擊穿透 Click-through")
-                        Text("Captions don't block clicks to other apps")
+                        Text("Live captions pass clicks to other apps. Pin long captions to scroll them.")
                             .font(.caption).foregroundStyle(.secondary)
                     }
                 }
@@ -605,6 +617,7 @@ struct SettingsView: View {
                     Button("重設 Reset caption settings") {
                         settings.resetCaptionSettings()
                     }
+                    .disabled(vm.asrState != .idle)
                     Text("Restores the caption, translation, overlay and audio settings to their "
                         + "defaults. Prompt Composer settings are untouched.")
                         .font(.caption).foregroundStyle(.secondary)
@@ -612,8 +625,8 @@ struct SettingsView: View {
 
                 VStack(alignment: .leading, spacing: 3) {
                     Button("解除安裝 Uninstall") { confirmUninstall = true }
-                    Text("Removes downloaded models, transcripts and settings, and moves the app "
-                        + "to the Trash.")
+                    Text("Removes private Qwen models, transcripts and settings, and moves the app "
+                        + "to the Trash. Shared speech models are kept.")
                         .font(.caption).foregroundStyle(.secondary)
                 }
 
@@ -626,6 +639,7 @@ struct SettingsView: View {
                     Button("重設權限 Reset permissions") {
                         Task { captionPermissionsReset = await vm.resetPrivacyPermissions() }
                     }
+                    .disabled(vm.isResettingPermissions)
                     Text("Clears this app's Microphone, Screen Recording and Accessibility "
                         + "privacy entries. Relaunch and grant them again. Use after replacing "
                         + "the app when the toggles look ON but capture fails.")
@@ -762,10 +776,12 @@ struct SettingsView: View {
                     // not use it, and taking it away from this page would revoke
                     // something this page never asked for.
                     Button("重設口述權限 Reset dictation permissions") {
-                        promptPermissionsReset = Permissions.resetPrivacyPermissions(
-                            services: Permissions.dictationServices
-                        )
+                        Task {
+                            promptPermissionsReset = await vm.resetPrivacyPermissions(
+                                services: Permissions.dictationServices)
+                        }
                     }
+                    .disabled(vm.isResettingPermissions)
                     Text("Clears this app's Microphone and Accessibility entries. Relaunch "
                         + "and grant them again. Screen Recording is left alone — dictation "
                         + "does not use it.")

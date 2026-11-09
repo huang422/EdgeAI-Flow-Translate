@@ -13,7 +13,7 @@ if ! command -v xcodegen >/dev/null; then
 fi
 
 echo "==> Generating FlowTranslate.xcodeproj from project.yml"
-xcodegen generate
+bash Scripts/generate-project.sh
 
 echo "==> Opening project"
 open FlowTranslate.xcodeproj

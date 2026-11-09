@@ -26,7 +26,7 @@ jobs:
       # runtime and crashes with "Symbol not found … Testing". xcodebuild uses
       # Xcode's matching swift-testing. (`make test` / swift test still works locally.)
       - name: Run core tests
-        run: xcodebuild test -scheme FlowTranslateCore -destination 'platform=macOS'
+        run: bash Scripts/run-tests.sh
 
   app-build:
     name: App build (Release)
@@ -39,11 +39,17 @@ jobs:
         with:
           xcode-version: latest-stable
 
+      - name: Ensure Metal Toolchain
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
       - name: Generate project
-        run: xcodegen generate
+        run: bash Scripts/generate-project.sh
 
       - name: Build app
         run: |
@@ -52,5 +58,5 @@ jobs:
             -scheme FlowTranslate \
             -configuration Release \
             -destination 'generic/platform=macOS' \
-            CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 CODE_SIGNING_ALLOWED=NO \
             build

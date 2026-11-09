@@ -10,9 +10,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if xcode-select -p 2>/dev/null | grep -q "Xcode.app"; then
+DEVELOPER_PATH="$(xcode-select -p 2>/dev/null || true)"
+if [[ -x "$DEVELOPER_PATH/usr/bin/xcodebuild" ]]; then
+    # GitHub's CLT framework can shadow Xcode's Swift Testing runtime.
+    if [[ "${GITHUB_ACTIONS:-}" == true && $# -eq 0 ]]; then
+        exec xcodebuild test -scheme FlowTranslateCore -destination 'platform=macOS'
+    fi
     # Full Xcode toolchain: plain swift test is enough.
-    exec swift test
+    exec swift test "$@"
 fi
 
 # Command Line Tools fallback: wire up the swift-testing framework rpaths.

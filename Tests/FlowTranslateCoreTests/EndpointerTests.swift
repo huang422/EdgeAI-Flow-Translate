@@ -5,61 +5,62 @@ import Testing
 @Suite struct EndpointerTests {
     @Test func staysIdleWithoutSpeechStart() {
         var ep = Endpointer()
-        for _ in 0..<20 { #expect(ep.process(speechStarted: false, speechEnded: false, sentenceEnded: false, dt: 0.1).isEmpty) }
+        for _ in 0..<20 { #expect(ep.process(speechStarted: false, speechEnded: false, dt: 0.1).isEmpty) }
         #expect(ep.inUtterance == false)
     }
 
     @Test func startsOnSpeechStart() {
         var ep = Endpointer()
-        #expect(ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1) == [.start])
+        #expect(ep.process(speechStarted: true, speechEnded: false, dt: 0.1) == [.start])
         #expect(ep.inUtterance == true)
     }
 
     @Test func finalizesOnSpeechEndAfterMinSpeech() {
         var ep = Endpointer(config: .init(minSpeech: 0.30, maxSpeech: 10))
-        _ = ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)
-        for _ in 0..<4 { _ = ep.process(speechStarted: false, speechEnded: false, sentenceEnded: false, dt: 0.1) }  // ≥ minSpeech
-        #expect(ep.process(speechStarted: false, speechEnded: true, sentenceEnded: false, dt: 0.1).contains(.finalize))
+        _ = ep.process(speechStarted: true, speechEnded: false, dt: 0.1)
+        for _ in 0..<4 { _ = ep.process(speechStarted: false, speechEnded: false, dt: 0.1) }  // ≥ minSpeech
+        #expect(ep.process(speechStarted: false, speechEnded: true, dt: 0.1).contains(.finalize))
         #expect(ep.inUtterance == false)
     }
 
     @Test func tooShortIsDroppedNotFinalized() {
         var ep = Endpointer(config: .init(minSpeech: 0.30, maxSpeech: 10))
-        _ = ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)  // 0.1s only
-        let ev = ep.process(speechStarted: false, speechEnded: true, sentenceEnded: false, dt: 0.1)  // end too soon
+        _ = ep.process(speechStarted: true, speechEnded: false, dt: 0.1)  // 0.1s only
+        let ev = ep.process(speechStarted: false, speechEnded: true, dt: 0.1)  // end too soon
         #expect(ev.contains(.finalize) == false)
         #expect(ep.inUtterance == false)
     }
 
     @Test func maxSpeechCapFlushes() {
         var ep = Endpointer(config: .init(minSpeech: 0.30, maxSpeech: 10))
-        _ = ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)
+        _ = ep.process(speechStarted: true, speechEnded: false, dt: 0.1)
         var finalized = false
         for _ in 0..<200 where !finalized {  // nonstop voice, no speechEnd
-            finalized = ep.process(speechStarted: false, speechEnded: false, sentenceEnded: false, dt: 0.1).contains(.finalize)
+            finalized = ep.process(speechStarted: false, speechEnded: false, dt: 0.1).contains(.finalize)
         }
         #expect(finalized)
     }
 
-    @Test func sentencePunctuationClosesAfterMinSpeech() {
+    @Test func provisionalPunctuationDoesNotCutActiveSpeech() {
         var ep = Endpointer(config: .init(minSpeech: 0.30, maxSpeech: 10))
-        _ = ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)
-        for _ in 0..<4 { _ = ep.process(speechStarted: false, speechEnded: false, sentenceEnded: false, dt: 0.1) }
-        #expect(ep.process(speechStarted: false, speechEnded: false, sentenceEnded: true, dt: 0.1).contains(.finalize))
+        _ = ep.process(speechStarted: true, speechEnded: false, dt: 0.1)
+        for _ in 0..<4 { _ = ep.process(speechStarted: false, speechEnded: false, dt: 0.1) }
+        #expect(ep.process(speechStarted: false, speechEnded: false, partial: "We should review.", dt: 0.1).isEmpty)
     }
 
     @Test func punctuationBeforeMinSpeechIsIgnored() {
         var ep = Endpointer(config: .init(minSpeech: 0.30, maxSpeech: 10))
-        _ = ep.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)
-        #expect(ep.process(speechStarted: false, speechEnded: false, sentenceEnded: true, dt: 0.1).isEmpty)
+        _ = ep.process(speechStarted: true, speechEnded: false, dt: 0.1)
+        #expect(ep.process(speechStarted: false, speechEnded: false, partial: "We should review.", dt: 0.1).isEmpty)
     }
 
-    @Test func endsSentenceDetection() {
-        #expect(Endpointer.endsSentence("Hello."))
-        #expect(Endpointer.endsSentence("好的。"))
-        #expect(Endpointer.endsSentence("really?"))
-        #expect(!Endpointer.endsSentence("hello"))
-        #expect(!Endpointer.endsSentence(""))
+    @Test func semanticGraceExpiresWithoutASecondSileroEnd() {
+        var e = Endpointer()
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 1)
+        #expect(e.process(speechStarted: false, speechEnded: true,
+                          partial: "We need to", dt: 0.04).isEmpty)
+        #expect(e.process(speechStarted: false, speechEnded: false,
+                          partial: "We need to", dt: 1.2) == [.finalize])
     }
 
     @Test func settingsRoundTripWithoutVadMode() throws {
@@ -120,20 +121,20 @@ import Testing
             minSpeech: 0.2, maxSpeech: 10, maxGraceEndings: 1
         ))
         _ = endpointer.process(speechStarted: true, speechEnded: false,
-                               sentenceEnded: false, dt: 0.3)
+                               dt: 0.3)
         // The blip ends with no partial text at all.
         let blip = endpointer.process(
-            speechStarted: false, speechEnded: true, sentenceEnded: false,
-            tooShort: Endpointer.isTooShortToClose(""), dt: 0.1
+            speechStarted: false, speechEnded: true,
+            dt: 0.1
         )
         #expect(blip.contains(.finalize))   // closed, and the grace was never touched
 
         // A fresh utterance, now with real speech that ends mid-thought: the
         // grace is still available to hold it open.
         _ = endpointer.process(speechStarted: true, speechEnded: false,
-                               sentenceEnded: false, dt: 0.3)
+                               dt: 0.3)
         let held = endpointer.process(speechStarted: false, speechEnded: true,
-                                      sentenceEnded: false, sentenceIncomplete: true, dt: 0.1)
+                                      partial: "We need to", dt: 0.1)
         #expect(held.isEmpty)
     }
 
@@ -144,14 +145,14 @@ import Testing
             minSpeech: 0.2, maxSpeech: 10, maxGraceEndings: 1
         ))
         _ = endpointer.process(speechStarted: true, speechEnded: false,
-                               sentenceEnded: false, dt: 0.3)
+                               dt: 0.3)
         // First silence: held open because the text is too short.
         let first = endpointer.process(speechStarted: false, speechEnded: true,
-                                       sentenceEnded: false, tooShort: true, dt: 0.1)
+                                       partial: "然後", dt: 0.1)
         #expect(first.isEmpty)
         // Second: the grace is spent, so it finalizes rather than hanging forever.
         let second = endpointer.process(speechStarted: false, speechEnded: true,
-                                        sentenceEnded: false, tooShort: true, dt: 0.1)
+                                        partial: "然後", dt: 0.1)
         #expect(second.contains(.finalize))
     }
 }

@@ -9,7 +9,10 @@ struct ContentView: View {
     /// closing and reopening the window never spawns a second overlay / hotkey set.
     @ObservedObject var vm: CaptureViewModel
     @State private var showSettings = false
-    @State private var tab: MainTab = .captions
+    @State private var settingsSize = CGSize(width: 560, height: 660)
+    @State private var controlsHeight: CGFloat = 200
+    @State private var detailsHeight: CGFloat = 36
+    @State private var tab: MainTab = AppEnvironment.isUIFixture && AppEnvironment.fixtureScenario == "prompt-result" ? .prompt : .captions
 
     private static let bottomAnchor = "TRANSCRIPT_BOTTOM"
 
@@ -72,31 +75,60 @@ struct ContentView: View {
             }
         }
         .padding(20)
-        // Both dimensions are set by the Prompt tab, which is the denser of the
-        // two. The width now has to hold an editor column and a 300 pt inspector
-        // beside it — at 680 the prompt preview was down to about 330 pt, which is
-        // too narrow to read a rendered prompt in. The height came *down* when the
-        // settings moved into that inspector and stopped contributing to it.
-        .frame(minWidth: 940, minHeight: 620)
+        .frame(minWidth: 640, minHeight: 520)
         .background(CaptionTheme.Palette.canvas)
         .preferredColorScheme(.dark)
         // Entering the tab starts the model download, the way pressing Start
         // does for a meeting. Without it the first compile silently blocks on
         // 2.3 GB with the UI showing only "compiling".
         .onChange(of: tab) { _, current in
-            if current == .prompt { vm.prepareForPromptWork() }
+            if current == .prompt {
+                vm.prepareForPromptWork()
+            } else {
+                vm.prepareForCaptions(refresh: true)
+            }
+        }
+        .onChange(of: vm.audioSourcesLocked) { _, locked in
+            if !locked && tab == .captions { vm.prepareForCaptions(refresh: true) }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: AppEnvironment.fixtureNotification)) { event in
+            guard AppEnvironment.isUIFixture, let scenario = event.object as? String else { return }
+            switch scenario {
+            case "caption-replay":
+                tab = .captions
+                vm.replayCaptionUIFixture()
+            case "prompt-result":
+                tab = .prompt
+                vm.composer.prepareUIFixture()
+            case "summary":
+                tab = .captions
+                vm.summaryText = String(repeating: "會議摘要 Meeting summary — decisions and follow-up actions.\n", count: 20)
+            case "model-prompt": vm.showModelDownloadPrompt = true
+            default:
+                tab = .captions
+                vm.summaryText = ""
+            }
         }
         // Hidden host for Apple's on-device translation session.
-        .background(TranslationHostView(service: vm.translation))
+        .background {
+            if !AppEnvironment.isUIFixture { TranslationHostView(service: vm.translation) }
+        }
         // Bind the main window so closing it stops the meeting + hides the overlay.
         .background(WindowAccessor { vm.bindMainWindow($0) })
         .sheet(isPresented: $showSettings) {
             SettingsView(
                 settings: $vm.settings, vm: vm,
-                initialPane: tab == .prompt ? .prompt : .captions
+                initialPane: tab == .prompt ? .prompt : .captions,
+                presentationSize: settingsSize
             )
         }
         .task {
+            if AppEnvironment.isUIFixture {
+                vm.showModelDownloadPrompt = AppEnvironment.fixtureScenario == "model-prompt"
+                if AppEnvironment.fixtureScenario == "prompt-result" { vm.composer.prepareUIFixture() }
+                if AppEnvironment.fixtureScenario == "caption-replay" { vm.replayCaptionUIFixture() }
+                return
+            }
             // Ask the Speech framework whether the built-in recognizer exists on
             // this machine before anything reads the answer. Until it has run,
             // `builtInAvailable` is false — which is the safe default: starting a
@@ -116,7 +148,7 @@ struct ContentView: View {
                 + "sentences are still recoverable — export them or generate a summary.")
         }
         .alert("下載模型？ Download models?", isPresented: $vm.showModelDownloadPrompt) {
-            Button("下載 Download") { Task { await vm.downloadAllModels() } }
+            Button("下載 Download") { Task { if !AppEnvironment.isUIFixture { await vm.downloadAllModels() } } }
             Button("稍後 Later", role: .cancel) {}
         } message: {
             Text("""
@@ -180,22 +212,77 @@ struct ContentView: View {
         .help(item.hint)
     }
 
-    /// The original single-window layout, unchanged — only lifted into its own
-    /// property so the Prompt tab can sit beside it.
+    /// The transcript must receive a finite viewport. Enclosing its ScrollView
+    /// in another vertical ScrollView expands it to the whole transcript and
+    /// makes scrollTo move an offscreen inner viewport instead of the visible one.
     private var captionsPane: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            sourcesSection
-            actionRow
-            languageChip
-            transcriptArea
-            if !vm.summaryText.isEmpty { summaryArea }
-            footer
+        GeometryReader { geometry in
+            let desiredControls = min(controlsHeight, geometry.size.height * 0.42)
+            // The summary owns its 150pt text viewport. It must not sit inside
+            // another capped ScrollView, which clipped the card to the footer.
+            let summary = vm.summaryText.isEmpty ? 0.0 : 194.0
+            let spacing = vm.summaryText.isEmpty ? 24.0 : 36.0
+            let details = min(max(36, detailsHeight), max(36, geometry.size.height * 0.14))
+            let transcriptMinimum = vm.summaryText.isEmpty ? min(160, geometry.size.height * 0.4) : 64.0
+            let remaining = max(0, geometry.size.height - summary - details - transcriptMinimum - spacing)
+            // A short screen may scroll the controls, but must retain a full
+            // button row and a full status/permission row beside the summary.
+            let controls = min(desiredControls, max(44, remaining))
+            VStack(alignment: .leading, spacing: 12) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        sourcesSection
+                        actionRow
+                        languageChip
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(GeometryReader { g in
+                        Color.clear.preference(key: CaptionControlsHeight.self, value: g.size.height)
+                    })
+                }
+                .frame(height: controls)
+                transcriptArea
+                    .frame(height: max(1, geometry.size.height - controls - details - summary - spacing))
+                if !vm.summaryText.isEmpty {
+                    summaryArea
+                        .frame(height: summary)
+                }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 8) {
+                        footer
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .background(GeometryReader { g in
+                        Color.clear.preference(key: CaptionDetailsHeight.self, value: g.size.height)
+                    })
+                }
+                .frame(height: details)
+            }
+            .onPreferenceChange(CaptionControlsHeight.self) { controlsHeight = $0 }
+            .onPreferenceChange(CaptionDetailsHeight.self) { detailsHeight = $0 }
         }
     }
 
     // MARK: - Title bar
 
     private var titleBar: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 10) {
+                brand
+                subtitle
+                Spacer()
+                titleActions
+            }
+            VStack(alignment: .leading, spacing: 6) {
+                HStack { brand; Spacer(); titleActions }
+                subtitle
+            }
+        }
+    }
+
+    private var brand: some View {
         HStack(spacing: 10) {
             RoundedRectangle(cornerRadius: 6, style: .continuous)
                 .fill(LinearGradient(colors: [CaptionTheme.Palette.accentSystem, CaptionTheme.Palette.privacy],
@@ -203,28 +290,53 @@ struct ContentView: View {
                 .frame(width: 24, height: 24)
                 .overlay(Circle().fill(.white).frame(width: 9, height: 9))
             Text("Flow Translate").font(.system(size: 17, weight: .bold))
-            Text("即時雙語字幕 Bilingual captions").font(.caption).foregroundStyle(CaptionTheme.Palette.inkTertiary)
-            Spacer()
+        }
+        .fixedSize()
+    }
+
+    private var subtitle: some View {
+        Text("即時雙語字幕 Bilingual captions").font(.caption)
+            .foregroundStyle(CaptionTheme.Palette.inkTertiary)
+    }
+
+    private var titleActions: some View {
+        HStack(spacing: 10) {
             statusPill
-            Button { showSettings = true } label: {
-                Image(systemName: "gearshape").imageScale(.large)
-                    .foregroundStyle(CaptionTheme.Palette.inkSecondary)
+            Button {
+                settingsSize = vm.settingsPresentationSize
+                showSettings = true
+            } label: {
+                Label("設定", systemImage: "gearshape")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.bordered)
+            .keyboardShortcut(",", modifiers: .command)
             .help("設定 Settings")
         }
+        .fixedSize()
     }
 
     @ViewBuilder
     private var statusPill: some View {
-        if vm.isSummarizing {
+        if AppEnvironment.isUIFixture {
+            pill("隔離測試 QA", color: .orange)
+        } else if vm.isSummarizing {
             pill("整理摘要中… Summarizing", color: CaptionTheme.Palette.pin, spinner: true)
         } else {
             switch vm.asrState {
             case .listening: pill("聆聽中 Listening", color: CaptionTheme.Palette.mic, breathing: true)
-            case .warming:   pill("模型載入中 Loading model", color: CaptionTheme.Palette.accentSystem, spinner: true)
+            case .warming:
+                if vm.captionModelLoadFailed {
+                    pill("模型載入失敗 Model load failed", color: .orange)
+                } else {
+                    pill("模型載入中 Loading model", color: CaptionTheme.Palette.accentSystem, spinner: true)
+                }
             case .loading:   pill("準備中 Preparing", color: CaptionTheme.Palette.accentSystem, spinner: true)
-            case .idle:      pill("待命 Idle", color: CaptionTheme.Palette.inkTertiary)
+            case .idle:
+                if vm.captionPrewarmInProgress {
+                    pill("預熱語音模型 Warming up", color: CaptionTheme.Palette.accentSystem, spinner: true)
+                } else {
+                    pill("待命 Idle", color: CaptionTheme.Palette.inkTertiary)
+                }
             }
         }
     }
@@ -250,31 +362,45 @@ struct ContentView: View {
     private var sourcesSection: some View {
         VStack(alignment: .leading, spacing: 9) {
             sectionLabel("音訊來源 SOURCES")
-            HStack(spacing: 10) {
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { sourceCards }
+                VStack(spacing: 10) { sourceCards }
+            }
+            .disabled(vm.audioSourcesLocked || AppEnvironment.isUIFixture)
+
+        }
+    }
+
+    @ViewBuilder private var sourceCards: some View {
                 SourceCard(title: "🎤 麥克風 Mic", color: CaptionTheme.Palette.mic,
                            on: vm.micEnabled, levels: vm.levels, level: \.mic) {
-                    Task { await vm.toggleMic() }
+                    Task { if !AppEnvironment.isUIFixture { await vm.toggleMic() } }
                 }
                 SourceCard(title: "🔊 系統聲 System", color: CaptionTheme.Palette.accentSystem,
                            on: vm.systemEnabled, levels: vm.levels, level: \.system) {
-                    Task { await vm.toggleSystem() }
+                    Task { if !AppEnvironment.isUIFixture { await vm.toggleSystem() } }
                 }
-            }
-        }
     }
 
     // MARK: - Action row
 
     private var actionRow: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(spacing: 12) { primaryActions; Spacer(); secondaryActions }
+            VStack(alignment: .leading, spacing: 10) { primaryActions; secondaryActions }
+        }
+    }
+
+    private var primaryActions: some View {
         HStack(spacing: 12) {
             mainButton
-            HotkeyToggle(
-                title: "浮動字幕 Overlay",
-                keys: "⌃⌥C",
-                isOn: $vm.overlayOn,
-                help: "在任何 app 上方顯示懸浮字幕，隨時可用 ⌃⌥C 開關。"
-            )
-            Spacer()
+            HotkeyToggle(title: "浮動字幕 Overlay", keys: "⌃⌥C", isOn: $vm.overlayOn,
+                         help: "在任何 app 上方顯示懸浮字幕，隨時可用 ⌃⌥C 開關。")
+        }
+    }
+
+    private var secondaryActions: some View {
+        HStack(spacing: 12) {
             Button { Task { await vm.generateSummary() } } label: {
                 Label("摘要 Summary", systemImage: "doc.text.magnifyingglass").font(.system(size: 12.5))
             }
@@ -300,14 +426,14 @@ struct ContentView: View {
             // Never start a meeting while a summary is generating (its model
             // unload would race the new meeting's translations) or during the
             // launch-time bulk download (duplicate ASR download).
-            .disabled(vm.isSummarizing || vm.isDownloadingModels)
+            .disabled(vm.isSummarizing || vm.isDownloadingModels || AppEnvironment.isUIFixture)
             .help(vm.isSummarizing ? "摘要產生中，完成後才能開始 Summary in progress"
                   : vm.isDownloadingModels ? "模型下載中 Models downloading" : "")
         case .loading:
-            Button {} label: {
-                HStack(spacing: 7) { ProgressView().controlSize(.small); Text("載入中 Loading") }.frame(minWidth: 96)
+            Button { Task { await vm.endMeeting() } } label: {
+                HStack(spacing: 7) { ProgressView().controlSize(.small); Text("取消準備 Cancel") }.frame(minWidth: 96)
             }
-            .buttonStyle(.borderedProminent).controlSize(.large).disabled(true)
+            .buttonStyle(.borderedProminent).controlSize(.large)
         case .warming, .listening:
             // Warming counts as an active meeting (audio already buffers), so the
             // user can stop it the same way.
@@ -324,7 +450,10 @@ struct ContentView: View {
     // MARK: - Language chip
 
     private var languageChip: some View {
-        Button { showSettings = true } label: {
+        Button {
+            settingsSize = vm.settingsPresentationSize
+            showSettings = true
+        } label: {
             HStack(spacing: 8) {
                 Text(vm.settings.scenario == .video ? "🎬 Video" : "👥 Meeting")
                     .font(.system(size: 12, weight: .semibold)).foregroundStyle(CaptionTheme.Palette.inkPrimary)
@@ -373,13 +502,14 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .topLeading)
                 .animation(.easeOut(duration: 0.2), value: vm.lines.count)
             }
-            .frame(minHeight: 220, maxHeight: .infinity)
+            .frame(maxHeight: .infinity)
             .background(Color(hex: 0x161618), in: RoundedRectangle(cornerRadius: 10))
             .overlay(RoundedRectangle(cornerRadius: 10).stroke(.white.opacity(0.05), lineWidth: 1))
-            .onChange(of: vm.lines.count) { _, _ in
+            .onChange(of: vm.lines) { _, _ in
                 withAnimation(.easeOut(duration: 0.2)) { proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
             }
             .onChange(of: vm.interimText) { _, _ in proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
+            .onChange(of: vm.interimChinese) { _, _ in proxy.scrollTo(Self.bottomAnchor, anchor: .bottom) }
         }
     }
 
@@ -439,6 +569,7 @@ struct ContentView: View {
         // own — see `PermissionPane`.
         HStack(spacing: 8) {
             Text(vm.statusMessage).font(.callout).foregroundStyle(CaptionTheme.Palette.inkTertiary)
+                .fixedSize(horizontal: false, vertical: true)
             if let pane = vm.statusAction {
                 Button(PermissionPane.buttonTitle) { pane.open() }
                     .font(.caption)
@@ -453,6 +584,16 @@ struct ContentView: View {
             .tracking(0.5)
             .foregroundStyle(CaptionTheme.Palette.inkTertiary)
     }
+}
+
+private struct CaptionControlsHeight: PreferenceKey {
+    static var defaultValue: CGFloat = 200
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+private struct CaptionDetailsHeight: PreferenceKey {
+    static var defaultValue: CGFloat = 36
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
 // MARK: - Source card
@@ -527,16 +668,7 @@ private struct VolumeMeter: View {
 private enum TranscriptRowLayout {
     static let dotSize: CGFloat = 6
     static let gap: CGFloat = 7
-    static let labelSize: CGFloat = 10
-    /// Sized for the wider *half* of a wrapped name, not the whole name.
-    ///
-    /// The transcript window had room for `Claude Mango` on one line, but the
-    /// column is reserved on every row here too, and 95 pt of it was going to a
-    /// name that fits in 55 pt stacked. Both speaker columns now lay the name out
-    /// the same way, which is also why they can share one measurement.
-    @MainActor static var speakerWidth: CGFloat {
-        CaptionTheme.speakerSlotWidth(labelSize: labelSize, style: .wrapped)
-    }
+    @MainActor static var speakerWidth: CGFloat { CaptionTheme.speakerSlotWidth }
 
     /// Where the caption text — and therefore its wrapped lines and translation
     /// — begins.
@@ -566,21 +698,7 @@ private struct TranscriptRow: View {
                 .alignmentGuide(.firstTextBaseline) { d in d[.bottom] + 1 }
             Group {
                 if reservesSpeakerSlot {
-                    // Fixed-width column: the sentence starts at the same x with
-                    // or without a label, and its wrapped lines stay inside the
-                    // text column instead of running back under the speaker.
-                    Text(SpeakerName.wrapping(line.speakerLabel ?? ""))
-                        .font(.system(size: TranscriptRowLayout.labelSize, weight: .bold))
-                        .foregroundStyle(CaptionTheme.Palette.inkSecondary)
-                        .multilineTextAlignment(.leading)
-                        .lineLimit(2)
-                        // Same reasoning as the floating band: a truncated
-                        // speaker name is worse than a column that widens for it,
-                        // because two names can truncate to the same prefix.
-                        // Both axes: a height proposed by the row is a one-line
-                        // height, and the label needs two.
-                        .fixedSize()
-                        .frame(minWidth: TranscriptRowLayout.speakerWidth, alignment: .leading)
+                    CaptionSpeakerLabel(name: line.speakerLabel ?? "")
                 }
             }
             VStack(alignment: .leading, spacing: 2) {

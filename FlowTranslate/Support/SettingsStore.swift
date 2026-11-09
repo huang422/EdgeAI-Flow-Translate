@@ -7,7 +7,7 @@ enum SettingsStore {
     private static let key = "FlowTranslate.CaptionSettings"
 
     static func load() -> CaptionSettings {
-        guard let data = UserDefaults.standard.data(forKey: key),
+        guard let data = AppEnvironment.preferences.data(forKey: key),
               let settings = try? JSONDecoder().decode(CaptionSettings.self, from: data)
         else { return .default }
         return settings
@@ -15,6 +15,6 @@ enum SettingsStore {
 
     static func save(_ settings: CaptionSettings) {
         guard let data = try? JSONEncoder().encode(settings) else { return }
-        UserDefaults.standard.set(data, forKey: key)
+        AppEnvironment.preferences.set(data, forKey: key)
     }
 }

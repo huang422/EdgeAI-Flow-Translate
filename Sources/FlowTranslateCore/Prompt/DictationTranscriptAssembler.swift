@@ -16,6 +16,11 @@ public enum DictationTranscriptAssembler {
     /// adding a separator puts one inside a Chinese sentence; Nemotron's bare
     /// words need one. A script-aware heuristic cannot tell which it is looking
     /// at, and is wrong in both directions.
+    ///
+    /// A side that already ends or begins with whitespace has written the join
+    /// itself, and a second separator on top of it is the same defect in the
+    /// other direction — a typed draft ending in a space meeting a bare segment,
+    /// or a segment following a line break that would gain a leading space.
     public static func join(
         _ left: String,
         _ right: String,
@@ -23,7 +28,10 @@ public enum DictationTranscriptAssembler {
     ) -> String {
         guard !left.isEmpty else { return right }
         guard !right.isEmpty else { return left }
-        return segmentsCarryOwnSpacing ? left + right : "\(left) \(right)"
+        let alreadyJoined = segmentsCarryOwnSpacing
+            || (left.last?.isWhitespace ?? false)
+            || (right.first?.isWhitespace ?? false)
+        return alreadyJoined ? left + right : "\(left) \(right)"
     }
 
     /// The text to insert, given the finalized transcript and the interim that was

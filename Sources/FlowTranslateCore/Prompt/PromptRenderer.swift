@@ -166,10 +166,18 @@ public enum PromptRenderer {
             // so the *compressed* IR is expanded and recognised constraints come
             // back in full. Losing that distinction was the one regression in
             // folding the old `expandInline` mode into this one.
+            //
+            // Both arms start from the **visible** IR. Reaching for `ir` here
+            // took the un-gated one, so "keep my wording" printed
+            // `out_of_scope`, `risks` and `tools` at `compact` — the three
+            // sections that level exists to remove — while every other mode
+            // dropped them, and the savings meter (which renders `off` with
+            // `expandsRecognisedConstraints`) measured a prompt with different
+            // sections in it from the one on screen.
             let wantsRulebookWording =
                 options.symbolMode != .off || options.expandsRecognisedConstraints
             body = SymbolCompressor.expand(
-                wantsRulebookWording ? compressed.ir : ir,
+                wantsRulebookWording ? compressed.ir : visible,
                 rulebook: options.rulebook, language: language, backend: backend
             )
             symbols = []

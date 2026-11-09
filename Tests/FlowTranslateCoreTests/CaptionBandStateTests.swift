@@ -49,6 +49,24 @@ final class CaptionBandStateTests: XCTestCase {
 
     // MARK: - Roll-up on next utterance
 
+    func testRollUpKeepsWholeBilingualParagraphIdentityAndText() {
+        var band = CaptionBandState(historyLimit: 2)
+        let translation = "第一個段落要整段往上推，這是不能消失的完整句尾。"
+        band.interim(utteranceId: u1, source: .system, english: "First paragraph.",
+                     chinese: translation, expectsTranslation: true)
+        band.commit(utteranceId: u1, source: .system,
+                    sentences: [(k1, "First paragraph.")], expectsTranslation: true)
+        let paragraph = band.slot
+        band.interim(utteranceId: u2, source: .system, english: "Next paragraph.",
+                     chinese: nil, expectsTranslation: true)
+        XCTAssertEqual(band.committed.last, paragraph)
+        // An unfinished translation is still allowed to finish in history;
+        // stability must not freeze an incomplete provisional translation.
+        band.translation(key: k1, text: translation + "晚到的完整補譯。")
+        XCTAssertEqual(band.committed.last?.id, paragraph?.id)
+        XCTAssertEqual(band.committed.last?.chinese, translation + "晚到的完整補譯。")
+    }
+
     func testNewUtteranceRollsUpFinalizedSlot() {
         var band = CaptionBandState(historyLimit: 2)
         band.interim(utteranceId: u1, source: .system, english: "one", chinese: nil, expectsTranslation: false)
@@ -60,12 +78,75 @@ final class CaptionBandStateTests: XCTestCase {
         XCTAssertEqual(band.slot?.english, "two")
     }
 
-    func testUnfinalizedSlotIsReplacedNotRolledUp() {
+    func testNewSourceRollsUpUnfinalizedTextWithoutChangingIt() {
         var band = CaptionBandState(historyLimit: 2)
         band.interim(utteranceId: u1, source: .system, english: "half a sent", chinese: nil, expectsTranslation: false)
         band.interim(utteranceId: u2, source: .microphone, english: "mic talks", chinese: nil, expectsTranslation: false)
-        XCTAssertTrue(band.committed.isEmpty)                   // interim never enters history
+        XCTAssertEqual(band.committed.map(\.english), ["half a sent"])
+        XCTAssertFalse(band.committed[0].isOpen)
+        XCTAssertTrue(band.visibleLines(showInterim: false).isEmpty)
+        XCTAssertNil(band.latestFinal)
         XCTAssertEqual(band.slot?.id, u2)
+    }
+
+    func testLateSpeakerResultLeavesRolledRowsAndNewSpeakerIntact() {
+        var band = CaptionBandState(historyLimit: 2)
+        band.interim(utteranceId: u1, source: .system, english: "We can ship.", chinese: nil,
+                     expectsTranslation: false)
+        band.interim(utteranceId: u1, source: .system, english: "We can ship. Ready?", chinese: nil,
+                     expectsTranslation: false)
+        let read = band.slot?.originalRows.rows
+        band.interim(utteranceId: u2, source: .system, english: "Yes", chinese: nil,
+                     expectsTranslation: false)
+        band.commit(utteranceId: u1, source: .system, sentences: [(k1, "We could ship. Ready?")],
+                    expectsTranslation: false, speakerLabel: "Speaker 1")
+        XCTAssertEqual(band.committed.map(\.id), [u1])
+        XCTAssertEqual(band.committed.first?.originalRows.rows, read)
+        XCTAssertEqual(band.committed.first?.speakerLabel, "Speaker 1")
+        XCTAssertEqual(band.slot?.id, u2)
+        XCTAssertEqual(band.slot?.originalRows.rows, ["Yes"])
+    }
+
+    func testReturningSourceAppendsOnlyTheUnseenSuffix() {
+        var band = CaptionBandState(historyLimit: 2)
+        band.interim(utteranceId: u1, source: .system, english: "We checked the report", chinese: nil,
+                     expectsTranslation: false)
+        band.interim(utteranceId: u2, source: .microphone, english: "Right.", chinese: nil,
+                     expectsTranslation: false)
+        band.interim(utteranceId: u1, source: .system, english: "We checked the report yesterday.", chinese: nil,
+                     expectsTranslation: false)
+        XCTAssertEqual(band.visibleLines(showInterim: true).flatMap(\.originalRows.rows),
+                       ["We checked the report", "Right.", "yesterday."])
+        XCTAssertEqual(band.committed.map(\.id), [u1, u2])
+    }
+
+    func testOldSourceFinalAppendsUnseenWordsWithoutRewritingReadRows() {
+        var band = CaptionBandState(historyLimit: 2)
+        band.interim(utteranceId: u1, source: .system, english: "We can", chinese: nil,
+                     expectsTranslation: false)
+        band.interim(utteranceId: u2, source: .microphone, english: "Right.", chinese: nil,
+                     expectsTranslation: false)
+        band.commit(utteranceId: u1, source: .system, sentences: [(k1, "We could ship tomorrow.")],
+                    expectsTranslation: false)
+        XCTAssertEqual(band.committed.first?.originalRows.rows, ["We can", "ship tomorrow."])
+        XCTAssertEqual(band.slot?.originalRows.rows, ["Right."])
+    }
+
+    func testSpeakerGroupsLabelFrozenRowsAndReceiveEachResultInOrder() {
+        var band = CaptionBandState()
+        band.interim(utteranceId: u1, source: .system, english: "Are we ready? Yes we are.",
+                     chinese: nil, expectsTranslation: true)
+        let rows = band.slot?.originalRows.rows
+        band.addPresentedSpeakerGroup(utteranceId: u1, key: k1, original: "Are we ready?",
+                                      speaker: "A", isLast: false)
+        band.addPresentedSpeakerGroup(utteranceId: u1, key: k2, original: "Yes we are.",
+                                      speaker: "B", isLast: true)
+        band.translation(key: k2, text: "好了。")
+        band.translation(key: k1, text: "準備好了嗎？")
+        XCTAssertEqual(band.slot?.id, u1)
+        XCTAssertEqual(band.slot?.originalRows.rows, rows)
+        XCTAssertEqual(band.slot?.originalSpeakerLabels, [0: "A", 1: "B"])
+        XCTAssertEqual(band.slot?.chinese, "準備好了嗎？\n好了。")
     }
 
     func testHistoryEviction() {

@@ -71,9 +71,6 @@ enum CaptionTheme {
         // so nothing on screen changes brightness when a sentence finalizes.
         // "In progress" is carried by the breathing dot, caret and underline.
 
-        // Band layout constants. `bandContentHeight` and the views MUST agree on
-        // these — if the reserved height and the rendered rows ever disagree the
-        // band silently clips or leaves a gap, so they share one definition.
         static let dotSize: CGFloat = 6
         /// Gap between the dot, the speaker slot and the caption text.
         static let gutterSpacing: CGFloat = 8
@@ -82,150 +79,21 @@ enum CaptionTheme {
         /// Gap between caption units.
         static let unitSpacing: CGFloat = 12
 
-        static let enterDuration: Double = 0.18   // 180ms ease-out fade + slide
         static let controlsDuration: Double = 0.16
-        /// In-place morph (interim → finalized) crossfade duration.
-        static let morphDuration: Double = 0.15
         /// History-line fade-out duration on eviction.
         static let evictDuration: Double = 0.25
     }
 
-    // MARK: - Caption band geometry
+    static let speakerLabelSize: CGFloat = 10
 
-    /// Rows the live line may wrap to — **and** the rows its own area reserves.
-    ///
-    /// One number for both, because a reserved area is the only thing that keeps
-    /// the live line's geometry still, and an area cannot reserve fewer rows than
-    /// it allows without the extra row pushing something.
-    ///
-    /// Three, so the cap is not met in practice: roughly 225 Latin or 111 CJK
-    /// characters at the default 600 pt band and 16 pt type, well past what the
-    /// endpointer hands over as one utterance. The cost is paid in blank rows
-    /// under a short caption, which is visible and still; the alternative was an
-    /// ellipsis, or a box that resizes on every interim revision — which is what
-    /// sizing this area to its text actually did.
-    static let liveRecognitionRows = 3
-
-    /// Rows a finalized line may wrap to.
-    ///
-    /// The same as the live line. A finalized caption is the same sentence one
-    /// moment later, so giving it less room only means it says less than it did
-    /// while it was being spoken — which reads as the app taking words away at
-    /// the moment you stop talking.
-    ///
-    /// Unlike the live line this is a **cap, not a reservation**: the history
-    /// area takes its own height, so a one-row sentence costs one row.
-    static let historyRecognitionRows = liveRecognitionRows
-
-    /// Rows the translation may wrap to.
-    ///
-    /// One. Every reserved row past what the sentence uses becomes slack below
-    /// the translation — see `liveRegion` — and this row is the closest to the
-    /// band's lower border, so it is the most expensive place to reserve space
-    /// that is usually empty. Chinese is compact enough that a translation of a
-    /// three-row source normally fits one row.
-    static let translationRows = 1
-
-    /// Height of one translation text row, without the gap above it.
-    static func translationTextRowHeight(_ fontSize: Double) -> CGFloat {
-        ceil(fontSize * 0.82 * 1.45)
-    }
-
-    /// Height reserved for the utterance being spoken.
-    ///
-    /// **A number, not a measurement, and that is the point.** Sizing this area
-    /// to its text means it changes on every interim revision — several times a
-    /// second while anybody is speaking — and the panel is resized to follow,
-    /// always a run loop behind. That was tried, to remove the blank row a short
-    /// caption leaves in a reserved area, and it took the whole overlay's
-    /// stability with it.
-    ///
-    /// So this is the one area that reserves rows it may not use. The finalized
-    /// lines above take their own height, which is what lets the top edge sit on
-    /// the top of the oldest caption rather than on a block of reserved blank.
-    static func liveUnitHeight(_ fontSize: Double, secondLine: Bool) -> CGFloat {
-        CGFloat(liveRecognitionRows) * rowHeight(fontSize)
-            + (secondLine
-               ? Metric.rowGap + CGFloat(translationRows) * translationTextRowHeight(fontSize)
-               : 0)
-    }
-
-    /// Height of ONE recognition row.
-    static func rowHeight(_ fontSize: Double) -> CGFloat { ceil(fontSize * 1.4) }
-
-
-    /// Font size of the diarized speaker name in the overlay.
-    static func speakerLabelSize(_ fontSize: Double) -> CGFloat { max(10, fontSize - 5) }
-
-    /// Fixed width of the speaker-name column, so the caption text starts at the
-    /// same x whether or not the label has arrived yet (it only does at
-    /// finalize).
-    ///
-    /// MEASURED, not estimated: a `size × 5` rule of thumb came out ~2 pt under
-    /// "Speaker 9" at 11 pt and ~9 pt under "Speaker 88" at 17 pt, so the column
-    /// truncated the very labels it exists to show. The same applies to counting
-    /// characters — `DeepSeek` and `Nemotron` are both eight characters and
-    /// `DeepSeek` renders wider — so every candidate is measured.
-    ///
-    /// **Two widths, not one.** Speakers are named `Claude Mango` rather than
-    /// `Speaker 1`, and the full name is 50% wider than the numbered label it
-    /// replaced: 148 pt at the maximum caption size, out of a 600 pt caption
-    /// block. Reserving that on every row of the floating band — including the
-    /// rows with no label — would spend a quarter of the caption width on a
-    /// column that is usually empty. So the band shows the model half alone
-    /// (`Claude`, unique within a session and *narrower* than "Speaker 88" was),
-    /// and the transcript window, which has the room, shows the full name.
-    @MainActor
-    static func speakerSlotWidth(labelSize: CGFloat, style: SpeakerLabelStyle = .wrapped) -> CGFloat {
-        // Memoized. The answer depends only on a font size and a fixed candidate
-        // list, but the call sites are `View` body properties — one per caption
-        // row, twice per row (the column and the second row's indent) — so it ran
-        // on every interim update. Measured at 211 µs a pass over the 22
-        // candidates, that was ~17 ms of main-thread work per second spent
-        // recomputing a constant, at a font size that changes only when the user
-        // drags a slider.
-        let key = SlotKey(labelSize: labelSize, style: style)
-        if let cached = slotWidths[key] { return cached }
-        let font = NSFont.systemFont(ofSize: labelSize, weight: .bold)
-        let widest = style.candidates.reduce(CGFloat(0)) { widest, candidate in
-            max(widest, (candidate as NSString).size(withAttributes: [.font: font]).width)
-        }
-        let width = ceil(widest) + 2
-        slotWidths[key] = width
-        return width
-    }
-
-    private struct SlotKey: Hashable {
-        let labelSize: CGFloat
-        let style: SpeakerLabelStyle
-    }
-
-    /// Bounded by construction: the key is a font size the user picks from a
-    /// 12–22 range and one of three styles, so this holds a handful of entries
-    /// for the life of the process.
-    @MainActor private static var slotWidths: [SlotKey: CGFloat] = [:]
-
-    /// Which form of the generated speaker name a column has to fit.
-    /// One style, because both speaker columns lay the name out the same way.
-    ///
-    /// A `short` (model half only) and a `full` (one line) case lived here while
-    /// the band and the transcript disagreed about which to show. They agree now,
-    /// and an unused case in a sizing enum is a size nothing is measured at —
-    /// which is how the column ends up fitting a name form the app never renders.
-    enum SpeakerLabelStyle: Hashable {
-        /// `Claude` above `Mango`. Sized to the wider half; nothing abbreviated.
-        case wrapped
-
-        var candidates: [String] {
-            switch self {
-            // The numbered fallback is covered by `allNameHalves`: past ten
-            // speakers the pools are exhausted and the halves become `Speaker`
-            // and a count, and a column that cannot fit its own fallback is the
-            // bug this function was written to stop.
-            case .wrapped: return SpeakerNamer.allNameHalves
-            }
-        }
-    }
+    /// Measure the widest displayed name half once, including the source labels
+    /// shown while diarization is still working.
+    @MainActor static let speakerSlotWidth: CGFloat = {
+        let font = NSFont.systemFont(ofSize: speakerLabelSize, weight: .bold)
+        let candidates = SpeakerNamer.allNameHalves + ["系統音訊", "麥克風"]
+        let widest = candidates.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        return ceil(widest) + 2
+    }()
 
     // MARK: - Type
 
@@ -237,6 +105,22 @@ enum CaptionTheme {
     /// Translation (secondary) font — ~0.82× the primary size.
     static func translationFont(_ size: Double) -> Font {
         .system(size: size * 0.82, weight: .regular, design: .default)
+    }
+}
+
+/// The transcript and floating band use the same two-line name and fixed type.
+struct CaptionSpeakerLabel: View {
+    let name: String
+    var reservesSpace = false
+
+    var body: some View {
+        Text(name.isEmpty && reservesSpace ? " \n " : SpeakerName.wrapping(name))
+            .font(.system(size: CaptionTheme.speakerLabelSize, weight: .bold))
+            .foregroundStyle(CaptionTheme.Palette.inkSecondary)
+            .multilineTextAlignment(.leading)
+            .lineLimit(2, reservesSpace: reservesSpace)
+            .fixedSize()
+            .frame(width: CaptionTheme.speakerSlotWidth, alignment: .leading)
     }
 }
 

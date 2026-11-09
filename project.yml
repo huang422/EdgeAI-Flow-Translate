@@ -8,19 +8,19 @@ options:
 packages:
   FlowTranslateCore:
     path: .
-  # Pinned exactly: no Package.resolved is committed (it lives inside the
-  # gitignored .xcodeproj), so CI re-resolves from scratch and an open range
+  # Pin direct versions and restore Dependencies/Package.resolved into the
+  # generated project so transitive packages are reproducible too. An open range
   # silently upgrades the build. 0.15.5 dropped `DownloadUtils`, which this app
   # uses for model-download progress — an open `from:` meant CI broke the moment
   # that version shipped, with no change on our side.
   FluidAudio:
     url: https://github.com/FluidInference/FluidAudio.git
     exactVersion: 0.15.4
-  # Pinned to a minor version so the MLXLLM/MLXLMCommon API matches our code.
+  # Pinned to the validated version so the MLXLLM/MLXLMCommon API matches our code.
   # 2.29.x is required to compile under Xcode 26 / Swift 6.
   MLXSwiftExamples:
     url: https://github.com/ml-explore/mlx-swift-examples.git
-    minorVersion: 2.29.1
+    exactVersion: 2.29.1
   # MLX core (Metal GPU memory control: cacheLimit / clearCache). Pinned to the
   # exact version mlx-swift-examples 2.29.1 already resolves, so no extra download.
   mlx-swift:
@@ -28,6 +28,48 @@ packages:
     exactVersion: 0.29.1
 
 targets:
+  FlowTranslateTranslationDiagnostics:
+    type: tool
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Diagnostics/FlowTranslateTranslationDiagnostics.swift
+      - path: FlowTranslate/Translation/TranslationService.swift
+    dependencies:
+      - package: FlowTranslateCore
+        product: FlowTranslateCore
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        ARCHS: arm64
+  FlowTranslateTerminationDiagnostics:
+    type: tool
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Diagnostics/FlowTranslateTerminationDiagnostics.swift
+      - path: FlowTranslate/Support/AppDelegate.swift
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        ARCHS: arm64
+  FlowTranslateDiagnostics:
+    type: tool
+    platform: macOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Diagnostics/FlowTranslateDiagnostics.swift
+      - path: FlowTranslate/ASR
+      - path: FlowTranslate/AudioCapture
+    dependencies:
+      - package: FlowTranslateCore
+        product: FlowTranslateCore
+      - package: FluidAudio
+        product: FluidAudio
+    settings:
+      base:
+        SWIFT_VERSION: "5.0"
+        ARCHS: arm64
   FlowTranslate:
     type: application
     platform: macOS
@@ -48,6 +90,7 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.flowtranslate.app
+        ARCHS: arm64
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         MARKETING_VERSION: "1.4.0" # x-release-please-version
         CURRENT_PROJECT_VERSION: "1"

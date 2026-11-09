@@ -1,0 +1,428 @@
+import AppKit
+import FlowTranslateCore
+import OSLog
+import SwiftUI
+
+@MainActor final class CaptureViewModel: ObservableObject {
+  @Published var settings = CaptionSettings.default
+  let activePromptRulebookIgnoringCategories = PromptStdlib.all
+  let promptEval = FixtureEval()
+  var isResettingPermissions = false
+  var permissionResetTask: Task<Permissions.ResetReport, Never>?
+  var sourceGenerations: [AudioSourceType: UInt64] = [:]
+  let router: AudioRouter
+  let echoLock = NSLock()
+  var systemSourceOn = false
+  var micEnabled = false
+  var systemEnabled = false
+  var statusMessage = ""
+  var statusAction: PermissionPane?
+  enum ASRState { case idle, loading }
+  var asrState = ASRState.idle
+  var levels = Levels()
+  struct Levels {
+    var mic = 0
+    var system = 0
+  }
+  let resetGate: CaptureGate?
+  var audioSourcesLocked: Bool { isResettingPermissions }
+  let settingsPresentationSize = CGSize(width: 470, height: 420)
+
+  init(router: AudioRouter = AudioRouter(), resetGate: CaptureGate? = nil) {
+    self.router = router
+    self.resetGate = resetGate
+  }
+
+  func drainPromptWorkloads() async { await resetGate?.pause() }
+  func endMeeting() async {}
+  func cancelRecognitionStartup() {}
+  // INSERT: toggleSystem
+  // INSERT: resetPrivacyPermissions
+  func uninstall() {}
+
+  private static let log = Logger()
+  private weak var boundWindow: NSWindow?
+  private let controlWindows = NSHashTable<NSWindow>.weakObjects()
+  private var windowCloseObserver: NSObjectProtocol?
+  private var controlWindowClosed = false
+  private var terminationRequested = false
+  private var closeResourcesTask: Task<Void, Never>?
+  private var summaryTask: Task<Void, Never>?
+  private var acceptingTranslations = true
+  private var acceptingCorrections = true
+  private var captionPrewarmInProgress = false
+  private let asr = FixtureWeights()
+  private let qwenHost = FixtureWeights()
+  private let store: TranscriptStoring = InMemoryTranscriptStore()
+  private var overlayOn = true
+  private var rewarmCount = 0
+
+  func releaseQwen() async {
+    await drainPromptWorkloads()
+    qwenHost.releaseModels()
+  }
+  func prepareForCaptions(refresh: Bool) {
+    guard !controlWindowClosed, !terminationRequested, closeResourcesTask == nil else { return }
+    rewarmCount += 1
+    asr.isWarm = true
+  }
+  // INSERT: prepareForTermination
+  // INSERT: bindMainWindow
+  // INSERT: handleWindowClosed
+  // INSERT: beginClosingResources
+
+  func checkResourceClose() async {
+    func makeWindow() -> NSWindow {
+      let window = DiagnosticWindow(
+        contentRect: NSRect(x: -20000, y: -20000, width: 640, height: 520),
+        styleMask: [.titled, .closable], backing: .buffered, defer: false)
+      window.isReleasedWhenClosed = false
+      window.orderBack(nil)
+      bindMainWindow(window)
+      return window
+    }
+    let first = makeWindow()
+    let second = makeWindow()
+    asr.isWarm = true
+    qwenHost.isWarm = true
+    let releases = asr.releases
+    first.close()
+    check(asr.isWarm && closeResourcesTask == nil, "closing one of two control windows keeps the active window ready")
+    second.close()
+    let closing = closeResourcesTask
+    await closing?.value
+    check(!overlayOn && !asr.isWarm && !qwenHost.isLoaded && rewarmCount == 0
+      && asr.releases == releases + 1 && router.activeSources.isEmpty,
+      "closing an idle control window releases both models and stops automatic prewarm")
+
+    let reopened = makeWindow()
+    let before = rewarmCount
+    var summaryEntered = false
+    summaryTask = Task { [self] in
+      summaryEntered = true
+      try? await Task.sleep(for: .seconds(5))
+      qwenHost.isWarm = true // completes native work even if the task was cancelled
+    }
+    while !summaryEntered { await Task.yield() }
+    reopened.close()
+    let secondClose = closeResourcesTask
+    let latest = makeWindow()  // user reopens before the cleanup finishes
+    await secondClose?.value
+    check(asr.isWarm && rewarmCount == before + 1 && !qwenHost.isLoaded,
+      "rapid reopen prewarms only after cancelled summary releases Qwen")
+
+    await prepareForTermination()
+    check(!asr.isWarm && !qwenHost.isLoaded && rewarmCount == before + 1,
+      "termination releases models without scheduling another preload")
+    latest.orderOut(nil)
+    if let windowCloseObserver { NotificationCenter.default.removeObserver(windowCloseObserver) }
+  }
+}
+
+private final class FixtureWeights {
+  var isWarm = false
+  var isLoaded: Bool { isWarm }
+  var releases = 0
+  func releaseModels() { isWarm = false; releases += 1 }
+}
+
+struct FixtureEval {
+  struct Progress {
+    var done: Int
+    var total: Int
+    var currentCase: String
+  }
+  var progress: Progress? { nil }
+  var tokenAccuracy: String { "" }
+  var statusMessage: String { "" }
+  var pasteableReport: String? { nil }
+  func cancel() {}
+  func run() {}
+}
+
+enum Permissions {
+  struct ResetReport {
+    let summary = ""
+    let isCompleteSuccess = true
+  }
+  static let dictationServices = ["Microphone", "Accessibility"]
+  static let screenRecordingHint = "Permission unavailable"
+  static func requestScreenRecordingOnce() async -> Bool { true }
+  static func resetPrivacyPermissions(services: [String]?) -> ResetReport { .init() }
+}
+
+enum DictationEngineFactory {
+  static let builtInAvailable = true
+  static func resolved(_ settings: CaptionSettings) -> ResolvedDictationEngine { .appleSpeech }
+  static func refreshAvailability() async {}
+}
+
+enum NemotronStreamingService {
+  static func shipDirectory(for language: String) -> String { language }
+  static func variantPresent(language: String, tier: String) -> Bool { true }
+}
+
+struct PermissionsIndicator: View {
+  var body: some View { Section("權限 Permissions") { Button("Open Settings") {} } }
+}
+
+private struct SettingsProbeKey: PreferenceKey {
+  static var defaultValue: [String: CGRect] = [:]
+  static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+    value.merge(nextValue(), uniquingKeysWith: { _, latest in latest })
+  }
+}
+
+private enum SettingsProbe {
+  static var frames: [String: CGRect] = [:]
+}
+
+extension View {
+  fileprivate func settingsProbe(_ key: String) -> some View {
+    background(
+      GeometryReader { geo in
+        Color.clear.preference(
+          key: SettingsProbeKey.self, value: [key: geo.frame(in: .named("settings-host"))])
+      })
+  }
+}
+
+private struct SettingsHarness: View {
+  @ObservedObject var vm: CaptureViewModel
+  let pane: SettingsView.Pane
+  let preferredSize: CGSize
+  let availableSize: CGSize
+
+  var body: some View {
+    SettingsView(settings: $vm.settings, vm: vm, initialPane: pane, presentationSize: preferredSize)
+      .settingsProbe("settings")
+      .frame(width: availableSize.width, height: availableSize.height)
+      .clipped()
+      .coordinateSpace(name: "settings-host")
+      .onPreferenceChange(SettingsProbeKey.self) { SettingsProbe.frames = $0 }
+  }
+}
+
+@MainActor private func checkSettingsLayout() async {
+  for pane in [SettingsView.Pane.captions, .prompt] {
+    for size in [
+      CGSize(width: 560, height: 660), CGSize(width: 560, height: 440),
+      CGSize(width: 400, height: 320),
+    ] {
+      let vm = CaptureViewModel()
+      SettingsProbe.frames = [:]
+      let view = hosted(
+        SettingsHarness(
+          vm: vm, pane: pane,
+          preferredSize: CGSize(width: 560, height: 660), availableSize: size),
+        width: size.width, height: size.height)
+      let window = DiagnosticWindow(
+        contentRect: NSRect(origin: CGPoint(x: -20000, y: -20000), size: size),
+        styleMask: [.borderless], backing: .buffered, defer: false)
+      window.contentView = view
+      window.orderBack(nil)
+      await pump(0.22)
+      let frame = CGRect(origin: .zero, size: size).insetBy(dx: -1, dy: -1)
+      for control in ["sectionPicker", "done"] {
+        let rect = SettingsProbe.frames[control]
+        check(
+          rect.map { !$0.isEmpty && frame.contains($0) } ?? false,
+          "settings \(control) stays visible at \(size), \(pane): \(String(describing: rect))")
+      }
+      window.orderOut(nil)
+    }
+  }
+}
+
+enum PromptDictation {
+  static let tier = "1120ms"
+  static func language(for settings: CaptionSettings) -> String { settings.firstLanguage }
+}
+
+enum RulebookStore {
+  static func reset() {}
+}
+
+enum AppEnvironment { static let isUIFixture = true }
+enum PermissionPane { case screenRecording }
+enum AudioCaptureError: Error { case systemAudioUnavailable }
+
+actor CaptureGate {
+  private(set) var entered = false
+  private var continuation: CheckedContinuation<Void, Never>?
+
+  func pause() async {
+    entered = true
+    await withCheckedContinuation { continuation = $0 }
+  }
+
+  func resume() {
+    continuation?.resume()
+    continuation = nil
+  }
+}
+
+class FixtureCapture: AudioCapturing {
+  var source: AudioSourceType { .system }
+  var isCapturing = false
+  var onChunk: ((AudioChunk) -> Void)?
+  let gate = CaptureGate()
+  func start() async throws {
+    await gate.pause()
+    isCapturing = true
+  }
+  func stop() { isCapturing = false }
+}
+
+final class MicCapture: FixtureCapture {}
+final class SystemAudioTap: FixtureCapture {}
+
+@MainActor private func checkSelectiveReset() async {
+  for resetSystem in [false, true] {
+    let capture = FixtureCapture()
+    let resetGate = resetSystem ? nil : CaptureGate()
+    let router = AudioRouter(capturerFactory: { _ in capture })
+    let vm = CaptureViewModel(router: router, resetGate: resetGate)
+    let toggle = Task { await vm.toggleSystem() }
+    while !(await capture.gate.entered) { await Task.yield() }
+    let reset = Task {
+      await vm.resetPrivacyPermissions(services: resetSystem ? nil : Permissions.dictationServices)
+    }
+    if let resetGate {
+      while !(await resetGate.entered) { await Task.yield() }
+      await capture.gate.resume()
+      await toggle.value
+      check(
+        vm.isResettingPermissions && vm.systemEnabled && router.activeSources.contains(.system),
+        "system startup completes during a dictation-only reset")
+      await resetGate.resume()
+      _ = await reset.value
+    } else {
+      _ = await reset.value
+      await capture.gate.resume()
+      await toggle.value
+    }
+    let expected = !resetSystem
+    check(
+      vm.systemEnabled == expected && router.activeSources.contains(.system) == expected
+        && capture.isCapturing == expected,
+      "reset scope leaves switch and actual capture consistent")
+    router.disable(.system)
+  }
+}
+
+@MainActor private final class SheetFixtureState: ObservableObject {
+  @Published var presented = false
+}
+
+private struct SettingsSheetHarness: View {
+  @ObservedObject var state: SheetFixtureState
+  @ObservedObject var vm: CaptureViewModel
+  @State private var showSettings = false
+  @State private var settingsSize = CGSize(width: 560, height: 660)
+  private var statusPill: some View { Text("模型載入失敗 Model load failed") }
+  // INSERT: titleBar
+  // INSERT: brand
+  // INSERT: subtitle
+  // INSERT: titleActions
+
+  var body: some View {
+    titleBar
+      .padding(20)
+      .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+      .coordinateSpace(name: "settings-host")
+      .onPreferenceChange(SettingsProbeKey.self) { SettingsProbe.frames = $0 }
+      .onChange(of: showSettings) { _, current in state.presented = current }
+      .sheet(isPresented: $showSettings) {
+        SettingsView(settings: $vm.settings, vm: vm, presentationSize: settingsSize)
+          .coordinateSpace(name: "settings-host")
+          .onPreferenceChange(SettingsProbeKey.self) { SettingsProbe.frames = $0 }
+      }
+  }
+}
+
+// These events target windows owned by this diagnostic process.
+@MainActor private func click(_ point: CGPoint, in window: NSWindow) async {
+  guard let content = window.contentView else { return }
+  let local = CGPoint(x: point.x, y: content.isFlipped ? point.y : content.bounds.height - point.y)
+  let location = content.convert(local, to: nil)
+  let time = ProcessInfo.processInfo.systemUptime
+  for type in [NSEvent.EventType.leftMouseDown, .leftMouseUp] {
+    if let event = NSEvent.mouseEvent(
+      with: type, location: location,
+      modifierFlags: [], timestamp: time, windowNumber: window.windowNumber,
+      context: nil, eventNumber: 0, clickCount: 1, pressure: 1)
+    {
+      NSApp.postEvent(event, atStart: false)
+    }
+  }
+  await pump(0.2)
+}
+
+private func scrollView(in view: NSView) -> NSScrollView? {
+  if let scroll = view as? NSScrollView, let document = scroll.documentView,
+    document.frame.height > scroll.contentView.bounds.height + 5
+  {
+    return scroll
+  }
+  for child in view.subviews {
+    if let scroll = scrollView(in: child) { return scroll }
+  }
+  return nil
+}
+
+@MainActor private func checkSettingsSheet() async {
+  let size = CGSize(width: 640, height: 520)
+  let state = SheetFixtureState()
+  let vm = CaptureViewModel()
+  SettingsProbe.frames = [:]
+  let window = DiagnosticWindow(
+    contentRect: NSRect(origin: CGPoint(x: -20000, y: -20000), size: size),
+    styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+  window.contentView = hosted(
+    SettingsSheetHarness(state: state, vm: vm),
+    width: size.width, height: size.height)
+  window.orderBack(nil)
+  await pump(0.2)
+  if let entry = SettingsProbe.frames["entry"] {
+    check(
+      CGRect(origin: .zero, size: size).contains(entry),
+      "main settings entry is visible at the minimum window size")
+    await click(CGPoint(x: entry.midX, y: entry.midY), in: window)
+  }
+  await pump(0.3)
+  guard let sheet = window.attachedSheet else {
+    check(false, "settings presents an attached AppKit sheet")
+    window.orderOut(nil)
+    return
+  }
+  let frame = CGRect(origin: .zero, size: sheet.contentLayoutRect.size).insetBy(dx: -1, dy: -1)
+  let initialDone = SettingsProbe.frames["done"]
+  check(
+    initialDone.map { frame.contains($0) } ?? false, "Done is visible inside the attached sheet")
+  if let selector = SettingsProbe.frames["sectionPicker"] {
+    await click(CGPoint(x: selector.maxX - selector.width / 4, y: selector.midY), in: sheet)
+  }
+  check(
+    SettingsProbe.frames["promptForm"] != nil, "the visible settings selector switches to Prompt")
+  if let content = sheet.contentView, let scroll = scrollView(in: content),
+    let document = scroll.documentView
+  {
+    let clip = scroll.contentView
+    let before = clip.bounds.origin
+    clip.scroll(to: CGPoint(x: before.x, y: max(0, document.frame.height - clip.bounds.height)))
+    scroll.reflectScrolledClipView(clip)
+    await pump(0.15)
+    check(
+      clip.bounds.origin != before && SettingsProbe.frames["done"] == initialDone,
+      "scrolling the form leaves Done reachable")
+  } else {
+    check(false, "the attached settings form has its own scroll viewport")
+  }
+  if let done = SettingsProbe.frames["done"] {
+    await click(CGPoint(x: done.midX, y: done.midY), in: sheet)
+  }
+  check(!state.presented, "clicking Done dismisses the attached sheet")
+  if let sheet = window.attachedSheet { window.endSheet(sheet) }
+  window.orderOut(nil)
+}

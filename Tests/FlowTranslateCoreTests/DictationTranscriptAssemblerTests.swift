@@ -27,6 +27,28 @@ struct DictationTranscriptAssemblerTests {
         #expect(joined == "Hello there")
     }
 
+    /// The Prompt tab joins a *typed draft* to a recognizer segment, and a draft
+    /// that ends in a space has already written the join. Adding a second one is
+    /// the same defect as the CJK space, just in the other direction.
+    @Test("A side that already carries the separator does not get another")
+    func existingWhitespaceIsNotDoubled() {
+        #expect(DictationTranscriptAssembler.join(
+            "Fix the uploader ", "it fails on 5xx", segmentsCarryOwnSpacing: false)
+            == "Fix the uploader it fails on 5xx")
+        #expect(DictationTranscriptAssembler.join(
+            "Fix the uploader", " it fails on 5xx", segmentsCarryOwnSpacing: false)
+            == "Fix the uploader it fails on 5xx")
+    }
+
+    /// A newline is whitespace too: a dictated list gets its next item on the
+    /// next line, not on the next line after a stray leading space.
+    @Test("A line break is a join, not something to add a space to")
+    func lineBreaksAreLeftAlone() {
+        #expect(DictationTranscriptAssembler.join(
+            "First item\n", "second item", segmentsCarryOwnSpacing: false)
+            == "First item\nsecond item")
+    }
+
     // MARK: - The duplication bug
 
     /// The regression this type exists for. The drain finalized the utterance and

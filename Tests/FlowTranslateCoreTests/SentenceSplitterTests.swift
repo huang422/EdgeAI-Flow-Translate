@@ -107,26 +107,3 @@ import Testing
         #expect(SentenceSplitter.split("A. 我們明天再討論。") == ["A. 我們明天再討論。"])
     }
 }
-
-/// Terminal punctuation in a streaming partial is not proof a sentence ended —
-/// the recognizer punctuates what it has so far, so 300 ms into
-/// "好，我們開始討論" the partial is "好。" and the early close cut there.
-@Suite struct EndpointerSentenceCloseTests {
-
-    @Test func punctuationOnOneCharacterDoesNotCloseEarly() {
-        #expect(Endpointer.endsSentence("好。") == false)
-        #expect(Endpointer.endsSentence("嗯。") == false)
-        #expect(Endpointer.endsSentence("A.") == false)
-    }
-
-    @Test func aRealShortSentenceStillClosesEarly() {
-        #expect(Endpointer.endsSentence("Yes."))
-        #expect(Endpointer.endsSentence("好的。"))
-        #expect(Endpointer.endsSentence("We shipped it."))
-    }
-
-    @Test func textWithoutTerminalPunctuationNeverCloses() {
-        #expect(Endpointer.endsSentence("so we should") == false)
-        #expect(Endpointer.endsSentence("") == false)
-    }
-}

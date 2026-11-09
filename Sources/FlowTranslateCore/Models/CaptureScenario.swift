@@ -37,11 +37,11 @@ public struct SegmentationTuning: Sendable, Equatable {
         self.maxSpeech = maxSpeech
     }
 
-    /// Produced content: fast splits at edited sentence boundaries.
-    public static let video = SegmentationTuning(minSilence: 0.30, minSpeech: 0.30, maxSpeech: 8)
+    /// Allow natural clause pauses in produced audio without holding live text.
+    public static let video = SegmentationTuning(minSilence: 0.70, minSpeech: 0.30, maxSpeech: 12)
     /// Live speech: tolerate mid-sentence thinking pauses; drop short backchannels
     /// ("mm-hm") via the longer minSpeech; allow longer turns before force-flush.
-    public static let meeting = SegmentationTuning(minSilence: 0.80, minSpeech: 0.40, maxSpeech: 10)
+    public static let meeting = SegmentationTuning(minSilence: 0.80, minSpeech: 0.40, maxSpeech: 16)
 
     public static func forScenario(_ scenario: CaptureScenario) -> SegmentationTuning {
         switch scenario {

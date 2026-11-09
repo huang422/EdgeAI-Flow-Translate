@@ -41,7 +41,7 @@ public enum SpeakerTurnAligner {
 
         var groups: [(tokens: [TimedTextToken], label: String?)] = []
         var previousLabel: String?
-        for token in tokens {
+        for token in completeWords(in: tokens) {
             let label = bestSpeaker(for: token, turns: turns) ?? previousLabel
             // Bind the index rather than testing `groups.last?.label == label`:
             // on an empty `groups` that optional chain yields nil, which compares
@@ -66,6 +66,35 @@ public enum SpeakerTurnAligner {
                 startTime: first.startTime,
                 endTime: max(first.startTime, last.endTime))
         }
+    }
+
+    /// SentencePiece timings may change speaker halfway through a Latin word.
+    /// Score the complete word together and keep punctuation with that word.
+    private static func completeWords(in tokens: [TimedTextToken]) -> [TimedTextToken] {
+        var words: [TimedTextToken] = []
+        var afterSeparator = false
+        for token in tokens {
+            let hasContent = token.text.contains { $0.isLetter || $0.isNumber }
+            let startsWord = hasContent && (afterSeparator || token.text.hasPrefix("▁")
+                || token.text.first?.isWhitespace == true || TokenEstimator.isCJKDominant(token.text))
+            // A standalone separator carries no audio. Do not extend the
+            // previous word into the next speaker's measured turn.
+            let separator = token.text.allSatisfy { $0 == "▁" || $0.isWhitespace }
+            if separator {
+                afterSeparator = true
+                continue
+            }
+            let text = afterSeparator && !token.text.hasPrefix("▁")
+                && token.text.first?.isWhitespace != true ? "▁" + token.text : token.text
+            if !startsWord && !afterSeparator, let previous = words.popLast() {
+                words.append(TimedTextToken(text: previous.text + text,
+                    startTime: previous.startTime, endTime: max(previous.endTime, token.endTime)))
+            } else {
+                words.append(TimedTextToken(text: text, startTime: token.startTime, endTime: token.endTime))
+            }
+            afterSeparator = false
+        }
+        return words
     }
 
     private static func bestSpeaker(for token: TimedTextToken, turns: [SpeakerTurn]) -> String? {

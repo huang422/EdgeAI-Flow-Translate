@@ -55,9 +55,8 @@ protocol DictationEngine: AnyObject {
     /// delivered.
     ///
     /// The engines answer this very differently, which is why it is theirs to
-    /// answer rather than a fixed sleep in the session. Nemotron's pipeline hops
-    /// to the MainActor on its own schedule and offers nothing to await, so it
-    /// waits out a measured window. The Speech framework has a real completion —
+    /// answer rather than a fixed sleep in the session. Nemotron waits for its buffered audio,
+    /// decoder finalization and ordered MainActor delivery. The Speech framework has a real completion —
     /// `finalizeAndFinishThroughEndOfInput()` returns when analysis is done and
     /// the results sequence then ends — so it waits for exactly that and usually
     /// returns much sooner.
@@ -87,12 +86,8 @@ enum Deadline {
     /// MainActor — which would make the deadline unenforceable in exactly the
     /// case it exists for: a MainActor-isolated task that is not yielding.
     static func run(_ limit: Duration, _ work: @escaping @Sendable () async -> Void) async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await work() }
-            group.addTask { try? await Task.sleep(for: limit) }
-            await group.next()
-            group.cancelAll()
-        }
+        let task = Task { await work() }
+        if !(await CancellableTaskWait.wait(for: task, timeout: limit)) { task.cancel() }
     }
 }
 
@@ -135,7 +130,7 @@ final class NemotronDictationEngine: DictationEngine {
     private let asr: NemotronStreamingService
     private let tier: String
 
-    private var savedHandler: ((TranscriptEvent) -> Void)?
+    private var savedHandler: (@MainActor @Sendable (TranscriptEvent) -> Void)?
     /// Whether this engine has actually taken over `asr.onEvent`.
     ///
     /// `savedHandler` alone cannot answer that: it is `nil` both before the
@@ -186,6 +181,7 @@ final class NemotronDictationEngine: DictationEngine {
             // shared task is finished and this returns at once.
             await asr.warmUpWeights()
             try Task.checkCancellation()
+            guard asr.isWarm else { throw DictationEngineError.modelUnavailable }
         } catch {
             // Put the configuration back before throwing: it was already
             // overwritten above, and leaving it applied hands the next meeting a
@@ -200,7 +196,7 @@ final class NemotronDictationEngine: DictationEngine {
         savedHandler = asr.onEvent
         didBorrowHandler = true
         asr.onEvent = { [weak self] event in
-            Task { @MainActor in self?.handle(event) }
+            self?.handle(event)
         }
         do {
             try await asr.startStream()
@@ -215,24 +211,15 @@ final class NemotronDictationEngine: DictationEngine {
     /// another; freeing them here made every ⌃⌥Space pay the load again.
     func closeInput() { asr.stopStream(keepModelsResident: true) }
 
-    /// How long to wait for the pipeline's trailing finalize.
-    ///
-    /// `stopStream()` only breaks the consumer loop; the pipeline then runs one
-    /// last `finalizeUtterance` for the audio it has already taken in, decodes it
-    /// and hops to the MainActor. That is the sentence being spoken when the key
-    /// was pressed. The meeting path waits 600 ms for exactly this, and dictation
-    /// needs it more, not less: a meeting that loses its last sentence still has
-    /// the rest, while a dictation is often *only* that sentence.
-    ///
-    /// A sleep rather than an await because there is nothing to await — the
-    /// pipeline signals completion only by calling `onEvent`.
-    private static let drainWindow: Duration = .milliseconds(600)
-
     func drain() async {
-        try? await Task.sleep(for: Self.drainWindow)
+        await asr.drain()
     }
 
     func release() {
+        // Release also runs when dictation was cancelled during cold model
+        // setup. Such a cancellation must not leave a graceful-stop barrier
+        // blocking the next meeting or deliver its results to the restored owner.
+        if savedConfiguration != nil { asr.cancelStream(keepModelsResident: true) }
         if didBorrowLoadProgress {
             asr.onLoadProgress = savedLoadProgress
             savedLoadProgress = nil
@@ -254,12 +241,21 @@ final class NemotronDictationEngine: DictationEngine {
 
     private func handle(_ event: TranscriptEvent) {
         switch event {
-        case let .interim(text, _, _):
+        case let .interim(text, source, _, _):
+            guard source == .microphone else { return }
             onInterim?(text)
+        case .previewFinal:
+            break
         case let .finalized(segment):
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return }
-            onFinalized?(text)
+            emitFinal(segment)
+        case let .finalizedGroups(segments):
+            for segment in segments { emitFinal(segment) }
         }
+    }
+
+    private func emitFinal(_ segment: ASRSegment) {
+        guard segment.source == .microphone else { return }
+        let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !text.isEmpty { onFinalized?(text) }
     }
 }

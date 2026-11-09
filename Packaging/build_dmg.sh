@@ -7,26 +7,21 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 APP_NAME="FlowTranslate"
-SCHEME="FlowTranslate"
 BUILD_DIR="Packaging/build"
-DERIVED="$BUILD_DIR/DerivedData"
-EXPORT_DIR="$BUILD_DIR/export"
+DERIVED="build/release"
+EXPORT_DIR="$BUILD_DIR/export.noindex"
 DMG_PATH="$BUILD_DIR/${APP_NAME}.dmg"
 
-echo "==> Generating Xcode project from project.yml"
-command -v xcodegen >/dev/null || { echo "error: install xcodegen (brew install xcodegen)"; exit 1; }
-xcodegen generate
-
-echo "==> Building ${SCHEME} (Release)"
-rm -rf "$DERIVED" "$EXPORT_DIR"
-xcodebuild \
-    -project "${APP_NAME}.xcodeproj" \
-    -scheme "$SCHEME" \
-    -configuration Release \
-    -derivedDataPath "$DERIVED" \
-    -destination 'generic/platform=macOS' \
-    CODE_SIGN_IDENTITY="${CODE_SIGN_IDENTITY:--}" \
-    build
+mkdir -p "$DERIVED"
+LOCK="$PWD/$DERIVED/.deployment-lock"
+if ! mkdir "$LOCK"; then
+    echo 'error: another Release install or package is using build/release.' >&2
+    exit 1
+fi
+STAGED_DMG="$BUILD_DIR/.FlowTranslate-next.dmg"
+trap 'rm -f "$STAGED_DMG"; rmdir "$LOCK"' EXIT
+bash Scripts/build-release.sh
+rm -rf "$EXPORT_DIR"
 
 APP_PATH="$DERIVED/Build/Products/Release/${APP_NAME}.app"
 [ -d "$APP_PATH" ] || { echo "error: build product not found at $APP_PATH"; exit 1; }
@@ -43,17 +38,22 @@ if [ -n "${DEVELOPER_ID_APP:-}" ]; then
     echo "==> Signing staged app with Developer ID"
     bash Packaging/sign_app.sh "$EXPORT_DIR/${APP_NAME}.app"
 else
-    echo "WARNING: DEVELOPER_ID_APP not set — the DMG will contain an AD-HOC"
-    echo "         signed app. Gatekeeper will block it on other Macs until the"
-    echo "         user right-clicks → Open (or runs: xattr -cr the app)."
+    echo "WARNING: DEVELOPER_ID_APP not set — this DMG contains an ad-hoc local build."
+    echo "         External distribution requires Developer ID signing and notarization."
 fi
 
 echo "==> Creating DMG"
-rm -f "$DMG_PATH"
 hdiutil create \
     -volname "$APP_NAME" \
     -srcfolder "$EXPORT_DIR" \
     -ov -format UDZO \
-    "$DMG_PATH"
+    "$STAGED_DMG"
+hdiutil verify "$STAGED_DMG"
+mv "$STAGED_DMG" "$DMG_PATH"
 
+# Only the installed app should remain discoverable by Spotlight.
+LSREGISTER="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
+"$LSREGISTER" -u "$APP_PATH" >/dev/null 2>&1 || true
+rm -rf "$APP_PATH"
+if [[ -z "${DEVELOPER_ID_APP:-}" ]]; then rm -rf "$EXPORT_DIR"; fi
 echo "==> Done: $DMG_PATH"

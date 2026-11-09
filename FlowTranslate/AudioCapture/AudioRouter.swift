@@ -8,8 +8,19 @@ import FlowTranslateCore
 /// consumer, so a quiet meeting participant clears the downstream level gates
 /// (Silero VAD + the `rms ≥ 0.012` voiced check) and still gets recognised.
 public final class AudioRouter: AudioRouting, @unchecked Sendable {
-    public private(set) var activeSources: Set<AudioSourceType> = []
-    public var onChunk: ((AudioChunk) -> Void)?
+    private let sourceLock = NSLock()
+    private var enabledSources: Set<AudioSourceType> = []
+    private var sourceTokens: [AudioSourceType: UUID] = [:]
+    public var activeSources: Set<AudioSourceType> { sourceLock.withLock { enabledSources } }
+    private let handlerLock = NSLock()
+    private var chunkHandler: ((AudioChunk) -> Void)?
+    public var onChunk: ((AudioChunk) -> Void)? {
+        get { handlerLock.withLock { chunkHandler } }
+        set { handlerLock.withLock { chunkHandler = newValue } }
+    }
+    private let clock = SessionAudioClock()
+
+    public func beginSession() { clock.begin() }
 
 
     private var capturers: [AudioSourceType: AudioCapturing] = [:]
@@ -22,7 +33,11 @@ public final class AudioRouter: AudioRouting, @unchecked Sendable {
     ]
     private let gainLock = NSLock()
 
-    public init() {}
+    private let capturerFactory: ((AudioSourceType) throws -> AudioCapturing)?
+
+    public init(capturerFactory: ((AudioSourceType) throws -> AudioCapturing)? = nil) {
+        self.capturerFactory = capturerFactory
+    }
 
     /// Update the per-source input gain live (applied on the next chunk).
     public func setGain(system: GainConfig, mic: GainConfig) {
@@ -34,20 +49,39 @@ public final class AudioRouter: AudioRouting, @unchecked Sendable {
         }
     }
 
+    // Claim ownership on the same actor as the UI's permission/reset check.
+    // The native start can suspend only after disable can find this claim.
+    @MainActor
     public func enable(_ source: AudioSourceType) async throws {
         guard !activeSources.contains(source) else { return }
 
         let capturer: AudioCapturing
-        switch source {
-        case .microphone:
-            capturer = MicCapture()
-        case .system:
-            if #available(macOS 13.0, *) {
-                capturer = SystemAudioTap()
-            } else {
-                throw AudioCaptureError.systemAudioUnavailable
+        if let capturerFactory {
+            capturer = try capturerFactory(source)
+        } else {
+            switch source {
+            case .microphone:
+                capturer = MicCapture()
+            case .system:
+                if #available(macOS 13.0, *) {
+                    capturer = SystemAudioTap()
+                } else {
+                    throw AudioCaptureError.systemAudioUnavailable
+                }
             }
         }
+
+        let token = UUID()
+        let registered = sourceLock.withLock {
+            guard capturers[source] == nil else { return false }
+            // Publish before awaiting start so disable can cancel a warming mic.
+            capturers[source] = capturer
+            sourceTokens[source] = token
+            return true
+        }
+        // A pending start is not an active source. Returning success here lets
+        // another caller show an enabled switch before capture has even started.
+        guard registered else { throw CancellationError() }
 
         gainLock.withLock {
             processors[source] = GainProcessor(config: configs[source] ?? .disabled)
@@ -55,18 +89,45 @@ public final class AudioRouter: AudioRouting, @unchecked Sendable {
 
         capturer.onChunk = { [weak self] chunk in
             guard let self else { return }
-            self.onChunk?(self.boost(chunk))
+            guard self.sourceLock.withLock({ self.sourceTokens[source] == token }) else { return }
+            let normalized = AudioChunk(samples: chunk.samples, source: chunk.source,
+                                        timestamp: self.clock.relativeTime(for: chunk.timestamp))
+            self.onChunk?(self.boost(normalized))
         }
-        try await capturer.start()
-        capturers[source] = capturer
-        activeSources.insert(source)
+        do {
+            try await capturer.start()
+            let accepted = sourceLock.withLock {
+                guard sourceTokens[source] == token else { return false }
+                enabledSources.insert(source)
+                return true
+            }
+            guard accepted else {
+                capturer.stop()
+                throw CancellationError()
+            }
+        } catch {
+            let ownsSource = sourceLock.withLock {
+                guard sourceTokens[source] == token else { return false }
+                capturers[source] = nil
+                sourceTokens[source] = nil
+                enabledSources.remove(source)
+                return true
+            }
+            capturer.stop()
+            if ownsSource { gainLock.withLock { processors[source] = nil } }
+            throw error
+        }
     }
 
     public func disable(_ source: AudioSourceType) {
-        capturers[source]?.stop()
-        capturers[source] = nil
+        let capturer = sourceLock.withLock {
+            let previous = capturers.removeValue(forKey: source)
+            sourceTokens[source] = nil
+            enabledSources.remove(source)
+            return previous
+        }
+        capturer?.stop()
         gainLock.withLock { processors[source] = nil }
-        activeSources.remove(source)
     }
 
     /// Apply the source's gain in place, persisting the processor's adaptive state.

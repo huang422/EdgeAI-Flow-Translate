@@ -58,9 +58,6 @@ public enum PermissionPane: Sendable {
     /// Take the user there. False when System Settings refused the URL, which is
     /// the caller's cue to print the path to click by hand.
     ///
-    /// Reached only from the two places a blocked action can report itself: the
-    /// dictation panel and the main window's status line. The settings readout
-    /// never calls it — see `PermissionsIndicator`.
     @discardableResult
     public func open() -> Bool {
         switch self {
@@ -73,6 +70,23 @@ public enum PermissionPane: Sendable {
 
 /// Permission queries and requests (microphone / screen recording) (FR-014).
 public enum Permissions {
+
+    /// The helper waits for graceful app termination before opening the same
+    /// bundle. It cannot create a second live capture owner during shutdown.
+    @MainActor public static func relaunchApp() {
+        guard !AppEnvironment.isUIFixture else { return }
+        let helper = Process()
+        helper.executableURL = URL(fileURLWithPath: "/bin/sh")
+        helper.arguments = ["-c", "while /bin/kill -0 \"$1\" 2>/dev/null; do /bin/sleep 0.2; done; /usr/bin/open \"$2\"",
+                            "flowtranslate-relaunch", String(ProcessInfo.processInfo.processIdentifier),
+                            Bundle.main.bundleURL.path]
+        do {
+            try helper.run()
+            AppDelegate.requestTermination()
+        } catch {
+            NSAlert(error: error).runModal()
+        }
+    }
 
     // MARK: - Opening System Settings
 

@@ -8,13 +8,8 @@ import SwiftUI
 /// hunting for "why is this not working" should not have to guess which tab keeps
 /// the answer.
 ///
-/// **A readout, not a control panel.** Nothing here asks for anything. macOS is
-/// asked at the moment the feature that needs it is switched on — the microphone
-/// when a source is enabled, Screen Recording when system audio is, Accessibility
-/// when the dictation hotkey is switched on — because that is the only moment
-/// the request has a reason the user can recognise. A row of buttons that prompt
-/// out of context is the same interruption as opening System Settings uninvited,
-/// one press further away.
+/// Missing grants have explicit recovery actions here, including while the
+/// settings sheet covers the main window's status actions.
 struct PermissionsIndicator: View {
     /// Re-read on a timer as well as on activation.
     ///
@@ -40,6 +35,9 @@ struct PermissionsIndicator: View {
                 + "除了麥克風之外，授權後都要重新啟動 App 才會生效：macOS 在程式啟動時就決定了這些權限。")
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if !resetThisLaunch.isEmpty {
+                Button("重新啟動 App Relaunch") { Permissions.relaunchApp() }
+            }
         }
         .onAppear(perform: reload)
         .onReceive(Self.refresh) { _ in reload() }
@@ -52,7 +50,8 @@ struct PermissionsIndicator: View {
         let wasReset = resetThisLaunch.contains(pane.tccService)
         // A reset removes the entry, so a "granted" answer from a process that
         // resolved it at launch is stale — the reset wins until the next launch.
-        let state: RowState = wasReset ? .reset : (isGranted ? .granted : .missing)
+        let state: RowState = wasReset && (pane != .microphone || !isGranted)
+            ? .reset : (isGranted ? .granted : .missing)
 
         return VStack(alignment: .leading, spacing: 3) {
             HStack(spacing: 6) {
@@ -70,8 +69,12 @@ struct PermissionsIndicator: View {
                  : pane.purpose)
                 .font(.caption).foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if state != .granted {
+                Button("\(PermissionPane.buttonTitle) · \(pane.title)") { pane.open() }
+                    .font(.caption)
+            }
         }
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .contain)
         .accessibilityLabel("\(pane.title) \(state.label)")
     }
 

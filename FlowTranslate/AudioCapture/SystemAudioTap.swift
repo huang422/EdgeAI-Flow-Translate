@@ -12,7 +12,6 @@ public final class SystemAudioTap: NSObject, AudioCapturing, SCStreamOutput, @un
 
     private var stream: SCStream?
     private let converter = AudioConverter()
-    private let startTime = Date()
     private let sampleQueue = DispatchQueue(label: "dev.flowtranslate.systemaudio")
 
     public override init() { super.init() }
@@ -73,7 +72,7 @@ public final class SystemAudioTap: NSObject, AudioCapturing, SCStreamOutput, @un
         let chunk = AudioChunk(
             samples: samples,
             source: .system,
-            timestamp: Date().timeIntervalSince(startTime)
+            timestamp: ProcessInfo.processInfo.systemUptime - Double(samples.count) / 16_000
         )
         onChunk?(chunk)
     }

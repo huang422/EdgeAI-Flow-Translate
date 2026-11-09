@@ -23,7 +23,9 @@ public protocol ASRStreaming: AnyObject {
     func startStream() async throws
     func feed(_ chunk: AudioChunk)
     func stopStream()
-    var onEvent: ((TranscriptEvent) -> Void)? { get set }
+    /// Stop input, finish buffered recognition, and deliver all final events.
+    func stopStreamAndDrain() async
+    var onEvent: (@MainActor @Sendable (TranscriptEvent) -> Void)? { get set }
 }
 
 /// Pre-finalization text cleanup protocol (contracts/translation.md, FR-006).

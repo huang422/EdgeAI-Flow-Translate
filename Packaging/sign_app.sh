@@ -14,7 +14,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-APP_PATH="${1:-Packaging/build/export/FlowTranslate.app}"
+APP_PATH="${1:-Packaging/build/export.noindex/FlowTranslate.app}"
 ENTITLEMENTS="FlowTranslate/FlowTranslate.entitlements"
 
 : "${DEVELOPER_ID_APP:?set DEVELOPER_ID_APP}"

@@ -75,4 +75,36 @@ import Testing
         #expect(result[0].text == "Testing.")
         #expect(result[0].speakerLabel == "Speaker 1")
     }
+
+    @Test func speakerBoundaryDoesNotSplitAWord() {
+        let tokens = [
+            TimedTextToken(text: "▁Please", startTime: 0, endTime: 0.3),
+            TimedTextToken(text: "▁trans", startTime: 0.3, endTime: 0.6),
+            TimedTextToken(text: "late", startTime: 0.6, endTime: 0.75),
+            TimedTextToken(text: ".", startTime: 0.75, endTime: 0.75),
+            TimedTextToken(text: "▁Sure", startTime: 0.9, endTime: 1.2),
+        ]
+        let turns = [
+            SpeakerTurn(label: "Speaker 1", startTime: 0, endTime: 0.6),
+            SpeakerTurn(label: "Speaker 2", startTime: 0.6, endTime: 1.3),
+        ]
+        let result = SpeakerTurnAligner.align(tokens: tokens, turns: turns)
+        #expect(result.map(\.text) == ["Please translate.", "Sure"])
+        #expect(result.map(\.speakerLabel) == ["Speaker 1", "Speaker 2"])
+    }
+
+    @Test func standaloneWordSeparatorDoesNotJoinAcrossSpeakers() {
+        let tokens = [
+            TimedTextToken(text: "▁Number", startTime: 0, endTime: 0.6),
+            TimedTextToken(text: "▁", startTime: 0.6, endTime: 0.6),
+            TimedTextToken(text: "1", startTime: 0.6, endTime: 0.7),
+            TimedTextToken(text: "2", startTime: 0.7, endTime: 0.8),
+            TimedTextToken(text: "3", startTime: 0.8, endTime: 0.9),
+        ]
+        let turns = [
+            SpeakerTurn(label: "Speaker 1", startTime: 0, endTime: 0.6),
+            SpeakerTurn(label: "Speaker 2", startTime: 0.6, endTime: 1),
+        ]
+        #expect(SpeakerTurnAligner.align(tokens: tokens, turns: turns).map(\.text) == ["Number", "123"])
+    }
 }

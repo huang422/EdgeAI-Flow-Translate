@@ -64,18 +64,7 @@ public enum PassageChunker {
                 pieces.append(Chunk(text: line, separator: separator))
                 continue
             }
-            // An over-long line splits at sentence boundaries. `SentenceSplitter`
-            // drops the whitespace between sentences, so a single space is put
-            // back — which is what the recognizer wrote there.
-            let sentences = SentenceSplitter.split(line)
-            guard !sentences.isEmpty else {
-                pieces.append(Chunk(text: line, separator: separator))
-                continue
-            }
-            for (position, sentence) in sentences.enumerated() {
-                let isLast = position == sentences.count - 1
-                pieces.append(Chunk(text: sentence, separator: isLast ? separator : " "))
-            }
+            pieces.append(contentsOf: losslessSentences(line, trailing: separator))
         }
 
         var chunks: [Chunk] = []
@@ -86,6 +75,13 @@ public enum PassageChunker {
         // separator when the chunk ends here. Either way it is carried, never
         // invented.
         var pending = ""
+        // Whether this chunk has taken a piece yet, which is **not** the same
+        // question as `current.isEmpty`. A blank line is a piece with empty
+        // text, so testing the string treated the piece after it as the first
+        // one and dropped the `pending` newline between them — losing a blank
+        // line the speaker (or the typist) put there, and breaking the rejoin
+        // identity below.
+        var started = false
 
         for piece in pieces {
             let cost = TokenEstimator.estimate(piece.text)
@@ -93,15 +89,45 @@ public enum PassageChunker {
                 chunks.append(Chunk(text: current, separator: pending))
                 current = ""
                 currentCost = 0
+                started = false
             }
-            current += current.isEmpty ? piece.text : pending + piece.text
+            current += started ? pending + piece.text : piece.text
+            started = true
             currentCost += cost
             pending = piece.separator
         }
-        if !current.isEmpty {
+        if started {
             chunks.append(Chunk(text: current, separator: pending))
         }
         return chunks
+    }
+
+    /// Caption splitting intentionally cleans text. Repair chunking must instead
+    /// retain every original character, including CJK adjacency and whitespace.
+    private static func losslessSentences(_ line: String, trailing: String) -> [Chunk] {
+        let chars = Array(line)
+        var result: [Chunk] = []
+        var start = 0
+        var i = 0
+        while i < chars.count {
+            guard SentenceSplitter.terminators.contains(chars[i]),
+                  !SentenceSplitter.isWordInternalDot(chars, i) else {
+                i += 1
+                continue
+            }
+            var end = i + 1
+            while end < chars.count, SentenceSplitter.terminators.contains(chars[end]) { end += 1 }
+            var next = end
+            while next < chars.count, chars[next].isWhitespace { next += 1 }
+            result.append(Chunk(text: String(chars[start..<end]),
+                                separator: String(chars[end..<next]) + (next == chars.count ? trailing : "")))
+            start = next
+            i = next
+        }
+        if start < chars.count {
+            result.append(Chunk(text: String(chars[start...]), separator: trailing))
+        }
+        return result
     }
 
     /// Put repaired chunks back together exactly as they came apart.

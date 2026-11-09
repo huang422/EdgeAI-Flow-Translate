@@ -10,14 +10,19 @@ public struct EndpointerConfig: Sendable, Equatable {
     public var maxSpeech: TimeInterval
     /// How many acoustic endpoints may be deferred per utterance when the live
     /// text looks unfinished (semantic endpointing, see `SemanticEndpoint`).
-    /// Each deferral waits one more VAD silence window; `maxSpeech` still caps.
+    /// Each deferral waits for `semanticGrace` more audio seconds.
     public var maxGraceEndings: Int
+    public var semanticGrace: TimeInterval
+    public var extendUnpunctuatedSpeech: Bool
 
     public init(minSpeech: TimeInterval = 0.30, maxSpeech: TimeInterval = 8,
-                maxGraceEndings: Int = 1) {
+                maxGraceEndings: Int = 1, semanticGrace: TimeInterval = 0.8,
+                extendUnpunctuatedSpeech: Bool = false) {
         self.minSpeech = minSpeech
         self.maxSpeech = maxSpeech
         self.maxGraceEndings = max(0, maxGraceEndings)
+        self.semanticGrace = max(0, semanticGrace)
+        self.extendUnpunctuatedSpeech = extendUnpunctuatedSpeech
     }
 
     public static let `default` = EndpointerConfig()
@@ -34,13 +39,14 @@ public enum EndpointEvent: Equatable, Sendable {
 /// Pure utterance-boundary tracker driven by Silero `speechStart`/`speechEnd`
 /// events. Source-agnostic and deterministic so it is fully unit tested without a
 /// model. Silero decides starts/endpoints; this enforces a minimum/maximum length
-/// and lets terminal punctuation close a sentence early (secondary to the VAD).
+/// and gives an unfinished thought a bounded extension of the same silence.
 public struct Endpointer {
     public private(set) var config: EndpointerConfig
     public private(set) var inUtterance = false
 
     private var elapsed: TimeInterval = 0   // total time since onset
-    private var graceUsed = 0               // semantic-endpoint deferrals so far
+    private var graceUsed = 0
+    private var graceRemaining: TimeInterval?
 
     public init(config: EndpointerConfig = .default) { self.config = config }
 
@@ -48,31 +54,9 @@ public struct Endpointer {
         inUtterance = false
         elapsed = 0
         graceUsed = 0
+        graceRemaining = nil
     }
 
-    /// Whether terminal punctuation ends the live partial, enabling an early close.
-    ///
-    /// Punctuation alone is not enough. A streaming recognizer punctuates the
-    /// partial it has *so far*, so a speaker 300 ms into "好，我們開始討論" emits
-    /// a partial of "好。" — terminal punctuation on one character — and this
-    /// trigger would close the utterance there, leaving a caption line of a
-    /// single character and the rest of the sentence starting a new one. Worst on
-    /// Chinese, where one character is a whole word and the recognizer is most
-    /// willing to punctuate early.
-    ///
-    /// So an early close also needs enough content to be a sentence. Counted in
-    /// letters, digits and CJK characters rather than words, because a Chinese
-    /// line has no spaces to count.
-    public static func endsSentence(_ s: String) -> Bool {
-        guard let last = s.last, ".?!。！？…".contains(last) else { return false }
-        return TextCounting.contentCharacters(s) >= minContentToClose
-    }
-
-    /// Below this, terminal punctuation is treated as mid-utterance noise and the
-    /// acoustic endpoint is left to decide.
-    ///
-    /// Two, not more: "Yes." and "OK." are complete answers and should still
-    /// close early, while "好。" and "嗯。" are the fragments this exists to stop.
     public static let minContentToClose = 2
 
     /// Whether `text` is long enough to be a sentence of its own.
@@ -96,78 +80,60 @@ public struct Endpointer {
     /// backchannel far more often than it is a sentence.
     public static let minCJKSentence = 4
 
-    /// Whether the live text is too short to close on — the `tooShort` argument
-    /// to `process`.
-    ///
-    /// **Empty is not short.** `isSentenceLength("")` is correctly `false` (an
-    /// empty string is not a sentence), but the call site inverted it into
-    /// "too short to close", which is a different claim: with no partial at all
-    /// there is nothing to judge. A cough or a keyboard click that outlasts
-    /// `minSpeech` before the recognizer emits anything therefore burned the
-    /// utterance's only semantic deferral, and `graceUsed` only resets at the
-    /// next `.start` — which does not fire, because the blip already opened the
-    /// utterance. Real speech then began inside it with no grace left and got cut
-    /// mid-thought at the first pause: the exact failure the semantic endpointer
-    /// exists to prevent, triggered by silence.
+    /// Give a short decoded reply time to continue. Silence or noise with no
+    /// decoded text should never consume the grace period.
     public static func isTooShortToClose(_ text: String) -> Bool {
         guard TextCounting.contentCharacters(text) > 0 else { return false }
         return !isSentenceLength(text)
     }
-
-
-    /// Advance by one chunk of `dt` seconds. `speechStarted`/`speechEnded` are the
-    /// Silero stream events; `sentenceEnded` is a terminal-punctuation hint (used
-    /// only as a secondary close once `minSpeech` is met); `sentenceIncomplete`
-    /// is the semantic hint that the live text ends mid-thought — an acoustic
-    /// endpoint arriving then is deferred (up to `maxGraceEndings` times).
-    /// - Parameter tooShort: the live text is not yet a sentence's worth of
-    ///   speech. Treated exactly like `sentenceIncomplete`: it defers one
-    ///   acoustic close rather than vetoing it.
+    /// Provisional text can defer an acoustic close, but never ends active
+    /// speech on its own. Silero sends one end event per pause, so the grace
+    /// counts down in audio time and expires even if the speaker stays quiet.
     public mutating func process(
-        speechStarted: Bool, speechEnded: Bool, sentenceEnded: Bool,
-        sentenceIncomplete: Bool = false, speakerChanged: Bool = false,
-        tooShort: Bool = false,
-        dt: TimeInterval
+        speechStarted: Bool, speechEnded: Bool, partial: String = "", dt: TimeInterval
     ) -> [EndpointEvent] {
         var events: [EndpointEvent] = []
-
-        if speechStarted && !inUtterance {
-            inUtterance = true
-            elapsed = 0
-            graceUsed = 0
-            events.append(.start)
+        if speechStarted {
+            if !inUtterance {
+                inUtterance = true
+                events.append(.start)
+            }
+            graceRemaining = nil
         }
         guard inUtterance else { return events }
-
         elapsed += dt
 
-        // Primary: Silero endpoint. Finalize if long enough, else drop the blip.
-        if speechEnded {
-            if elapsed < config.minSpeech {
-                reset()
-                return events
-            }
-            // Semantic grace: the text ends mid-thought ("so", "然後…") — hold
-            // the utterance open for one more silence window instead of cutting.
-            // Two reasons to hold the utterance open for one more silence
-            // window: it ends mid-thought, or there is not yet enough of it to
-            // be a sentence. The second is what produced two-character caption
-            // lines — a speaker pausing after "然後" or "好的" hit the acoustic
-            // endpoint with a complete-sounding fragment, so the semantic check
-            // had nothing to object to.
-            if (sentenceIncomplete || tooShort) && graceUsed < config.maxGraceEndings {
-                graceUsed += 1
-                return events
-            }
-            events.append(.finalize)
+        if speechEnded, elapsed < config.minSpeech,
+           TextCounting.contentCharacters(partial) == 0 {
             reset()
             return events
         }
-        // A different speaker took over → close the current line immediately.
-        // Then sentence punctuation, then the wall-clock max cap.
-        if elapsed >= config.minSpeech && (sentenceEnded || speakerChanged) || elapsed >= config.maxSpeech {
+
+        if elapsed >= config.maxSpeech {
             events.append(.finalize)
             reset()
+        } else if speechEnded {
+            let lastWordOrPunctuation = partial.last {
+                !$0.isWhitespace && !"」』）】》\u{201D}\u{2019}\"')]}".contains($0)
+            }
+            let unpunctuated = config.extendUnpunctuatedSpeech
+                && lastWordOrPunctuation.map { !".?!。！？".contains($0) } == true
+            let needsGrace = unpunctuated || SemanticEndpoint.isIncomplete(partial)
+                || Self.isTooShortToClose(partial)
+            if needsGrace, graceUsed < config.maxGraceEndings, config.semanticGrace > 0 {
+                graceUsed += 1
+                graceRemaining = config.semanticGrace
+            } else {
+                events.append(.finalize)
+                reset()
+            }
+        } else if let remaining = graceRemaining {
+            if dt >= remaining {
+                events.append(.finalize)
+                reset()
+            } else {
+                graceRemaining = remaining - dt
+            }
         }
         return events
     }

@@ -32,7 +32,6 @@ public final class MicCapture: AudioCapturing, @unchecked Sendable {
     /// it re-look. A fresh engine asks the system again.
     private var engine = AVAudioEngine()
     private let converter = AudioConverter()
-    private let startTime = Date()
 
     /// Guards `engine` and `stopRequested`.
     ///
@@ -122,7 +121,7 @@ public final class MicCapture: AudioCapturing, @unchecked Sendable {
             let chunk = AudioChunk(
                 samples: samples,
                 source: .microphone,
-                timestamp: Date().timeIntervalSince(self.startTime)
+                timestamp: ProcessInfo.processInfo.systemUptime - Double(samples.count) / 16_000
             )
             self.onChunk?(chunk)
         }

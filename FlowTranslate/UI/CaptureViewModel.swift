@@ -122,7 +122,7 @@ final class CaptureViewModel: ObservableObject {
     /// to avoid. `downloadAllModels()` also runs at `.idle` and drives the same
     /// `MLXModelDownloader` a compile would.
     private var isSharedModelBusy: Bool {
-        asrState != .idle || isSummarizing || isDownloadingModels
+        isClosingResources || asrState != .idle || isSummarizing || isDownloadingModels
     }
 
     /// The three prompt workloads that contend for the shared model.
@@ -134,6 +134,8 @@ final class CaptureViewModel: ObservableObject {
     /// in order to unblock themselves is *which* work to stop, and that is
     /// exactly what the message left out.
     private func sharedModelBlocker(excluding consumer: PromptWorkload) -> String? {
+        if isClosingResources { return "正在釋放模型 Closing" }
+        if isResettingPermissions { return "重設權限中 Resetting permissions" }
         if asrState != .idle { return "會議進行中 Meeting in progress" }
         if isSummarizing { return "產生摘要中 Generating summary" }
         if isDownloadingModels { return "下載模型中 Downloading models" }
@@ -236,7 +238,10 @@ final class CaptureViewModel: ObservableObject {
         },
         settings: { [weak self] in self?.settings ?? CaptionSettings() },
         rulebook: { [weak self] in self?.activePromptRulebook ?? PromptStdlib.all },
-        didFinishWork: { [weak self] in self?.schedulePromptModelRelease() },
+        didFinishWork: { [weak self] in
+            self?.schedulePromptModelRelease()
+            self?.prepareForCaptions(refresh: true)
+        },
         didMoveHUD: { [weak self] origin in self?.settings.promptHUDPosition = origin },
         didChangeInsertMode: { [weak self] mode in self?.settings.promptQuickInsertMode = mode },
         prepareModel: { [weak self] in
@@ -354,7 +359,7 @@ final class CaptureViewModel: ObservableObject {
     private var correctionQueue: [PendingCorrection] = []
     private var correctionRunning = false
     private var inflightCorrection: Task<Void, Never>?
-    private var acceptingCorrections = true
+    private var acceptingCorrections = false
     private let correctionQueueLimit = 4
 
     // Echo suppression: when system audio is playing through speakers, the mic
@@ -364,6 +369,7 @@ final class CaptureViewModel: ObservableObject {
     private let echoLock = NSLock()
     private var lastSystemVoiceAt = Date.distantPast
     private var systemSourceOn = false
+    private var micSuppressionEnabled = false
 
     // Level-meter throttle: post to the MainActor at most ~12 Hz per source
     // instead of once per audio chunk (dozens/sec × 2 sources of UI churn).
@@ -386,12 +392,6 @@ final class CaptureViewModel: ObservableObject {
     // (like the ASR model) so there's no surprise download mid-meeting.
     private var qwenPrefetchTask: Task<Void, Never>?
 
-    // Number of ASR model memory-loads currently in flight (warm preload and/or
-    // a second source's pipeline). Drives the honest `.warming` state so the UI
-    // never claims "Listening" while the model is still loading (audio IS
-    // buffered during the load, so the user can safely start speaking).
-    private var modelLoadsInFlight = 0
-
     // Download percentages surfaced during the Start sequence, composed into ONE
     // status line ("準備模型：ASR 42% · Qwen 背景下載 12%") instead of two
     // independently animating footer rows.
@@ -412,7 +412,8 @@ final class CaptureViewModel: ObservableObject {
     ///
     /// The disk prefetch is deliberately left running: the summary needs those
     /// files even after translation switches to Apple or the meeting ends.
-    private func releaseQwen() async {
+    private func releaseQwen(summaryFinished: Bool = false) async {
+        guard !isSummarizing || summaryFinished else { return }
         mlxQueue.removeAll()
         // Only a consumer that will still be GIVEN work keeps the model. A
         // generation merely running right now must not block the release —
@@ -421,11 +422,13 @@ final class CaptureViewModel: ObservableObject {
         guard !(settings.transcriptCorrectionEnabled && acceptingCorrections) else { return }
         // The prompt features hold this same host, and unloading under a live
         // compile is the `GPU.clearCache` hazard above.
+        let loading = qwenLoadTask
+        loading?.cancel()
         await drainPromptWorkloads()
         await drainInflightTranslations()
         await drainCorrections()
+        await loading?.value
         qwenHost.unload()         // frees the container + returns the MLX cache to the OS
-        qwenLoadTask?.cancel(); qwenLoadTask = nil
     }
 
     /// Free the shared Qwen model once the prompt features have been idle for a
@@ -488,16 +491,9 @@ final class CaptureViewModel: ObservableObject {
     /// leaves the new variant unfetched.
     private var prewarmedDictationKey: String?
 
-    /// Get the recognizer's files ready while the user is looking at the Prompt
-    /// tab, so the first ⌃⌥Space does not pay for fetching and validating the
-    /// variant before it can hear anything — seconds of silence that is
-    /// indistinguishable from the hotkey not working.
-    ///
-    /// Tied to the tab rather than to the hotkey switch, because the tab is where
-    /// intent is declared and where the model is released again on leaving. It is
-    /// also the download-only path: no shared recognizer state is touched, so it
-    /// is safe beside a running meeting, and it costs no memory — weights load
-    /// lazily on the first audio chunk and are freed with everything else.
+    /// Prepare the selected dictation variant while idle. Same-variant weights
+    /// are reused; changing language/tier replaces them. The service rejects a
+    /// late prewarm result if a newer preparation or stream has begun.
     private func prewarmDictationASR() {
         guard !isDownloadingModels, asrState == .idle else { return }
         // **Whichever engine is selected.** The built-in recognizer's assets are
@@ -505,6 +501,8 @@ final class CaptureViewModel: ObservableObject {
         // is the user waiting.
         let engine = DictationEngineFactory.resolved(settings)
         let language = PromptDictation.language(for: settings, engine: engine)
+        // Merely visiting Prompt must not displace the selected caption preload.
+        if engine == .nemotron, asr.isWarm || captionPrewarmInProgress { return }
         let key = "\(engine.rawValue)|\(language)|\(PromptDictation.tier)"
         guard key != prewarmedDictationKey else { return }
         prewarmedDictationKey = key
@@ -526,6 +524,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     func prepareForPromptWork() {
+        guard !AppEnvironment.isUIFixture else { return }
         guard !isSharedModelBusy else { return }
         prewarmDictationASR()
         promptIdleReleaseTask?.cancel()
@@ -583,6 +582,7 @@ final class CaptureViewModel: ObservableObject {
     private func ensureQwenReady(
         report: @escaping @MainActor (QwenLoadPhase) -> Void
     ) async -> Bool {
+        guard !Task.isCancelled else { return false }
         if qwenHost.isLoaded { return true }
         guard qwenLoadFailures < qwenLoadFailureLimit else { return false }
         if qwenLoadTask == nil {
@@ -590,8 +590,11 @@ final class CaptureViewModel: ObservableObject {
                 guard let self else { return }
                 report(.loading(nil))
                 // Wait for the at-Start disk prefetch (if any) so we don't download twice.
-                await self.qwenPrefetchTask?.value
                 do {
+                    if let prefetch = self.qwenPrefetchTask {
+                        _ = await CancellableTaskWait.wait(for: prefetch)
+                    }
+                    try Task.checkCancellation()
                     try await self.qwenHost.ensureLoaded { p in
                         Task { @MainActor in report(.loading(p)) }
                     }
@@ -602,6 +605,8 @@ final class CaptureViewModel: ObservableObject {
                     // the model in between, so the load is never re-attempted.
                     self.qwenLoadTask = nil
                     report(.ready)
+                } catch is CancellationError {
+                    self.qwenLoadTask = nil
                 } catch {
                     Self.log.error("Qwen load failed: \(String(reflecting: error), privacy: .public)")
                     self.qwenLoadFailures += 1
@@ -612,8 +617,10 @@ final class CaptureViewModel: ObservableObject {
                 }
             }
         }
-        await qwenLoadTask?.value
-        return qwenHost.isLoaded
+        if let loading = qwenLoadTask {
+            _ = await CancellableTaskWait.wait(for: loading)
+        }
+        return !Task.isCancelled && qwenHost.isLoaded
     }
 
     /// Await the shared model for a live translation, narrating on `translationStatus`.
@@ -637,7 +644,10 @@ final class CaptureViewModel: ObservableObject {
     private func qwenReadyForCorrection() -> Bool {
         if qwenHost.isLoaded { return true }
         guard qwenLoadFailures < qwenLoadFailureLimit, qwenLoadTask == nil else { return false }
-        Task { @MainActor [weak self] in _ = await self?.ensureQwenReadyForCorrection() }
+        Task { @MainActor [weak self] in
+            guard let self, self.acceptingCorrections, !self.isClosingResources else { return }
+            _ = await self.ensureQwenReadyForCorrection()
+        }
         return false
     }
 
@@ -794,13 +804,11 @@ final class CaptureViewModel: ObservableObject {
     init() {
         // Bound the MLX Metal cache up front so freed Qwen weights / KV caches are
         // returned to the OS instead of lingering (the main memory-bloat fix).
-        MLXMemory.configureAtLaunch()
+        if !AppEnvironment.isUIFixture { MLXMemory.configureAtLaunch() }
 
         // Persist the transcript to Application Support so an unexpected close
         // does not lose accumulated segments (FR-008).
-        let dir = FileManager.default
-            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("FlowTranslate", isDirectory: true)
+        let dir = AppEnvironment.dataDirectory
         store = (try? FileTranscriptStore(directory: dir)) ?? InMemoryTranscriptStore()
 
         router.onChunk = { [weak self] chunk in
@@ -829,7 +837,7 @@ final class CaptureViewModel: ObservableObject {
                 // Both flags read under the lock (`systemSourceOn` is written by
                 // the UI thread in toggleSystem).
                 let suppress = self.echoLock.withLock {
-                    self.systemSourceOn
+                    self.micSuppressionEnabled && self.systemSourceOn
                         && Date().timeIntervalSince(self.lastSystemVoiceAt) < 0.8
                 }
                 if suppress { return }
@@ -837,16 +845,19 @@ final class CaptureViewModel: ObservableObject {
             }
         }
         asr.onEvent = { [weak self] event in
-            Task { @MainActor in self?.handle(event) }
+            self?.handle(event)
         }
-        asr.onModelLoading = { [weak self] loading in
+        asr.onModelLoading = { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
-                // Count in-flight loads (warm preload + per-source pipelines) and
-                // derive the honest warming/listening state from the total, so the
-                // indicator can never be lost to a start-up scheduling race.
-                self.modelLoadsInFlight = max(0, self.modelLoadsInFlight + (loading ? 1 : -1))
                 self.refreshWarmingState()
+                if self.captionPrewarmInProgress, self.asrState == .idle,
+                   let failure = self.asr.modelLoadFailure {
+                    self.statusMessage = "模型預熱失敗：\(failure)。可按「開始」重試。"
+                }
+                if self.asr.isWarm || self.asr.modelLoadFailure != nil {
+                    self.captionPrewarmInProgress = false
+                }
             }
         }
         asr.onVadUnavailable = { [weak self] msg in
@@ -881,6 +892,14 @@ final class CaptureViewModel: ObservableObject {
         overlay.onReset = { [weak self] in
             self?.resetOverlaySettings()
         }
+        if AppEnvironment.isUIFixture {
+            translationStatus = "翻譯語言：en-US → 繁體中文 · Apple 系統翻譯（即時）"
+            statusMessage = "隔離 UI 測試：音訊、模型與全域快捷鍵停用。請使用 /Applications/FlowTranslate.app 操作正式功能。"
+            if AppEnvironment.fixtureScenario == "summary" {
+                summaryText = String(repeating: "會議摘要 Meeting summary — decisions and follow-up actions.\n", count: 20)
+            }
+            return
+        }
         applySettings()
         registerGlobalShortcuts()
     }
@@ -890,16 +909,22 @@ final class CaptureViewModel: ObservableObject {
     private func registerGlobalShortcuts() {
         let mod = controlKey | optionKey
         let center = GlobalHotKeyCenter.shared
-        center.register(keyCode: kVK_ANSI_C, modifiers: mod) { [weak self] in
+        var failed: [String] = []
+        func register(_ name: String, keyCode: Int, label: String, handler: @escaping () -> Void) {
+            if !center.register(name, keyCode: keyCode, modifiers: mod, handler: handler) {
+                failed.append(label)
+            }
+        }
+        register("overlay.toggle", keyCode: kVK_ANSI_C, label: "⌃⌥C") { [weak self] in
             Task { @MainActor in self?.toggleOverlay() }
         }
-        center.register(keyCode: kVK_ANSI_Equal, modifiers: mod) { [weak self] in
+        register("overlay.font.increase", keyCode: kVK_ANSI_Equal, label: "⌃⌥=") { [weak self] in
             Task { @MainActor in self?.stepOverlayFont(1) }
         }
-        center.register(keyCode: kVK_ANSI_Minus, modifiers: mod) { [weak self] in
+        register("overlay.font.decrease", keyCode: kVK_ANSI_Minus, label: "⌃⌥−") { [weak self] in
             Task { @MainActor in self?.stepOverlayFont(-1) }
         }
-        center.register(keyCode: kVK_ANSI_P, modifiers: mod) { [weak self] in
+        register("overlay.pin", keyCode: kVK_ANSI_P, label: "⌃⌥P") { [weak self] in
             Task { @MainActor in self?.overlay.togglePin() }
         }
         // ⌃⌥Space is registered from `applySettings`, not here: it is the one
@@ -909,6 +934,9 @@ final class CaptureViewModel: ObservableObject {
         // every other application — the switch changed nothing a user could
         // observe except that nothing happened.
         applyDictationHotkey()
+        if !failed.isEmpty {
+            statusMessage = "快捷鍵無法註冊：\(failed.joined(separator: ", ")) · 請關閉其他 FlowTranslate 副本或占用這些按鍵的 App，再重新啟動。"
+        }
     }
 
     /// The name the dictation shortcut is registered under.
@@ -972,6 +1000,7 @@ final class CaptureViewModel: ObservableObject {
     /// then opens behind whatever the user is looking at, which is the same as not
     /// asking at all.
     func setDictationHotkey(_ on: Bool) {
+        guard !AppEnvironment.isUIFixture else { return }
         settings.promptHotkeyEnabled = on
         guard on else { return }
         Permissions.requestAccessibilityOnce()
@@ -1007,6 +1036,8 @@ final class CaptureViewModel: ObservableObject {
     private var lastTranslationKey = ""
 
     private func applySettings() {
+        guard !AppEnvironment.isUIFixture else { return }
+        echoLock.withLock { micSuppressionEnabled = settings.suppressMicDuringSystemAudio }
         translation.enabled = settings.needsTranslation
         // "auto" first-caption → let the translator auto-detect the source.
         translation.sourceLanguage = settings.firstLanguage == "auto"
@@ -1044,6 +1075,22 @@ final class CaptureViewModel: ObservableObject {
             availabilityTask = Task { await updateTranslationAvailability() }
         }
         warnIfSelectedVariantMissing()
+        prepareForCaptions()
+    }
+
+    @Published private(set) var captionPrewarmInProgress = false
+    private var captionWarmSelection: String?
+
+    func prepareForCaptions(refresh: Bool = false) {
+        guard !AppEnvironment.isUIFixture, !controlWindowClosed, !isSharedModelBusy,
+              !audioSourcesLocked else { return }
+        let language = settings.firstLanguage
+        let tier = settings.asrTier
+        let selection = "\(language)|\(tier)"
+        guard refresh || captionWarmSelection != selection else { return }
+        captionWarmSelection = selection
+        let accepted = asr.prewarmCachedVariant(language: language, tier: tier)
+        captionPrewarmInProgress = accepted && !asr.isWarm && asr.modelLoadFailure == nil
     }
 
     /// After the first-caption language or ASR tier changes, tell the user right
@@ -1238,11 +1285,7 @@ final class CaptureViewModel: ObservableObject {
                 self.pumpCorrectionQueue()
             }
             guard !Task.isCancelled else { return }
-            // Never WAIT for the model here. `ensureQwenReady` ends in
-            // `await qwenLoadTask?.value`, and awaiting a `Task<Void, Never>` is
-            // not cancellation-aware — a correction parked on the multi-GB load
-            // would hold `endMeeting`'s drain open for the whole thing, so Stop
-            // appeared to hang. Correction is the low-priority track: if the
+            // Never WAIT for the model here. Correction is the low-priority track: if the
             // model isn't resident it starts the load and skips this sentence,
             // and the next one lands once it's warm.
             guard self.qwenReadyForCorrection() else { return }
@@ -1291,16 +1334,33 @@ final class CaptureViewModel: ObservableObject {
         // while the model finishes loading.
         guard asrState.isMeetingActive else { return }
         switch event {
-        case .interim(let text, let source, let at):
-            handleInterim(text: text, source: source, at: at)
+        case .interim(let text, let source, let at, let utteranceId):
+            handleInterim(text: text, source: source, at: at, utteranceId: utteranceId)
+        case .previewFinal(let segment):
+            guard let id = segment.utteranceId else { return }
+            let text = TraditionalChineseGuard.normalizingScript(cleaner.cleanup(segment.text))
+            if utteranceIds[segment.source] != id, !text.isEmpty,
+               (lastInterimAudioTime[segment.source] ?? -.infinity) <= segment.utteranceEndTime {
+                // A short reply may have its first usable text only at decoder
+                // finalization. It still appears before speaker analysis.
+                handleInterim(text: text, source: segment.source, at: segment.utteranceEndTime,
+                              utteranceId: id)
+            }
+            if overlay.model.band.line(for: id) != nil {
+                overlay.model.previewOriginalFinal(utteranceId: id, text: text,
+                                                   expectsTranslation: settings.needsTranslation)
+            }
         case .finalized(let segment):
             handleFinalized(segment)
+        case .finalizedGroups(let segments):
+            for segment in segments { handleFinalized(segment) }
         }
     }
 
     /// Live partial. Both sources record their partial; only the arbiter's owner
     /// drives the displayed interim (main window + overlay slot).
-    private func handleInterim(text: String, source: AudioSourceType, at: TimeInterval) {
+    private func handleInterim(text: String, source: AudioSourceType, at: TimeInterval,
+                               utteranceId: UUID?) {
         // The audio time this partial covers, kept so a *late* finalize can tell
         // whether the partial on screen still belongs to it. Same clock as
         // `ASRSegment.endTime` — both are the capture chunk's timestamp.
@@ -1320,8 +1380,9 @@ final class CaptureViewModel: ObservableObject {
         // the Han range before it asks ICU anything, and caches per character.
         let text = TraditionalChineseGuard.normalizingScript(text)
         interimBySource[source] = text
-        let isNewUtterance = utteranceIds[source] == nil
-        if isNewUtterance { utteranceIds[source] = UUID() }
+        let id = utteranceId ?? utteranceIds[source] ?? UUID()
+        let isNewUtterance = utteranceIds[source] != id
+        utteranceIds[source] = id
 
         let owner = interimArbiter.interim(from: source, at: now)
         guard owner == source else { return }   // background source: recorded only
@@ -1349,17 +1410,20 @@ final class CaptureViewModel: ObservableObject {
         scheduleInterimTranslation(text)
     }
 
-    /// Finalized utterance: clean, split, persist, translate — and commit to the
-    /// caption band. The LAST sentence reuses the utterance id minted at the first
-    /// partial, so the overlay slot morphs in place (interim → final) instead of
-    /// disappearing and re-appearing (the perceived "re-recognition" jump).
+    /// One finalized ASR utterance stays one bilingual paragraph, from partial
+    /// through persistence and roll-up. Splitting it at punctuation used to evict
+    /// the start of a multi-sentence paragraph and translate every piece again.
     private func handleFinalized(_ segment: ASRSegment) {
         let now = Date().timeIntervalSinceReferenceDate
         let source = segment.source
+        let activeUtterance = utteranceIds[source]
         // Whether the partial currently on screen is *this* segment's, or already
         // belongs to the sentence after it. See `lastInterimAudioTime`.
-        let partialIsNewer = (lastInterimAudioTime[source] ?? -.infinity) > segment.endTime
-        let uttId = partialIsNewer ? nil : utteranceIds[source]
+        let partialIsNewer = segment.position == .earlierGroup
+            || (segment.utteranceId != nil && activeUtterance != nil
+                && segment.utteranceId != activeUtterance)
+            || (lastInterimAudioTime[source] ?? -.infinity) > segment.utteranceEndTime
+        let uttId = partialIsNewer ? nil : activeUtterance
         if !partialIsNewer {
             utteranceIds[source] = nil
             interimBySource[source] = nil
@@ -1378,15 +1442,11 @@ final class CaptureViewModel: ObservableObject {
         // No active session (extreme timing edge) → nothing to attribute the
         // segment to; never invent a random session id (FR-008 integrity).
         guard let session = currentSession else { return }
-        // Split a (possibly multi-sentence) utterance into individual sentences,
-        // so captions appear one sentence at a time — not one big block.
-        // Script-normalized before splitting, for the same reason the dictation
-        // path does it: the recognizer writes Mandarin in Simplified — that is
-        // the only Mandarin tag it has — and this app's output is Traditional.
-        // Only the script changes; no word is rewritten.
+        // Keep the whole cleaned paragraph, including its original punctuation
+        // and spacing. The splitter is only a usability check for filler-only /
+        // punctuation-only output; it no longer changes the display unit.
         let recognized = TraditionalChineseGuard.normalizingScript(cleaner.cleanup(segment.text))
-        let sentences = SentenceSplitter.split(recognized)
-        guard !sentences.isEmpty else {
+        guard !SentenceSplitter.split(recognized).isEmpty else {
             // Nothing usable — pure filler, or punctuation the recognizer emitted
             // with no words behind it. Clear the displayed interim AND the band
             // slot; otherwise a caret line would linger forever.
@@ -1396,67 +1456,54 @@ final class CaptureViewModel: ObservableObject {
             return
         }
 
-        // Carry the live translation across the finalize, so the second caption
-        // does not vanish for the second or two before the accurate one arrives.
-        //
-        // Paired to the sentences rather than dropped: a translation of two
-        // sentences is two translations, so splitting it the same way gives each
-        // sentence its own. When the two cannot be paired — merged clauses,
-        // differing counts — this is nil and the pending marker is right.
-        let provisionalTexts = wasDisplayed
-            ? InterimTranslationPairing.pair(
-                interim: interimChinese, toSentenceCount: sentences.count)
-            : nil
-
+        let provisional = wasDisplayed && segment.position == .whole && !interimChinese.isEmpty
+            ? interimChinese : nil
+        let displayId = segment.utteranceId ?? (segment.position == .earlierGroup ? activeUtterance : uttId)
+        let displayed = displayId.flatMap { overlay.model.band.line(for: $0) }
+        let expiredPreview = displayed == nil
+            && displayId.map { overlay.model.band.hasPresented($0) } == true
+        let hasReadRows = displayed.map {
+            $0.id != overlay.model.band.slot?.id || $0.originalRows.rows.count > 1
+        } ?? false
+        let keepsGroupedPreview = hasReadRows && segment.position != .whole
         if wasDisplayed {
-            // Stop live-translating; the accurate finalized translation takes over.
             clearDisplayedInterim()
+            // A full-utterance partial translation cannot be attached to just
+            // the last speaker's words. Retire that partial before committing.
+            if segment.position == .lastGroup, !keepsGroupedPreview, let uttId {
+                overlay.model.applyDiscard(utteranceId: uttId)
+            }
         }
-        // `Speaker 1` → `Claude Mango`, once per raw label per meeting. The same
-        // full name goes everywhere — transcript, stored segment, caption band —
-        // and each view decides how to lay it out.
         let speaker = speakerName(for: segment.speakerLabel, source: source)
-        var pairs: [(key: UUID, english: String)] = []
-        var provisional: [UUID: String] = [:]
-        for (i, sentence) in sentences.enumerated() {
-            let isLast = i == sentences.count - 1
-            let id = (isLast && wasDisplayed && uttId != nil) ? uttId! : UUID()
-            pairs.append((key: id, english: sentence))
-            if let text = provisionalTexts?[i], !text.isEmpty { provisional[id] = text }
-            lines.append(CaptionLine(id: id, english: sentence,
-                                     chinese: provisional[id],
-                                     source: source, timestamp: Date(),
-                                     speakerLabel: speaker?.full))
-            let seg = TranscriptSegment(
-                id: id,
-                sessionId: session.id,
-                index: segmentIndex,
-                startTime: segment.startTime,
-                endTime: segment.endTime,
-                source: source,
-                speakerLabel: speaker?.full,
-                sourceText: sentence
-            )
-            segmentIndex += 1
-            store.append(seg)
-            // Translate via the active backend (Apple or Qwen/MLX).
-            translateSentence(id: id, text: sentence)
-            // Accurate track: repair the recorded sentence behind the live work.
-            enqueueCorrection(id: id, text: sentence)
-        }
+        let retainedId = segment.position == .whole && displayed != nil ? displayId : nil
+        let id = retainedId ?? (wasDisplayed ? uttId : nil) ?? UUID()
+        lines.append(CaptionLine(id: id, english: recognized, chinese: provisional,
+                                 source: source, timestamp: Date(), speakerLabel: speaker?.full))
+        store.append(TranscriptSegment(
+            id: id, sessionId: session.id, index: segmentIndex,
+            startTime: segment.startTime, endTime: segment.endTime,
+            source: source, speakerLabel: speaker?.full, sourceText: recognized))
+        segmentIndex += 1
         if lines.count > 500 { lines.removeFirst(lines.count - 500) }
-        currentOverlayId = pairs.last?.key   // marks that a sentence just finalized
+        if wasDisplayed || overlay.model.band.slot?.isFinal != false { currentOverlayId = id }
 
-        overlay.model.applyCommit(
-            utteranceId: wasDisplayed ? uttId : nil,
-            source: source,
-            sentences: pairs,
-            expectsTranslation: settings.needsTranslation,
-            // The full name. The band wraps it at the join and reserves only the
-            // wider half's width, so it no longer has to be shortened to fit —
-            // and a shortened name stopped identifying anyone past ten speakers.
-            speakerLabel: speaker?.full,
-            provisional: provisional)
+        // Install the key before an exact cached translation or instant phrase
+        // can synchronously return. The same identity now owns the whole text.
+        if !expiredPreview {
+            if keepsGroupedPreview, let displayId {
+                overlay.model.addPresentedSpeakerGroup(
+                    utteranceId: displayId, key: id, original: recognized,
+                    speaker: speaker?.full, isLast: segment.position == .lastGroup)
+            } else {
+                overlay.model.applyCommit(
+                    utteranceId: retainedId ?? (wasDisplayed ? uttId : nil), source: source,
+                    sentences: [(key: id, english: recognized)],
+                    expectsTranslation: settings.needsTranslation, speakerLabel: speaker?.full,
+                    provisional: provisional.map { [id: $0] } ?? [:])
+            }
+        }
+        translateSentence(id: id, text: recognized)
+        enqueueCorrection(id: id, text: recognized)
 
         promoteNextInterim(nextOwner)
     }
@@ -1598,27 +1645,26 @@ final class CaptureViewModel: ObservableObject {
 
     // MARK: - Recognition / meeting lifecycle
 
-    /// Status line for the honest model-warming phase. Incoming audio is ring-
-    /// buffered during the load, so the user can start speaking right away.
-    private static let warmingMessage = "模型載入中…可先開始說話（開頭語音不會漏）"
+    /// A cold native load may exceed the short audio buffer: wait for readiness.
+    private static let warmingMessage = "本機 ASR 準備中…請等候辨識就緒再說話；可按「結束」取消"
     private static let listeningMessage = "辨識中 Listening"
 
-    /// Derive `.warming` ↔ `.listening` from the number of in-flight ASR model
-    /// loads. Runs on every load start/finish; only meaningful mid-meeting.
-    ///
-    /// Known benign edge: a cancelled previous-meeting load can deliver its
-    /// deferred `(false)` after a rapid Stop→Start, briefly flipping to
-    /// `.listening` early — the next chunk's pipeline load flips it back, and
-    /// audio is ring-buffered throughout, so no words are ever lost.
+    var captionModelLoadFailed: Bool { asrState == .warming && asr.modelLoadFailure != nil }
+
+    /// Readiness belongs to the current shared load, never an accumulated count
+    /// of obsolete loads. A failed load must not report Listening.
     private func refreshWarmingState() {
         switch asrState {
         case .warming:
-            if modelLoadsInFlight == 0 {
+            if asr.isWarm {
                 asrState = .listening
                 statusMessage = Self.listeningMessage
+            } else if let failure = asr.modelLoadFailure {
+                statusMessage = "模型載入失敗：\(failure)。可按「結束」後重新開始。"
+                overlay.model.listenState = .failed
             }
         case .listening:
-            if modelLoadsInFlight > 0 {
+            if !asr.isWarm {
                 // A later load (e.g. the second audio source's pipeline) — show
                 // the honest warming state again; its audio is buffered meanwhile.
                 asrState = .warming
@@ -1660,12 +1706,27 @@ final class CaptureViewModel: ObservableObject {
         return ns.localizedDescription
     }
 
+    private var recognitionStartTask: Task<Void, Never>?
+    private var recognitionGeneration: UInt64 = 0
+
     func startRecognition() async {
         // Idle only — and never while a summary is running (its `releaseQwen()`
         // would race a new meeting's translations: GPU.clearCache hazard) or
         // while the launch-time bulk download runs (two concurrent downloads of
         // the same ASR variant would corrupt the cache).
-        guard asrState == .idle, !isSummarizing, !isDownloadingModels else { return }
+        guard !isClosingResources, recognitionStartTask == nil, asrState == .idle, !isSummarizing,
+              !isDownloadingModels, !isResettingPermissions else { return }
+        recognitionGeneration &+= 1
+        let startupToken = recognitionGeneration
+        asrState = .loading
+        let task = Task { [self] in await prepareRecognition(startupToken: startupToken) }
+        recognitionStartTask = task
+        await task.value
+        if recognitionStartTask == task { recognitionStartTask = nil }
+    }
+
+    private func prepareRecognition(startupToken: UInt64) async {
+        let began = ContinuousClock.now
         // The Prompt tab shares this ASR service and the Qwen host, so a compile
         // in flight has to be cancelled AND awaited before the meeting touches
         // either — unloading the Qwen container mid-generation is the known
@@ -1674,14 +1735,17 @@ final class CaptureViewModel: ObservableObject {
         // the same host, so starting a meeting without draining it left the
         // longest of the three running straight into `loadModels`.
         await drainPromptWorkloads()
-        asrState = .loading
+        guard startupToken == recognitionGeneration, !Task.isCancelled, !isResettingPermissions else { return }
+        Self.log.notice("Caption startup prompt cleanup: \(String(describing: ContinuousClock.now - began), privacy: .public)")
         asrDownloadPct = nil
         composeLoadingStatus()
         // Fail fast when the selected variant needs downloading but we're offline
         // (a clear message instead of a 60 s+ URLSession hang at "0%").
         if !NemotronStreamingService.variantPresent(
             language: settings.firstLanguage, tier: settings.asrTier) {
-            guard await NetworkCheck.isOnline() else {
+            let online = await NetworkCheck.isOnline()
+            guard startupToken == recognitionGeneration, !Task.isCancelled, !isResettingPermissions else { return }
+            guard online else {
                 asrState = .idle
                 statusMessage = "目前離線，且所選語言的辨識模型尚未下載（約 600 MB）。請連上網路後再按「開始」。"
                 return
@@ -1700,14 +1764,19 @@ final class CaptureViewModel: ObservableObject {
             asr.keepAcousticContext = settings.keepAcousticContext
             asr.onLoadProgress = { [weak self] p in
                 Task { @MainActor in
-                    guard let self else { return }
+                    guard let self, self.recognitionGeneration == startupToken else { return }
                     self.asrDownloadPct = Int(p * 100)
                     self.composeLoadingStatus()
                 }
             }
             try await asr.loadModels(tier: settings.asrTier)
+            guard startupToken == recognitionGeneration, !Task.isCancelled, !isResettingPermissions else { return }
+            Self.log.notice("Caption startup disk and speaker preparation finished at \(String(describing: ContinuousClock.now - began), privacy: .public)")
+            router.beginSession()
             try await asr.startStream()
+            guard startupToken == recognitionGeneration, !Task.isCancelled, !isResettingPermissions else { return }
             currentSession = store.beginSession(settings: settings)
+            Self.log.notice("Caption startup transcript ready at \(String(describing: ContinuousClock.now - began), privacy: .public)")
             segmentIndex = 0
             lines.removeAll()
             summaryText = ""
@@ -1726,18 +1795,28 @@ final class CaptureViewModel: ObservableObject {
             // it's resident; `refreshWarmingState` flips to listening when the
             // pending load completes. If the model is already resident (isWarm)
             // and nothing is loading, go straight to listening.
-            if asr.isWarm && modelLoadsInFlight == 0 {
+            if asr.isWarm {
                 asrState = .listening
                 statusMessage = Self.listeningMessage
             } else {
                 asrState = .warming
                 statusMessage = Self.warmingMessage
+                refreshWarmingState()
             }
         } catch {
+            guard startupToken == recognitionGeneration, !Task.isCancelled else { return }
             asrState = .idle
             asrDownloadPct = nil
             statusMessage = "模型載入失敗：\(Self.humanizeError(error))。再按一次「開始」即可重試。"
         }
+    }
+
+    private func cancelRecognitionStartup() {
+        recognitionGeneration &+= 1
+        recognitionStartTask?.cancel()
+        recognitionStartTask = nil
+        asr.cancelStream(keepModelsResident: true)
+        asrState = .idle
     }
 
     // MARK: - Model preflight / uninstall
@@ -1820,16 +1899,11 @@ final class CaptureViewModel: ObservableObject {
     // MARK: - Termination
 
     /// Called from `applicationShouldTerminate` (Cmd+Q, logout, shutdown): make
-    /// the transcript durable before the process dies. Synchronous and fast — the
-    /// debounced store write could otherwise lose the last ~2.5 s of sentences.
-    func prepareForTermination() {
-        if asrState.isMeetingActive {
-            asr.stopStream()
-            store.endSession()   // FileTranscriptStore.endSession() flushes to disk
-            asrState = .idle
-        } else {
-            (store as? FileTranscriptStore)?.flush()
-        }
+    /// the transcript durable before the process dies. Await the same stop/drain
+    /// as the Stop button before flushing and replying to the OS.
+    func prepareForTermination() async {
+        terminationRequested = true
+        await beginClosingResources().value
     }
 
     /// Download every model now (ASR variant, Silero VAD, Qwen, and the pyannote
@@ -1837,11 +1911,13 @@ final class CaptureViewModel: ObservableObject {
     /// Idle-only: running this concurrently with a meeting's `loadModels` would
     /// double-download the same ASR variant into the same directory.
     func downloadAllModels() async {
-        guard !isDownloadingModels, asrState == .idle else { return }
+        guard !isClosingResources, !isDownloadingModels, asrState == .idle else { return }
         guard await NetworkCheck.isOnline() else {
             statusMessage = "目前離線，無法下載模型。請連上網路後再試。"
             return
         }
+        guard !isClosingResources, !controlWindowClosed, !isDownloadingModels,
+              asrState == .idle else { return }
         isDownloadingModels = true
         showModelDownloadPrompt = false
         statusMessage = "Downloading models…"
@@ -1859,20 +1935,22 @@ final class CaptureViewModel: ObservableObject {
         _ = await asr.prefetchVAD()
         await qwenPrefetchTask?.value
         isDownloadingModels = false
+        prepareForCaptions(refresh: true)
         statusMessage = modelsPresent
             ? "模型已就緒 Models ready"
             : "部分模型仍未下載 — 請檢查網路後重試 Some models still missing"
     }
 
-    /// Delete every downloaded model + app data, remove the app's privacy (TCC)
+    /// Delete private models + app data, remove the app's privacy (TCC)
     /// entries so a reinstall prompts fresh instead of hitting a stale toggle,
     /// move the app to the Trash, and quit.
     func uninstall() {
+        guard !AppEnvironment.isUIFixture else { return }
         let fm = FileManager.default
         let appSupport = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        for dir in ["FluidAudio", "FlowTranslate"] {
-            try? fm.removeItem(at: appSupport.appendingPathComponent(dir, isDirectory: true))
-        }
+        // FluidAudio is shared with other apps. Uninstall must not remove its
+        // ASR/VAD/speaker cache or unrelated models owned by another project.
+        try? fm.removeItem(at: appSupport.appendingPathComponent("FlowTranslate", isDirectory: true))
         if let bundleId = Bundle.main.bundleIdentifier {
             UserDefaults.standard.removePersistentDomain(forName: bundleId)
         } else {
@@ -1880,7 +1958,7 @@ final class CaptureViewModel: ObservableObject {
         }
         Permissions.resetPrivacyPermissions()
         try? fm.trashItem(at: Bundle.main.bundleURL, resultingItemURL: nil)
-        NSApplication.shared.terminate(nil)
+        AppDelegate.requestTermination()
     }
 
     /// Manually clear this app's privacy entries — Microphone, Screen Recording
@@ -1889,9 +1967,39 @@ final class CaptureViewModel: ObservableObject {
     /// Privacy toggle looks ON but capture fails until the old entry is removed.
     /// Stops active sources first, since their grants are being revoked.
     @discardableResult
-    func resetPrivacyPermissions() async -> Permissions.ResetReport {
-        if micEnabled { await toggleMic() }
-        if systemEnabled { await toggleSystem() }
+    func resetPrivacyPermissions(services: [String]? = nil) async -> Permissions.ResetReport {
+        if let task = permissionResetTask { return await task.value }
+        isResettingPermissions = true
+        let resetsMic = services?.contains("Microphone") ?? true
+        let resetsSystem = services?.contains("ScreenCapture") ?? true
+        if resetsMic { sourceGenerations[.microphone, default: 0] &+= 1 }
+        if resetsSystem { sourceGenerations[.system, default: 0] &+= 1 }
+        let task = Task { [self] in
+            if asrState == .loading { cancelRecognitionStartup() }
+            // A dictation may own the microphone while micEnabled is false.
+            // Return its lease before disabling capture, without calling the
+            // user toggles (which intentionally reject changes during dictation).
+            await drainPromptWorkloads()
+            await endMeeting()
+            if resetsMic {
+                router.disable(.microphone)
+                micEnabled = false
+                levels.mic = 0
+            }
+            if resetsSystem {
+                router.disable(.system)
+                systemEnabled = false
+                levels.system = 0
+                echoLock.withLock { systemSourceOn = false }
+            }
+            let report = AppEnvironment.isUIFixture
+                ? Permissions.ResetReport()
+                : Permissions.resetPrivacyPermissions(services: services)
+            statusMessage = report.summary
+            statusAction = nil
+            return report
+        }
+        permissionResetTask = task
         // The report's own summary, not a verdict derived from it: collapsing the
         // services into one boolean is wrong when only some fail, and a fixed "run
         // these by hand" line is useless when the reason is that `tccutil` cannot
@@ -1899,43 +2007,77 @@ final class CaptureViewModel: ObservableObject {
         //
         // Returned as well as posted to the status line: the caller is a sheet
         // that stays open, and the status line is on the window behind it.
-        let report = Permissions.resetPrivacyPermissions()
-        statusMessage = report.summary
+        let report = await task.value
+        permissionResetTask = nil
+        isResettingPermissions = false
         return report
     }
 
-    /// True while `endMeeting` is inside its drain window, so a second Stop
-    /// (button mash / window close) can't run the teardown twice.
-    private var isStopping = false
+    @Published private(set) var isResettingPermissions = false
+    private var permissionResetTask: Task<Permissions.ResetReport, Never>?
+    private var sourceGenerations: [AudioSourceType: UInt64] = [:]
+
+    /// Every Stop/window-close/Quit caller awaits the same completion.
+    private let meetingStop = MeetingStopCoordinator()
 
     func endMeeting() async {
-        guard asrState.isMeetingActive, !isStopping else { return }
-        isStopping = true
-        defer { isStopping = false }
+        if asrState == .loading {
+            cancelRecognitionStartup()
+            statusMessage = "已取消準備 Cancelled"
+            return
+        }
+        guard asrState.isMeetingActive || meetingStop.isRunning else { return }
+        await meetingStop.run { [self] in await finishMeeting() }
+    }
+
+    private func finishMeeting() async {
+        let cancelledColdLoad = asrState == .warming && !asr.isWarm
+        let modelLoadFailure = asr.modelLoadFailure
         statusMessage = "結束中… Stopping"
-        asr.stopStream()
-        // Drain window: the pipelines' trailing finalize (the sentence being
-        // spoken when Stop was pressed) needs a moment to decode + hop to the
-        // MainActor. Stay "active" briefly so `handle()` still accepts it — the
-        // last words make it into the transcript, and anything later than this
-        // window is dropped by the state guard (no ghost captions).
-        try? await Task.sleep(nanoseconds: 600_000_000)
-        asr.releaseModels()       // free ASR memory
+        // Includes pending cold-start audio, final decoding and delivery on the
+        // MainActor. Keep the session active until the last event is stored.
+        if cancelledColdLoad {
+            // No recognizer exists to drain yet. Cancel this session's pending
+            // audio immediately, while retaining the single shared native load
+            // so a subsequent Start cannot launch a duplicate CoreML compile.
+            asr.cancelStream(keepModelsResident: true)
+        } else {
+            asr.stopStream(keepModelsResident: true)
+            await asr.drain()
+        }
+        acceptingCorrections = false
+        // The ASR's last final can just have queued a translation. Complete
+        // accepted final sentences instead of cancelling them during unload.
+        // New live audio has stopped, so this cannot grow without bound.
+        if translationMethod == .mlx {
+            statusMessage = "完成最後翻譯中… Finishing translations"
+            while !mlxQueue.isEmpty || !inflightTranslations.isEmpty {
+                pumpMLXQueue()
+                let tasks = Array(inflightTranslations.values)
+                guard !tasks.isEmpty else { break } // backend changed/unavailable
+                for task in tasks { await task.value }
+            }
+        }
         // Stop accepting new work first, so nothing can be queued behind the
         // drain that `releaseQwen()` performs before it frees the model.
         acceptingTranslations = false
-        acceptingCorrections = false
         await releaseQwen()       // drains both queues, then frees the model
         store.endSession()
         asrState = .idle
-        modelLoadsInFlight = 0
         interimText = ""
         interimChinese = ""
         resetLiveCaptionState()
         overlay.model.clear()
+        prepareForCaptions()
         if settings.autoCloseOverlayOnStop { overlayOn = false }   // opt-in (Settings)
         // Keep `lines` (the transcript) so it can be summarized / exported on demand.
-        statusMessage = "已結束 Done · 可按「摘要 Summary」產生摘要"
+        if let modelLoadFailure {
+            statusMessage = "模型載入失敗：\(modelLoadFailure)。可按「開始」重試。"
+        } else {
+            statusMessage = cancelledColdLoad
+                ? "已取消尚未就緒的辨識 Cancelled · 未辨識的音訊已捨棄，模型仍在背景準備"
+                : "已結束 Done · 可按「摘要 Summary」產生摘要"
+        }
     }
 
     /// Whether a finished-meeting transcript is available to summarize on demand
@@ -1947,7 +2089,7 @@ final class CaptureViewModel: ObservableObject {
         // anything, so this no longer depends on evaluation order to stay lazy —
         // which is what the previous version needed a paragraph to explain and
         // three other call sites broke anyway.
-        guard asrState == .idle, !isSummarizing, currentSession != nil, !lines.isEmpty
+        guard !isClosingResources, asrState == .idle, !isSummarizing, currentSession != nil, !lines.isEmpty
         else { return false }
         return !busyPromptWorkloads
     }
@@ -1957,9 +2099,26 @@ final class CaptureViewModel: ObservableObject {
     /// (and never slows a new real-time session) unless the user asks for it.
     func generateSummary() async {
         guard canSummarize else { return }
+        isSummarizing = true
+        let task = Task { [self] in await runSummary() }
+        summaryTask = task
+        await task.value
+    }
+
+    private var summaryTask: Task<Void, Never>?
+
+    private func runSummary() async {
+        defer {
+            summaryTask = nil
+            isSummarizing = false
+            prepareForCaptions(refresh: true)
+        }
+        asr.releaseModels()       // summary needs memory; idle meetings reuse ASR weights
+        captionPrewarmInProgress = false
         statusMessage = "產生摘要中… Generating summary…"
         await summarize()
-        await releaseQwen()       // free the shared Qwen model + MLX cache after the summary
+        if !isClosingResources { await releaseQwen(summaryFinished: true) }
+        guard !Task.isCancelled else { return }
         // Honest completion status: `summarize()` can fail on both backends.
         statusMessage = summaryText.isEmpty
             ? "摘要失敗 Summary failed · 請再試一次（記憶體不足或模型未下載）"
@@ -1968,19 +2127,22 @@ final class CaptureViewModel: ObservableObject {
 
     private func summarize() async {
         guard let session = currentSession else { return }
-        isSummarizing = true
-        defer { isSummarizing = false }
-
         var pair: (english: Summary, chinese: Summary)?
         do {
             // Make sure the at-Start disk prefetch finished so the summarizer loads
             // from cache instead of starting its own concurrent download.
-            await qwenPrefetchTask?.value
+            if let prefetch = qwenPrefetchTask {
+                _ = await CancellableTaskWait.wait(for: prefetch)
+            }
+            try Task.checkCancellation()
             statusMessage = "產生摘要中 Generating summary (Qwen3-4B)…"
             pair = try await mlxSummarizer.summarizeBilingual(session: session, segments: store.segments) { p in
                 Task { @MainActor in self.statusMessage = "Summarizing… \(Int(p * 100))%" }
             }
+        } catch is CancellationError {
+            return
         } catch {
+            guard !Task.isCancelled else { return }
             // MLX unavailable (offline / first-run download failed / low memory):
             // fall back to the on-device extractive summary so the user still gets one.
             Self.log.error("Qwen summary failed: \(String(reflecting: error), privacy: .public)")
@@ -1989,7 +2151,7 @@ final class CaptureViewModel: ObservableObject {
             pair = try? await fallbackSummarizer.summarizeBilingual(session: session, segments: store.segments, progress: nil)
         }
 
-        guard let pair else { return }
+        guard let pair, !Task.isCancelled else { return }
         lastSummaryEN = pair.english
         lastSummaryZH = pair.chinese
         // Show English and Traditional Chinese as separate sections.
@@ -2030,27 +2192,95 @@ final class CaptureViewModel: ObservableObject {
     // MARK: - Window lifecycle
 
     private weak var boundWindow: NSWindow?
+    private let controlWindows = NSHashTable<NSWindow>.weakObjects()
     private var windowCloseObserver: NSObjectProtocol?
+    private var controlWindowClosed = false
+    private var terminationRequested = false
+    private var closeResourcesTask: Task<Void, Never>?
+    private var isClosingResources: Bool { terminationRequested || closeResourcesTask != nil }
 
     /// Observe the main control window's close so that closing it stops capturing and
     /// hides the overlay (the app stays running for a quick reopen). Filtered to the
     /// exact window, so closing the Settings sheet doesn't trigger it.
-    func bindMainWindow(_ window: NSWindow?) {
-        guard let window, boundWindow !== window else { return }
-        boundWindow = window
-        if let old = windowCloseObserver { NotificationCenter.default.removeObserver(old) }
-        windowCloseObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification, object: window, queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated { self?.handleWindowClosed() }
-        }
+    var audioSourcesLocked: Bool { isClosingResources || busyPromptWorkloads || isResettingPermissions }
+
+    /// Capture the presenting window once. NSApp.mainWindow can become the
+    /// sheet itself, causing its dimensions to shrink on subsequent refreshes.
+    var settingsPresentationSize: CGSize {
+        let available = boundWindow?.contentLayoutRect.size
+            ?? NSScreen.main?.visibleFrame.size ?? CGSize(width: 640, height: 740)
+        return CGSize(width: min(560, max(320, available.width - 40)),
+                      height: min(660, max(320, available.height - 40)))
     }
 
-    /// Closing the control window stops the meeting and hides the floating overlay, so
-    /// the app never keeps capturing audio (or floating captions) with no visible UI.
+    func bindMainWindow(_ window: NSWindow?) {
+        guard let window, !controlWindows.contains(window),
+              !controlWindowClosed || window.isVisible else { return }
+        let reopening = controlWindowClosed
+        controlWindowClosed = false
+        boundWindow = window
+        controlWindows.add(window)
+        if let visible = window.screen?.visibleFrame {
+            var frame = window.frame
+            frame.size.width = min(frame.width, visible.width)
+            frame.size.height = min(frame.height, visible.height)
+            frame.origin.x = max(visible.minX, min(frame.minX, visible.maxX - frame.width))
+            frame.origin.y = max(visible.minY, min(frame.minY, visible.maxY - frame.height))
+            if frame != window.frame { window.setFrame(frame, display: true) }
+        }
+        if windowCloseObserver == nil {
+            windowCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification, object: nil, queue: .main
+            ) { [weak self] notification in
+                MainActor.assumeIsolated {
+                    guard let self, let closing = notification.object as? NSWindow,
+                          self.controlWindows.contains(closing) else { return }
+                    self.controlWindows.remove(closing)
+                    if self.boundWindow === closing { self.boundWindow = self.controlWindows.anyObject }
+                    if self.controlWindows.count == 0 { self.handleWindowClosed() }
+                }
+            }
+        }
+        if reopening { prepareForCaptions(refresh: true) }
+    }
+
     private func handleWindowClosed() {
-        overlayOn = false                              // didSet → overlay.hide()
-        if asrState.isMeetingActive { Task { await endMeeting() } }
+        controlWindowClosed = true
+        boundWindow = nil
+        _ = beginClosingResources()
+    }
+
+    private func beginClosingResources() -> Task<Void, Never> {
+        if let closeResourcesTask { return closeResourcesTask }
+        overlayOn = false
+        captionPrewarmInProgress = false
+        summaryTask?.cancel()
+        for source in AudioSourceType.allCases {
+            sourceGenerations[source, default: 0] &+= 1
+            router.disable(source)
+        }
+        micEnabled = false
+        systemEnabled = false
+        levels.mic = 0
+        levels.system = 0
+        echoLock.withLock { systemSourceOn = false }
+
+        let task = Task { [self] in
+            await endMeeting()
+            await summaryTask?.value
+            acceptingTranslations = false
+            acceptingCorrections = false
+            await releaseQwen()
+            // A dictation lease may restore a previously enabled mic as it drains.
+            for source in AudioSourceType.allCases { router.disable(source) }
+            asr.releaseModels()
+            (store as? FileTranscriptStore)?.flush()
+            Self.log.notice("Control resources released: ASR resident=\(self.asr.isWarm), Qwen resident=\(self.qwenHost.isLoaded), active sources=\(self.router.activeSources.count)")
+            closeResourcesTask = nil
+            prepareForCaptions(refresh: true)
+        }
+        closeResourcesTask = task
+        return task
     }
 
     /// Reset all overlay-related preferences to defaults (font, opacity, line count,
@@ -2119,13 +2349,17 @@ final class CaptureViewModel: ObservableObject {
     // MARK: - Audio sources
 
     func toggleMic() async {
+        guard !audioSourcesLocked else { return }
+        let token = sourceGenerations[.microphone, default: 0]
         if micEnabled {
             router.disable(.microphone); micEnabled = false; levels.mic = 0
             return
         }
         // One shared rule with the dictation path: asked once when macOS has
         // never been asked, never again after a grant.
-        guard await Permissions.ensureMicrophone() else {
+        let granted = await Permissions.ensureMicrophone()
+        guard token == sourceGenerations[.microphone, default: 0] else { return }
+        guard granted else {
             // Offered, not opened. Once macOS has recorded a denial,
             // `requestAccess` returns false without ever showing a dialog again,
             // so System Settings is the only thing that can change the answer —
@@ -2137,19 +2371,30 @@ final class CaptureViewModel: ObservableObject {
             return
         }
         do {
-            try await router.enable(.microphone); micEnabled = true
+            try await router.enable(.microphone)
+            guard token == sourceGenerations[.microphone, default: 0] else {
+                return
+            }
+            micEnabled = true
             statusMessage = "麥克風已開啟"
+        } catch is CancellationError {
+            return
         } catch {
+            guard token == sourceGenerations[.microphone, default: 0] else { return }
             statusMessage = "麥克風啟動失敗: \(error.localizedDescription)"
         }
     }
 
     func toggleSystem() async {
+        guard !audioSourcesLocked else { return }
+        let token = sourceGenerations[.system, default: 0]
         if systemEnabled {
             router.disable(.system); systemEnabled = false; levels.system = 0
             echoLock.withLock { systemSourceOn = false }
         } else {
-            guard await Permissions.requestScreenRecordingOnce() else {
+            let granted = await Permissions.requestScreenRecordingOnce()
+            guard token == sourceGenerations[.system, default: 0] else { return }
+            guard granted else {
                 // The advice changes after the first attempt. A grant is resolved
                 // when the process starts, so "I turned it on and it still says
                 // this" is the expected second attempt and the answer is a
@@ -2164,9 +2409,19 @@ final class CaptureViewModel: ObservableObject {
                 return
             }
             do {
-                try await router.enable(.system); systemEnabled = true
+                try await router.enable(.system)
+                guard token == sourceGenerations[.system, default: 0] else {
+                    return
+                }
+                systemEnabled = true
                 echoLock.withLock { systemSourceOn = true }
-            } catch { statusMessage = "Failed to start system audio: \(error)" }
+            } catch is CancellationError {
+                return
+            } catch {
+                guard token == sourceGenerations[.system, default: 0] else { return }
+                statusMessage = "系統音訊啟動失敗：\(error.localizedDescription) · 請確認螢幕錄製權限並重新啟動 App"
+                statusAction = .screenRecording
+            }
         }
     }
 
@@ -2180,4 +2435,40 @@ final class CaptureViewModel: ObservableObject {
     // MARK: - Session bookkeeping
 
     private var currentSession: Session?
+
+    private var fixtureReplay: Task<Void, Never>?
+
+    /// Exercise the real transcript and overlay views without capture, model
+    /// loading or production data. Available only in isolated fixture bundles.
+    func replayCaptionUIFixture() {
+        guard AppEnvironment.isUIFixture else { return }
+        fixtureReplay?.cancel()
+        summaryText = ""
+        lines = (1...100).map { index in
+            CaptionLine(id: UUID(), english: "Sentence \(index): bilingual caption replay.",
+                        chinese: "第 \(index) 句：雙語字幕版面測試。")
+        }
+        overlayOn = true
+        overlay.model.clear()
+        fixtureReplay = Task { [weak self] in
+            for index in 101...110 {
+                do { try await Task.sleep(for: .milliseconds(400)) } catch { return }
+                guard let self else { return }
+                self.lines.append(CaptionLine(id: UUID(), english: "LATEST \(index): automatically following new captions.",
+                                              chinese: "最新第 \(index) 句：字幕應自動捲到這裡。"))
+            }
+            for index in 1...8 {
+                guard let self else { return }
+                let id = UUID()
+                self.overlay.model.applyInterim(utteranceId: id, source: .system,
+                                               english: "Live sentence \(index)", chinese: "即時字幕第 \(index) 句",
+                                               expectsTranslation: true)
+                do { try await Task.sleep(for: .milliseconds(1200)) } catch { return }
+                self.overlay.model.applyCommit(utteranceId: id, source: .system,
+                                              sentences: [(key: id, english: "Final sentence \(index)")],
+                                              expectsTranslation: true)
+                self.overlay.model.applyTranslation(key: id, text: "完整字幕第 \(index) 句")
+            }
+        }
+    }
 }

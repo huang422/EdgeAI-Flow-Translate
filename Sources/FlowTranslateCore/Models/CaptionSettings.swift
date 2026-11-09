@@ -211,6 +211,9 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
     /// When true, adaptively raise quiet speech toward a target loudness on top of
     /// the manual gains (upward compression, rate-limited + noise-gated + limited).
     public var autoGainEnabled: Bool
+    /// Optional speaker playback suppression. Off with headphones so local and
+    /// remote speech can be transcribed simultaneously. This is not true AEC.
+    public var suppressMicDuringSystemAudio: Bool
     /// What the system audio is (video vs. live meeting speech) — drives the
     /// utterance-segmentation timing (see `SegmentationTuning`).
     public var scenario: CaptureScenario
@@ -275,6 +278,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         systemInputGainDb: Double = 0,
         micInputGainDb: Double = 0,
         autoGainEnabled: Bool = false,
+        suppressMicDuringSystemAudio: Bool = false,
         scenario: CaptureScenario = .video,
         primaryLineOnTop: PrimaryLine = .original,
         historyLineCount: Int = 1,
@@ -308,6 +312,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         self.systemInputGainDb = CaptionSettings.clampGain(systemInputGainDb)
         self.micInputGainDb = CaptionSettings.clampGain(micInputGainDb)
         self.autoGainEnabled = autoGainEnabled
+        self.suppressMicDuringSystemAudio = suppressMicDuringSystemAudio
         self.scenario = scenario
         self.primaryLineOnTop = primaryLineOnTop
         self.historyLineCount = max(0, min(2, historyLineCount))
@@ -370,6 +375,7 @@ public struct CaptionSettings: Codable, Sendable, Equatable {
         systemInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .systemInputGainDb) ?? d.systemInputGainDb)
         micInputGainDb = CaptionSettings.clampGain(try c.decodeIfPresent(Double.self, forKey: .micInputGainDb) ?? d.micInputGainDb)
         autoGainEnabled = try c.decodeIfPresent(Bool.self, forKey: .autoGainEnabled) ?? d.autoGainEnabled
+        suppressMicDuringSystemAudio = try c.decodeIfPresent(Bool.self, forKey: .suppressMicDuringSystemAudio) ?? false
         scenario = Self.lenient(CaptureScenario.self, c, .scenario, default: d.scenario)
         primaryLineOnTop = Self.lenient(PrimaryLine.self, c, .primaryLineOnTop, default: d.primaryLineOnTop)
         historyLineCount = max(0, min(2, try c.decodeIfPresent(Int.self, forKey: .historyLineCount) ?? d.historyLineCount))

@@ -8,17 +8,15 @@ import os
 /// Listening state mirrored from the app's `ASRState` so the idle status pill can
 /// reflect reality (listening / loading / warming / not listening) instead of
 /// always claiming "Listening" even when stopped or still loading the model.
-enum OverlayListenState { case idle, loading, warming, listening }
+enum OverlayListenState { case idle, loading, warming, listening, failed }
 
 /// Observable content + presentation state for the floating caption overlay.
 /// Content lives in `CaptionBandState` (pure, unit-tested core logic): a current
 /// utterance **slot** that morphs in place from interim to finalized (same view
 /// identity → no jump), plus rolled-up history lines.
 ///
-/// The band is a fixed size from the settings and pinned by its bottom edge, so
-/// no edge moves while captions stream: the live utterance starts on a fixed line
-/// and grows downward into room reserved for it, and the finalized lines above
-/// step up a whole unit at a time.
+/// The band is pinned by its bottom edge. Bilingual paragraphs retain their view
+/// identities as they roll up, and their full height determines the top edge.
 @MainActor
 final class OverlayModel: ObservableObject {
     // Content: the caption-band state machine (see FlowTranslateCore).
@@ -45,6 +43,10 @@ final class OverlayModel: ObservableObject {
     @Published var showSpeakerSlot = false
     @Published var reduceMotion = false
 
+    // Set from the screen and bottom anchor by the panel controller.
+    @Published var textWidth = CaptionTheme.Metric.overlayMaxWidth
+    @Published var availableCaptionHeight = CGFloat.greatestFiniteMagnitude
+
     var isPinned: Bool { band.isPinned }
 
     // MARK: - Band events (called by CaptureViewModel)
@@ -52,8 +54,10 @@ final class OverlayModel: ObservableObject {
     /// Live partial for the displayed utterance (same id all utterance long).
     func applyInterim(utteranceId: UUID, source: AudioSourceType,
                       english: String, chinese: String?, expectsTranslation: Bool) {
+        guard interimStyle == .markedWithCaret else { return }
         band.interim(utteranceId: utteranceId, source: source, english: english,
-                     chinese: chinese, expectsTranslation: expectsTranslation)
+                     chinese: chinese, expectsTranslation: expectsTranslation,
+                     fitsOriginal: originalWidthCheck(expectsTranslation: expectsTranslation))
     }
 
     /// Finalized utterance, cleaned + split; the last sentence morphs the slot.
@@ -63,7 +67,19 @@ final class OverlayModel: ObservableObject {
                      provisional: [UUID: String] = [:]) {
         band.commit(utteranceId: utteranceId, source: source,
                     sentences: sentences, expectsTranslation: expectsTranslation,
-                    speakerLabel: speakerLabel, provisional: provisional)
+                    speakerLabel: speakerLabel, provisional: provisional,
+                    fitsOriginal: originalWidthCheck(expectsTranslation: expectsTranslation,
+                                                     hasSpeaker: speakerLabel != nil))
+    }
+
+    private func originalWidthCheck(expectsTranslation: Bool, hasSpeaker: Bool = false) -> (String) -> Bool {
+        let secondary = showSecondLine && expectsTranslation && primaryLineOnTop != .original
+        let font = NSFont.systemFont(ofSize: fontSize * (secondary ? 0.82 : 1), weight: .semibold)
+        let speakerWidth = showSpeakerSlot || hasSpeaker
+            ? CaptionTheme.speakerSlotWidth + CaptionTheme.Metric.gutterSpacing : 0
+        let width = max(12, textWidth - speakerWidth - CaptionTheme.Metric.gutterSpacing
+                        - CaptionTheme.Metric.dotSize - 8)
+        return { ($0 as NSString).size(withAttributes: [.font: font]).width <= width }
     }
 
     /// Accurate translation for a finalized sentence.
@@ -81,6 +97,18 @@ final class OverlayModel: ObservableObject {
         band.discard(utteranceId: utteranceId)
     }
 
+    func addPresentedSpeakerGroup(
+        utteranceId: UUID, key: UUID, original: String, speaker: String?, isLast: Bool
+    ) {
+        band.addPresentedSpeakerGroup(utteranceId: utteranceId, key: key,
+                                      original: original, speaker: speaker, isLast: isLast)
+    }
+
+    func previewOriginalFinal(utteranceId: UUID, text: String, expectsTranslation: Bool) {
+        band.previewOriginalFinal(utteranceId: utteranceId, text: text,
+                                  fitsOriginal: originalWidthCheck(expectsTranslation: expectsTranslation))
+    }
+
     func togglePin() { band.togglePin() }
 
     func clear() {
@@ -94,6 +122,7 @@ final class OverlayModel: ObservableObject {
 /// Callbacks the SwiftUI overlay invokes back into the `OverlayController`.
 struct OverlayActions {
     var onSize: (CGSize) -> Void = { _ in }
+    var onOverflow: (Bool) -> Void = { _ in }
     var onDrag: (CGSize) -> Void = { _ in }
     var onDragEnd: () -> Void = {}
     var onReset: () -> Void = {}
@@ -113,10 +142,22 @@ private struct VisualEffectBlur: NSViewRepresentable {
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }
 
+private enum OverlayChrome {
+    static let side: CGFloat = 24
+    static let top: CGFloat = 8
+    static let shadowBottom: CGFloat = 30
+    static let controlBottom: CGFloat = 40
+    static let captionTop: CGFloat = 14
+    static let captionBottom: CGFloat = 6
+    static let panelWidthInset = 2 * (side + CaptionTheme.Metric.overlayScrimHPadding)
+    static let panelHeightInset = top + controlBottom + captionTop + captionBottom
+}
+
 private extension View {
     /// The dark blurred caption backdrop (scrim): tint + rounded corners + inset
     /// hairline + drop shadow. Amber outline when pinned.
-    func scrim(opacity: Double, pinned: Bool = false) -> some View {
+    func scrim(opacity: Double, pinned: Bool = false,
+               bottomInset: CGFloat = OverlayChrome.shadowBottom) -> some View {
         let corner = CaptionTheme.Metric.scrimCorner
         let border = pinned ? CaptionTheme.Palette.pin.opacity(0.45) : Color.white.opacity(0.09)
         return self.background(
@@ -135,9 +176,9 @@ private extension View {
         // Room below for the shadow, which falls 4 pt down with an 11 pt blur.
         // The control strip is above the scrim again, so there is nothing under
         // it to catch the shadow and the panel's own edge would clip it.
-        .padding(.horizontal, 24)
-        .padding(.top, 8)
-        .padding(.bottom, 30)
+        .padding(.horizontal, OverlayChrome.side)
+        .padding(.top, OverlayChrome.top)
+        .padding(.bottom, bottomInset)
     }
 }
 
@@ -172,21 +213,6 @@ struct BreathingDot: View {
     }
 }
 
-private extension View {
-    /// Let this line wrap, up to `rows`.
-    ///
-    /// **Wrapping only — the type size is never touched.** A previous version
-    /// shrank a long caption to fit its rows, and the size is the user's setting:
-    /// a caption that quietly gets smaller when a sentence runs long is the app
-    /// overruling the one thing about the overlay they chose by hand. The row
-    /// allowance is what gives instead, and it is generous enough
-    /// (`CaptionTheme.liveRecognitionRows`) that the limit is a backstop rather
-    /// than something a sentence meets.
-    func wrapping(upTo rows: Int) -> some View {
-        lineLimit(rows)
-    }
-}
-
 /// A horizontal dotted underline used under the interim text.
 private struct DottedUnderline: Shape {
     func path(in rect: CGRect) -> Path {
@@ -200,8 +226,8 @@ private struct DottedUnderline: Shape {
 // MARK: - Caption band line
 
 /// One line of the caption band. The SAME view renders the line through its whole
-/// life, and the text morphs in place via `contentTransition(.interpolate)` (new
-/// words fade in; cleanup edits crossfade).
+/// life. Interim words may interpolate; finalized text does not crossfade when
+/// its paragraph rolls up.
 ///
 /// **The text itself never changes appearance.** One colour, one weight, full
 /// strength, whether the line is in progress, newest or old — so a sentence
@@ -216,8 +242,6 @@ private struct BandLineView: View {
     /// Whether to reserve the fixed speaker-name slot (diarization on).
     let showSpeakerSlot: Bool
     let reduceMotion: Bool
-    /// Rows this line may wrap to.
-    let recognitionRows: Int
 
     /// Non-empty translation text, if any.
     private var translation: String? {
@@ -238,10 +262,6 @@ private struct BandLineView: View {
     /// Keep the row ORDER fixed by the primary-line setting (even while the
     /// translation is still pending) so the finalize morph never swaps rows.
     private var englishOnTop: Bool { !showSecondRow || primaryOnTop == .original }
-
-    private var speakerSlotWidth: CGFloat {
-        CaptionTheme.speakerSlotWidth(labelSize: CaptionTheme.speakerLabelSize(fontSize))
-    }
 
     /// Reserve the speaker column when diarization is on — OR whenever a label
     /// actually exists, so a label can never be dropped just because the mirrored
@@ -265,11 +285,9 @@ private struct BandLineView: View {
     /// One caption unit, as tall as its own text — the two rows adjacent, with
     /// nothing reserved between them.
     ///
-    /// Reserving rows *inside* the unit was tried and is what put a gap between
-    /// the original and its translation: a three-row area holding a one-row
-    /// sentence shows the two rows it is not using, and they land in the one
-    /// place a reader reads across. Where the slack goes instead is
-    /// `liveRegion`'s problem, and it puts it above the whole unit.
+    /// The original and its translation wrap together at the configured font
+    /// sizes. The viewport clips old paragraphs at its top, never a text tail
+    /// with a separate one-row limit.
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: CaptionTheme.Metric.gutterSpacing) {
             dot
@@ -278,14 +296,13 @@ private struct BandLineView: View {
             VStack(alignment: .leading, spacing: CaptionTheme.Metric.rowGap) {
                 Group {
                     if englishOnTop {
-                        englishRow(font: CaptionTheme.primaryFont(fontSize), color: topColor,
-                                   rows: recognitionRows)
+                        englishRow(font: CaptionTheme.primaryFont(fontSize), color: topColor)
                     } else {
                         Text(secondRowText)
                             .font(CaptionTheme.primaryFont(fontSize).weight(.semibold))
-                            .contentTransition(reduceMotion ? .identity : .interpolate)
+                            .contentTransition(line.isFinal || reduceMotion ? .identity : .interpolate)
                             .foregroundStyle(translation == nil ? CaptionTheme.Palette.inkTertiary : topColor)
-                            .wrapping(upTo: recognitionRows)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
                 }
 
@@ -294,13 +311,11 @@ private struct BandLineView: View {
                         if englishOnTop {
                             Text(secondRowText)
                                 .font(CaptionTheme.translationFont(fontSize))
-                                .contentTransition(reduceMotion ? .identity : .interpolate)
+                                .contentTransition(line.isFinal || reduceMotion ? .identity : .interpolate)
                                 .foregroundStyle(bottomColor)
-                                .wrapping(upTo: CaptionTheme.translationRows)
+                                .fixedSize(horizontal: false, vertical: true)
                         } else {
-                            englishRow(font: CaptionTheme.translationFont(fontSize),
-                                       color: bottomEnglishColor,
-                                       rows: CaptionTheme.translationRows)
+                            englishRow(font: CaptionTheme.translationFont(fontSize), color: bottomEnglishColor)
                         }
                     }
                 }
@@ -310,79 +325,52 @@ private struct BandLineView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    /// Speaker name in a FIXED-width slot, so the text's left edge never moves.
-    /// The label only arrives at finalize — diarization runs on the completed
-    /// utterance — so letting it push the sentence right would shift the text
-    /// AND re-wrap it at the exact moment the speaker stopped talking. The slot
-    /// exists only while diarization is on; otherwise the layout is unchanged.
+    /// Reserve the label column before diarization returns. Late speaker
+    /// names can then appear without changing the original text's width.
     @ViewBuilder
     private var speakerLabel: some View {
         if reservesSpeakerSlot {
-            Text(SpeakerName.wrapping(line.speakerLabel ?? ""))
-                .font(.system(size: CaptionTheme.speakerLabelSize(fontSize), weight: .bold))
-                // Two lines, broken at the join. One line could not fit the full
-                // name in a column the band reserves on every row, and showing
-                // the model half alone stopped being unique the moment the name
-                // pools ran out.
-                .multilineTextAlignment(.leading)
-                // `inkSecondary`, not `inkTertiary`: the speaker is a cue you
-                // actually read, and the weakest ink is near-invisible on the
-                // scrim at label size.
-                .foregroundStyle(CaptionTheme.Palette.inkSecondary)
-                .lineLimit(2)
-                // `minWidth`, not `width`, and `fixedSize` so the label wins.
-                //
-                // The slot is measured against every name the generator can
-                // produce, so in principle nothing overflows it. In practice a
-                // fixed width plus tail truncation means that if anything ever
-                // *does* hand this row a longer label — a full `Claude Mango`
-                // from a path that should have sent the short form, a restored
-                // line, a name form added later — the name is silently cut, and a
-                // cut name is worse than no name: `Claude M…` and `Claude P…`
-                // read as the same speaker.
-                //
-                // A wider column instead shifts the text by a few points on the
-                // rows that carry the long label, which is visible, harmless, and
-                // self-reporting. Everything else in this band is built so text
-                // is never truncated; this was the one place it could be.
-                // `fixedSize()` on BOTH axes, which is the whole point.
-                // `vertical: false` left the height to the parent, and the row's
-                // height comes from a one-line caption — so the two-line label was
-                // proposed a one-line box and collapsed straight back to one
-                // truncated line. The hard newline was there; there was nowhere
-                // to put it.
-                .fixedSize()
-                .frame(minWidth: speakerSlotWidth, alignment: .leading)
+            CaptionSpeakerLabel(name: line.speakerLabel ?? (line.source == .system ? "系統音訊" : "麥克風"),
+                                reservesSpace: true)
         }
     }
 
     /// The recognition-text row: caret + dotted underline live HERE (wherever the
     /// English sits), never on a possibly-empty translation row.
     ///
-    /// Bounded to `rows` rather than allowed to wrap freely: text taking as many
-    /// lines as it needs makes the band scroll, which puts half a glyph at the top
-    /// of the box. The allowance is sized so a sentence wraps inside it.
-    private func englishRow(font: Font, color: Color, rows: Int) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 3) {
-            Text(line.english)
-                // One weight for every state. Medium→semibold on finalize was the
-                // worst of the jumps: semibold is wider, so a sentence could
-                // re-wrap the moment it ended and shove the whole band upward.
-                .font(font.weight(.semibold))
-                .contentTransition(reduceMotion ? .identity : .interpolate)
-                .foregroundStyle(color)
-                .wrapping(upTo: rows)
-                .overlay(alignment: .bottom) {
-                    if !line.isFinal {
-                        DottedUnderline()
-                            .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [1.5, 2.5]))
-                            .foregroundStyle(Color(hex: 0xF5F5F7).opacity(0.3))
-                            .frame(height: 1.5)
-                            .offset(y: 3)
+    private func englishRow(font: Font, color: Color) -> some View {
+        let rows = line.originalRows.rows.isEmpty ? [line.english] : line.originalRows.rows
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(rows.indices, id: \.self) { index in
+                let open = line.isOpen && index == rows.count - 1
+                ZStack(alignment: .topLeading) {
+                    if reservesSpeakerSlot {
+                        // Reserve the same two-line height before a late label
+                        // arrives. The name sits in the existing column.
+                        CaptionSpeakerLabel(name: index > 0 ? line.originalSpeakerLabels[index] ?? "" : "",
+                                            reservesSpace: true)
+                            .offset(x: -CaptionTheme.speakerSlotWidth - CaptionTheme.Metric.gutterSpacing)
+                            .frame(width: 0, alignment: .leading)
+                    }
+                    HStack(alignment: .firstTextBaseline, spacing: 3) {
+                        Text(rows[index])
+                            .font(font.weight(.semibold))
+                            .contentTransition(.identity)
+                            .foregroundStyle(color)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .overlay(alignment: .bottom) {
+                                if open {
+                                    DottedUnderline()
+                                        .stroke(style: StrokeStyle(lineWidth: 1.5, dash: [1.5, 2.5]))
+                                        .foregroundStyle(Color(hex: 0xF5F5F7).opacity(0.3))
+                                        .frame(height: 1.5)
+                                        .offset(y: 3)
+                                }
+                            }
+                        if open { BlinkingCaret(height: fontSize * 0.95, animated: !reduceMotion) }
                     }
                 }
-            if !line.isFinal {
-                BlinkingCaret(height: fontSize * 0.95, animated: !reduceMotion)
+                .transition(reduceMotion ? .identity : .move(edge: .bottom))
             }
         }
     }
@@ -391,7 +379,7 @@ private struct BandLineView: View {
 
     @ViewBuilder
     private var dot: some View {
-        if line.isFinal {
+        if !line.isOpen {
             // No glow-on-latest: that marked "newest", which the band's own
             // bottom-up order already says, and it made every sentence boundary
             // animate something. The dot's only job is source colour.
@@ -484,6 +472,8 @@ private struct ListeningPill: View {
             BreathingDot(color: CaptionTheme.Palette.mic, size: 7).frame(width: 7, height: 7)
         case .loading, .warming:
             BreathingDot(color: CaptionTheme.Palette.accentSystem, size: 7).frame(width: 7, height: 7)
+        case .failed:
+            Circle().fill(.orange).frame(width: 7, height: 7)
         case .idle:
             Circle().fill(CaptionTheme.Palette.inkTertiary).frame(width: 7, height: 7)
         }
@@ -493,7 +483,8 @@ private struct ListeningPill: View {
         switch state {
         case .listening: return "聆聽中… Listening"
         case .loading:   return "準備模型… Preparing"
-        case .warming:   return "模型載入中…可先說話 Loading model"
+        case .warming:   return "模型載入中 Loading model"
+        case .failed:    return "模型載入失敗 Model load failed"
         case .idle:      return "待命 Idle"
         }
     }
@@ -556,21 +547,35 @@ private struct OverlayControlBar: View {
 
 // MARK: - Root overlay view
 
-private struct OverlaySizeKey: PreferenceKey {
-    static let defaultValue: CGSize = .zero
-    static func reduce(value: inout CGSize, nextValue: () -> CGSize) { value = nextValue() }
-}
-
-/// Top-level SwiftUI content hosted inside the floating `NSPanel`: a reserved
-/// band for the hover control bar, then the caption band (or the idle pill).
-///
-/// The control bar is at the **top**. It sat at the bottom for a while, on the
-/// reasoning that the panel is anchored by its bottom edge so only the bottom is
-/// guaranteed still — but the band is a fixed size now, so the top edge does not
-/// move either and that reasoning no longer buys anything.
 private struct OverlayRootView: View {
     @ObservedObject var model: OverlayModel
     let actions: OverlayActions
+
+    @State private var intrinsicCaptionHeight: CGFloat = 20
+    @State private var liveHeight: LiveMeasurement?
+
+    private struct LiveKey: Equatable {
+        let id: UUID
+        let width: CGFloat
+        let fontSize: Double
+        let secondLine: Bool
+        let primary: PrimaryLine
+        let speakerSlot: Bool
+    }
+
+    private struct LiveMeasurement: Equatable {
+        let key: LiveKey?
+        let height: CGFloat
+    }
+
+    private var liveKey: LiveKey? {
+        guard let line = model.band.visibleSlot, !line.isFinal,
+              model.interimStyle == .markedWithCaret
+        else { return nil }
+        return LiveKey(id: line.id, width: model.textWidth, fontSize: model.fontSize,
+                       secondLine: model.showSecondLine, primary: model.primaryLineOnTop,
+                       speakerSlot: model.showSpeakerSlot)
+    }
 
     /// The corner the controls occupy, measured from the panel's bottom-right.
     /// Read by the controller too: the hit-test and the hover rectangle have to
@@ -584,28 +589,9 @@ private struct OverlayRootView: View {
         content
         .fixedSize()
         .animation(model.reduceMotion ? nil : .easeOut(duration: CaptionTheme.Metric.controlsDuration), value: model.showControls)
-        .background(
-            GeometryReader { geo in
-                Color.clear.preference(key: OverlaySizeKey.self, value: geo.size)
-            }
-        )
-        .onPreferenceChange(OverlaySizeKey.self) { actions.onSize($0) }
-        // **Anchored to the bottom of the panel, and this is the fix for the
-        // last of the jumping.** Resizing the window is a round trip: SwiftUI
-        // lays the content out, reports its size through the preference above,
-        // and the controller sets the panel frame — on the *next* turn of the
-        // run loop. For that one turn the content and the window disagree about
-        // how tall they are, and `NSHostingView` resolves a `fixedSize` content
-        // smaller or larger than its bounds by **centring** it. So every single
-        // change of height moved the content down by half the difference and
-        // back again, which is a flicker at the bottom edge and at the live
-        // line's first row — the two places that are supposed to be nailed down.
-        //
-        // Pinning the content to the bottom makes the transient land entirely at
-        // the top, where the geometry already says movement is allowed. The
-        // frame goes **after** the preference so the reported size is still the
-        // content's own; putting it before would report the panel's bounds and
-        // feed the sizing loop its own output.
+        .onGeometryChange(for: CGSize.self) { $0.size } action: { actions.onSize($0) }
+        // AppKit owns the panel frame. Align content to its lower edge while
+        // the measured height and the window frame settle after a caption update.
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
     }
 
@@ -613,7 +599,7 @@ private struct OverlayRootView: View {
     /// band doubles as the "captions will appear here" affordance) or content
     /// remains on screen (e.g. pinned for reading after the meeting ended).
     private var showBand: Bool {
-        model.listenState == .listening || model.listenState == .warming
+        model.listenState == .listening || model.listenState == .warming || model.listenState == .failed
             || model.band.hasContent
     }
 
@@ -626,187 +612,95 @@ private struct OverlayRootView: View {
             // centred) so the centre-anchored window keeps a constant width and never
             // shifts horizontally when content toggles idle ↔ caption.
             ListeningPill(state: model.listenState)
-                .frame(width: CaptionTheme.Metric.overlayTotalWidth, alignment: .center)
+                .frame(width: model.textWidth + CaptionTheme.Metric.overlayScrimHPadding * 2, alignment: .center)
         }
-    }
-
-    /// The finalized lines, oldest first. These are the ones that move.
-    private var historyLines: [BandLine] { model.band.visibleCommitted }
-
-    /// The utterance being spoken — or the one that just finished, which stays in
-    /// the slot until the next begins. Nil when the user hid the interim line.
-    private var liveLine: BandLine? {
-        guard let slot = model.band.visibleSlot,
-              slot.isFinal || model.interimStyle == .markedWithCaret
-        else { return nil }
-        return slot
     }
 
     private var captionBand: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            // Banner OUTSIDE the fixed content area: pinning is a deliberate act,
-            // the one-time height change is fine (and the banner never clips).
-            if model.band.isPinned {
-                PinnedBanner(pending: model.band.pendingWhilePinned)
+        let overflow = intrinsicCaptionHeight > model.availableCaptionHeight
+        return Group {
+            if overflow {
+                ScrollView { captionStack }
+                    .defaultScrollAnchor(.bottom)
+                    .frame(height: model.availableCaptionHeight)
+            } else {
+                captionStack
             }
-            bandContent
-                .frame(width: CaptionTheme.Metric.overlayMaxWidth, alignment: .bottomLeading)
         }
+        .frame(width: model.textWidth)
+        .onChange(of: overflow, initial: true) { _, current in actions.onOverflow(current) }
+        .onChange(of: model.band.isPinned) { _, _ in actions.onOverflow(overflow) }
         .padding(.horizontal, CaptionTheme.Metric.overlayScrimHPadding)
-        .padding(.top, 14)
-        // Small, because the live area already carries its own slack underneath
-        // the translation — see `liveRegion`. Adding the old 15 pt on top of that
-        // made the reserved rows read as a gap rather than as padding.
-        .padding(.bottom, 6)
-        // **Inside the box, in the one corner that never moves.**
-        //
-        // The panel is pinned by its bottom edge and its width is a constant, so
-        // the bottom-right corner is fixed in both axes while the top edge follows
-        // the history. A control anywhere else travels when the box grows — and a
-        // control that moves between the user seeing it and pressing it is a
-        // control that cannot be pressed. `.overlay` rather than a row in the
-        // stack, so the captions keep their full width and the box its height.
+        .padding(.top, OverlayChrome.captionTop)
+        .padding(.bottom, OverlayChrome.captionBottom)
+        .scrim(opacity: model.opacity, pinned: model.band.isPinned, bottomInset: OverlayChrome.controlBottom)
+        // Reserve the shadow gutter for controls so they never cover text.
         .overlay(alignment: .bottomTrailing) {
             OverlayControlBar(model: model, actions: actions)
                 .opacity(model.showControls ? 1 : 0)
                 .allowsHitTesting(model.showControls)
-                .padding(.trailing, 6)
-                .padding(.bottom, 4)
+                .padding(.trailing, OverlayChrome.side)
+                .padding(.bottom, 3)
         }
-        .scrim(opacity: model.opacity, pinned: model.band.isPinned)
+        .onDisappear { actions.onOverflow(false) }
     }
 
-    /// Height reserved for the live utterance. Never changes.
-    private var liveRegionHeight: CGFloat {
-        CaptionTheme.liveUnitHeight(model.fontSize, secondLine: model.showSecondLine)
+    private var captionStack: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if model.band.isPinned {
+                PinnedBanner(pending: model.band.pendingWhilePinned)
+            }
+            bandContent
+        }
+        .frame(width: model.textWidth, alignment: .leading)
+        .fixedSize(horizontal: false, vertical: true)
+        .onGeometryChange(for: CGFloat.self) { ceil($0.size.height) } action: { height in
+            intrinsicCaptionHeight = height
+        }
     }
 
-    /// The caption band: **the live utterance starts at a fixed line, and the top
-    /// edge sits on top of the oldest one.**
-    ///
-    /// Two regions, and the boundary between them is the only geometry that
-    /// matters. The sentence being spoken is the one you are reading, so it is
-    /// given its own reserved area at the foot of the box, top-aligned: its first
-    /// row lands on the same line whatever it does next, and it grows *downward*
-    /// into space that was already set aside for it. Nothing below it, and no
-    /// edge of the window, moves while somebody is talking.
-    ///
-    /// The finalized lines sit above it and take **their own height**, so the top
-    /// of the box lands on the top of the oldest one and there is no reserved
-    /// blank above it. Combined with the bottom-pinned panel, that means only the
-    /// top edge ever moves, and only when a sentence finalizes or is evicted —
-    /// never while one is being spoken, because nothing in this half changes then.
-    ///
-    /// One stack, bottom-anchored, could not do this: the live line's *last* row
-    /// would be the fixed one, so its first row jumped up a row every time the
-    /// sentence wrapped, taking the whole history with it.
+    private var displayedLines: [BandLine] {
+        model.band.visibleLines(showInterim: model.interimStyle == .markedWithCaret)
+    }
+
     private var bandContent: some View {
-        VStack(alignment: .leading, spacing: CaptionTheme.Metric.unitSpacing) {
-            // Guarded on the lines, not the setting: an empty region is still a
-            // `VStack` child, and its spacing would hold a 12 pt gap above the
-            // live line for a history that does not exist yet.
-            if !historyLines.isEmpty {
-                historyRegion
+        let key = liveKey
+        return VStack(alignment: .leading, spacing: CaptionTheme.Metric.unitSpacing) {
+            ForEach(displayedLines) { line in
+                let measuredKey = key?.id == line.id ? key : nil
+                bandLineView(line)
+                    .onGeometryChange(for: LiveMeasurement.self) {
+                        LiveMeasurement(key: measuredKey, height: ceil($0.size.height))
+                    } action: { measurement in
+                        guard let active = measurement.key, active == liveKey else { return }
+                        if liveHeight?.key != active || measurement.height > (liveHeight?.height ?? 0) {
+                            liveHeight = measurement
+                        }
+                    }
+                    .frame(minHeight: measuredKey != nil && measuredKey == liveHeight?.key
+                           ? liveHeight?.height : nil, alignment: .bottomLeading)
+                    .transition(model.reduceMotion ? .identity : .asymmetric(
+                        insertion: .move(edge: .bottom).combined(with: .opacity),
+                        removal: .move(edge: .top).combined(with: .opacity)))
             }
-            liveRegion
+            if displayedLines.isEmpty { bandStatusRow }
         }
-        // **No animation on the band's own height.** There was one, easing the
-        // layout over 180 ms — which meant the content's height changed on every
-        // frame of it, and the window chased each of those a run loop behind. Ten
-        // resizes, ten frames of the content and the panel disagreeing, for one
-        // sentence rolling up. The height change is instantaneous now: one
-        // resize, one frame, absorbed at the top by the bottom anchor in
-        // `OverlayRootView`. The per-line opacity transitions below stay, because
-        // fading a line in and out costs no layout.
-    }
-
-    /// Finalized lines, sized to themselves and stacked above the live utterance.
-    ///
-    /// **No fixed height and no scroll view.** Reserving the rows these lines are
-    /// allowed to use meant the box was always as tall as its worst case — three
-    /// rows per sentence, when most take one — so it stood in a block of empty
-    /// scrim that never went away. Letting the stack size itself puts the top of
-    /// the box on the top of the oldest caption instead.
-    ///
-    /// This does not bring back the moving box it replaced. That version measured
-    /// the *live* line, which re-wraps several times a second; this half only
-    /// changes when a sentence finalizes or is evicted. And the panel is pinned by
-    /// its bottom edge with a constant width, so a change here can only move the
-    /// top.
-    private var historyRegion: some View {
-        VStack(alignment: .leading, spacing: CaptionTheme.Metric.unitSpacing) {
-            ForEach(historyLines) { line in
-                bandLineView(line, recognitionRows: CaptionTheme.historyRecognitionRows)
-                    // Removal is instant, and it has to be for the floor below to
-                    // mean anything. A removal transition keeps the leaving view
-                    // in the layout for its whole duration, so a symmetric fade
-                    // held one extra line for 250 ms at every commit — which the
-                    // high-water mark would then adopt as the new floor, for a
-                    // line that no longer exists. Insertion may fade: the arriving
-                    // line's space is needed immediately either way.
-                    .transition(model.reduceMotion
-                                ? .identity
-                                : .asymmetric(
-                                    insertion: .opacity.animation(
-                                        .easeOut(duration: CaptionTheme.Metric.evictDuration)),
-                                    removal: .identity))
-            }
-        }
-        // **Nothing reserves height here.** The stack is exactly as tall as the
-        // lines in it, so the top edge sits on the top of the oldest caption and
-        // follows it as history arrives, is evicted, or the visible-line count,
-        // font size and second-caption switch change.
+        .fixedSize(horizontal: false, vertical: true)
         .frame(maxWidth: .infinity, alignment: .leading)
+        .animation(model.reduceMotion ? nil : .easeOut(duration: CaptionTheme.Metric.evictDuration),
+                   value: displayedLines.map(\.id))
+        .animation(model.reduceMotion ? nil : .easeOut(duration: CaptionTheme.Metric.evictDuration),
+                   value: displayedLines.map { $0.originalRows.rows.count })
     }
 
-    /// The utterance being spoken: a **fixed** area with the content at the
-    /// **top** of it.
-    ///
-    /// Both choices are forced by the requirements below; every other arrangement
-    /// breaks one of them.
-    ///
-    /// - The bottom edge is fixed and the top follows the history, so the box's
-    ///   height is `history + live`.
-    /// - The live sentence must start on a fixed line. Its top is therefore a
-    ///   fixed distance above the bottom edge — which means **this area's height
-    ///   cannot depend on the sentence**. Hence `height`, not `minHeight`.
-    /// - It is `topLeading` because that fixed line is the *first* row. Bottom
-    ///   alignment holds the last row instead, which reads as the sentence
-    ///   crawling upward and leaves the unused rows above it — a block of blank
-    ///   between the history and the live line.
-    /// - The recognition text and its translation are adjacent inside the unit,
-    ///   with nothing reserved between them, so there is no gap where a reader
-    ///   reads across.
-    ///
-    /// All four together make the consequence unavoidable: a reserved area
-    /// holding a shorter sentence has slack, and with the content at the top that
-    /// slack is **below the translation** — the only place left for it. It reads
-    /// as padding above the band's lower border, which is why the band's own
-    /// bottom padding is small.
-    @ViewBuilder
-    private var liveRegion: some View {
-        Group {
-            if let live = liveLine {
-                bandLineView(live, recognitionRows: CaptionTheme.liveRecognitionRows)
-            } else {
-                bandStatusRow
-            }
-        }
-        .frame(height: liveRegionHeight, alignment: .topLeading)
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func bandLineView(
-        _ line: BandLine, recognitionRows: Int
-    ) -> some View {
+    private func bandLineView(_ line: BandLine) -> some View {
         BandLineView(
             line: line,
             fontSize: model.fontSize,
             primaryOnTop: model.primaryLineOnTop,
             showSecond: model.showSecondLine,
             showSpeakerSlot: model.showSpeakerSlot,
-            reduceMotion: model.reduceMotion,
-            recognitionRows: recognitionRows
+            reduceMotion: model.reduceMotion
         )
     }
 
@@ -818,7 +712,10 @@ private struct OverlayRootView: View {
             case .warming:
                 BreathingDot(color: CaptionTheme.Palette.accentSystem, animated: !model.reduceMotion, size: 6)
                     .frame(width: 6, height: 6)
-                Text("模型載入中…可先開始說話（開頭不會漏）")
+                Text("模型載入中…請等候辨識就緒再說話")
+            case .failed:
+                Circle().fill(.orange).frame(width: 6, height: 6)
+                Text("模型載入失敗 · 請回主視窗結束後重試")
             case .listening:
                 BreathingDot(color: CaptionTheme.Palette.mic, animated: !model.reduceMotion, size: 6)
                     .frame(width: 6, height: 6)
@@ -845,13 +742,10 @@ private struct OverlayRootView: View {
 /// hovering.
 private final class PassthroughHostingView<Content: View>: NSHostingView<Content> {
     var controlsVisible: () -> Bool = { false }
+    var canScrollCaptions: () -> Bool = { false }
 
-    /// Only the controls' corner is ever interactive.
-    ///
-    /// Everything else — every caption, pinned or not — passes the click straight
-    /// through to whatever is behind the overlay, which is the whole point of a
-    /// click-through caption band.
     override func hitTest(_ point: NSPoint) -> NSView? {
+        if canScrollCaptions() { return super.hitTest(point) }
         guard controlsVisible() else { return nil }
         // Bottom-left origin, so the controls' corner is low y and high x.
         let corner = OverlayRootView.controlCornerSize
@@ -912,6 +806,8 @@ final class OverlayController {
 
     private var clickThroughEnabled = true
     private var isHovering = false
+    private var captionsOverflow = false
+    private var defaultAnchor: CGPoint?
     /// Where the overlay is pinned: `x` is its horizontal centre, `y` is its
     /// **bottom edge**. `nil` until the user drags it.
     ///
@@ -969,15 +865,7 @@ final class OverlayController {
         model.showSpeakerSlot = s.diarizationEnabled
         model.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         clickThroughEnabled = s.clickThrough
-        // Adopt the stored anchor only when it actually changed — i.e. when the
-        // user dragged the overlay.
-        //
-        // `applyContentSize` shifts the live anchor on every reflow so the bottom
-        // edge holds, and re-reading the persisted top-centre value here undid
-        // that. Any unrelated settings write would do it: a font step, a gain
-        // slider, an overlay-opacity drag — each one snapped the box back and
-        // moved the line being read, which is precisely what holding the bottom
-        // edge exists to prevent.
+        // Keep the active drag position across unrelated settings changes.
         if s.overlayBottomAnchor != lastAppliedStoredAnchor {
             lastAppliedStoredAnchor = s.overlayBottomAnchor
             // Adopted verbatim: the stored point IS the bottom edge, so there is
@@ -1002,7 +890,9 @@ final class OverlayController {
     private func makePanel() -> NSPanel {
         let root = OverlayRootView(model: model, actions: makeActions())
         let hosting = PassthroughHostingView(rootView: root)
+        hosting.sizingOptions = []   // only applyContentSize may resize the panel
         hosting.controlsVisible = { [weak self] in self?.model.showControls ?? false }
+        hosting.canScrollCaptions = { [weak self] in self?.canScrollCaptions ?? false }
         self.hostingView = hosting
 
         let panel = UnconstrainedPanel(
@@ -1026,42 +916,44 @@ final class OverlayController {
     private func makeActions() -> OverlayActions {
         OverlayActions(
             onSize: { [weak self] in self?.applyContentSize($0) },
+            onOverflow: { [weak self] overflowing in
+                self?.captionsOverflow = overflowing
+                self?.updateHover()
+            },
             onDrag: { [weak self] in self?.dragChanged($0) },
             onDragEnd: { [weak self] in self?.dragEnded() },
             onReset: { [weak self] in self?.onReset?() }
         )
     }
 
-    /// Resize the panel to fit its content while keeping the user's **bottom-centre
-    /// anchor** fixed: the box grows upward and stays put horizontally no matter
-    /// how the content width/height change (new line, idle pill ↔ caption, pin
-    /// banner). Falls back to the default bottom-centre placement when un-dragged.
-    ///
-    /// Every edge but the top is therefore fixed by construction: `origin.y` is
-    /// the anchor itself, and `origin.x` is the anchor minus half a width that
-    /// `OverlayRootView` holds constant. Only `maxY` — the top — follows the text.
+    /// The anchor chooses the display. Growing the frame cannot choose another
+    /// display and unexpectedly move the anchor during a caption update.
     private func applyContentSize(_ size: CGSize) {
         guard let panel, size.width > 1, size.height > 1 else { return }
         lastContentSize = size
-        guard let screen = panel.screen ?? NSScreen.main else { return }
-        let vf = screen.visibleFrame
+        if defaultAnchor == nil, let screen = panel.screen ?? NSScreen.main {
+            defaultAnchor = defaultBottom(in: screen.visibleFrame)
+        }
+        guard let anchor = pinnedBottom ?? defaultAnchor,
+              let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor) }) ?? NSScreen.main
+        else { return }
+        let available = screen.visibleFrame.insetBy(dx: 8, dy: 8)
+        let panelWidth = min(CaptionTheme.Metric.overlayMaxWidth + OverlayChrome.panelWidthInset,
+                             available.width)
+        // If a saved position is off-screen, leave at least a small viewport.
+        let minRoom = min(160, available.height)
+        let bottom = min(max(anchor.y, available.minY), available.maxY - minRoom)
+        let textWidth = max(1, panelWidth - OverlayChrome.panelWidthInset)
+        let heightLimit = max(1, available.maxY - bottom - OverlayChrome.panelHeightInset)
+        if model.textWidth != textWidth { model.textWidth = textWidth }
+        if model.availableCaptionHeight != heightLimit { model.availableCaptionHeight = heightLimit }
 
-        let bottom = pinnedBottom ?? defaultBottom(in: vf)
-        // The bottom edge IS the origin's y, so it does not move when the height
-        // changes. Only the top boundary follows the text.
-        var origin = CGPoint(x: bottom.x - size.width / 2, y: bottom.y)
-        // Nudged back into the visible frame, never discarded, so the overlay
-        // cannot drift off-screen or snap to the centre after a resolution,
-        // display or Space change.
-        origin.x = min(max(origin.x, vf.minX + 8), max(vf.minX + 8, vf.maxX - size.width - 8))
-        // **Only the lower bound.** An upper one — `min(origin.y, vf.maxY -
-        // size.height - 8)` — inverts the geometry: once the box is tall enough
-        // for it to bite it pins `maxY` to the screen edge, so every caption that
-        // makes the box taller pushes the **bottom** down. That engages exactly
-        // when the box is doing what it is supposed to do. The height is bounded
-        // by `historyLimit` anyway, so dropping it costs nothing.
-        origin.y = max(origin.y, vf.minY + 8)
-        panel.setFrame(NSRect(origin: origin, size: size), display: true)
+        let height = min(ceil(size.height), available.maxY - bottom)
+        let x = min(max(anchor.x - panelWidth / 2, available.minX), available.maxX - panelWidth)
+        let frame = NSRect(x: x, y: bottom, width: panelWidth, height: height)
+        if panel.frame != frame {
+            panel.setFrame(frame, display: true)
+        }
     }
 
     /// Default placement: horizontally centred, sitting `overlayBottomFraction`
@@ -1085,11 +977,10 @@ final class OverlayController {
         }
         guard let ms = dragMouseStart, let os = dragOriginStart else { return }
         let newOrigin = CGPoint(x: os.x + (mouse.x - ms.x), y: os.y + (mouse.y - ms.y))
-        panel.setFrameOrigin(newOrigin)
-        // Track the live position as a bottom edge, so a content-size update
-        // mid-drag stays pinned to where the user is dragging.
+        // Use the same screen bounds for dragging and content changes.
         let size = panel.frame.size
         pinnedBottom = CGPoint(x: newOrigin.x + size.width / 2, y: newOrigin.y)
+        applyContentSize(lastContentSize)
     }
 
     private func dragEnded() {
@@ -1144,12 +1035,13 @@ final class OverlayController {
             isHovering = overPanel
             model.showControls = overPanel
         }
-        // `ignoresMouseEvents == true` means click-through; capture only over the
-        // control strip. Pinning no longer makes the caption area interactive:
-        // there is nothing to scroll now that every unit sits in its own slot,
-        // and swallowing clicks over frozen captions is the opposite of what a
-        // click-through overlay is for.
-        panel.ignoresMouseEvents = !overBand
+        panel.ignoresMouseEvents = !(overBand || (overPanel && canScrollCaptions))
+    }
+
+    // Pinning deliberately enters reading mode. Live subtitles remain
+    // click-through even when their content is taller than the screen.
+    private var canScrollCaptions: Bool {
+        captionsOverflow && (!clickThroughEnabled || model.band.isPinned)
     }
 
     private func setHovering(_ inside: Bool) {

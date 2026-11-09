@@ -18,10 +18,14 @@ import Testing
         #expect(!SemanticEndpoint.isIncomplete("are you ready?"))
     }
 
-    /// Terminal punctuation always wins, even after a dangler-looking word.
     @Test func terminalPunctuationWins() {
         #expect(!SemanticEndpoint.isIncomplete("I know what this is."))
         #expect(!SemanticEndpoint.isIncomplete("好，就這樣。"))
+    }
+
+    @Test func provisionalPeriodsDoNotCompleteStrongConnectives() {
+        #expect(SemanticEndpoint.isIncomplete("We should do this because."))
+        #expect(SemanticEndpoint.isIncomplete("我們先做這個然後。"))
     }
 
     @Test func trailingCommaIsIncomplete() {
@@ -72,16 +76,16 @@ import Testing
     /// endpoint finalizes even if still "incomplete".
     @Test func acousticEndpointDeferredOnceThenFinalizes() {
         var e = Endpointer(config: cfg())
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
         // First endpoint: text ends in "because" → deferred, utterance stays open.
-        let deferred = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                                 sentenceIncomplete: true, dt: 0.1)
+        let deferred = e.process(speechStarted: false, speechEnded: true,
+                                 partial: "We need to", dt: 0.1)
         #expect(deferred.isEmpty)
         #expect(e.inUtterance)
         // Speaker continues, then a second endpoint (still incomplete) finalizes.
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 1.0)
-        let final = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                              sentenceIncomplete: true, dt: 0.1)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 1.0)
+        let final = e.process(speechStarted: false, speechEnded: true,
+                              partial: "We need to", dt: 0.1)
         #expect(final == [.finalize])
         #expect(!e.inUtterance)
     }
@@ -89,46 +93,51 @@ import Testing
     /// A complete-sounding sentence is NOT deferred.
     @Test func completeSentenceFinalizesImmediately() {
         var e = Endpointer(config: cfg())
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
-        let events = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                               sentenceIncomplete: false, dt: 0.1)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
+        let events = e.process(speechStarted: false, speechEnded: true,
+                               dt: 0.1)
         #expect(events == [.finalize])
     }
 
-    /// Sub-minSpeech blips are still dropped, incomplete or not.
-    @Test func blipStillDropsRegardlessOfSemantics() {
+    @Test func subMinimumNoiseWithoutDecodedWordsIsDropped() {
         var e = Endpointer(config: cfg())
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.1)
-        let events = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                               sentenceIncomplete: true, dt: 0.05)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.1)
+        let events = e.process(speechStarted: false, speechEnded: true, dt: 0.05)
         #expect(events.isEmpty)
         #expect(!e.inUtterance)
+    }
+
+    @Test func decodedShortReplySurvivesMinimumSpeechFilter() {
+        var e = Endpointer(config: cfg())
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.1)
+        let events = e.process(speechStarted: false, speechEnded: true, partial: "Yes.", dt: 0.05)
+        #expect(events == [.finalize])
     }
 
     /// The wall-clock cap still fires during a grace hold (a non-stop talker
     /// can't keep the line open forever).
     @Test func maxSpeechCapStillAppliesAfterGrace() {
         var e = Endpointer(config: cfg(maxSpeech: 2))
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
-        _ = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                      sentenceIncomplete: true, dt: 0.1)   // deferred
-        let events = e.process(speechStarted: false, speechEnded: false, sentenceEnded: false,
-                               sentenceIncomplete: true, dt: 2.0)   // blows past the cap
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
+        _ = e.process(speechStarted: false, speechEnded: true,
+                      partial: "We need to", dt: 0.1)   // deferred
+        let events = e.process(speechStarted: false, speechEnded: false,
+                               partial: "We need to", dt: 2.0)   // blows past the cap
         #expect(events == [.finalize])
     }
 
     /// Grace budget resets for the next utterance.
     @Test func graceBudgetResetsPerUtterance() {
         var e = Endpointer(config: cfg())
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
-        _ = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                      sentenceIncomplete: true, dt: 0.1)   // grace used
-        _ = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                      sentenceIncomplete: true, dt: 0.1)   // finalize (budget spent)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
+        _ = e.process(speechStarted: false, speechEnded: true,
+                      partial: "We need to", dt: 0.1)   // grace used
+        _ = e.process(speechStarted: false, speechEnded: true,
+                      partial: "We need to", dt: 0.1)   // finalize (budget spent)
         // New utterance gets a fresh grace budget.
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
-        let deferred = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                                 sentenceIncomplete: true, dt: 0.1)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
+        let deferred = e.process(speechStarted: false, speechEnded: true,
+                                 partial: "We need to", dt: 0.1)
         #expect(deferred.isEmpty)
         #expect(e.inUtterance)
     }
@@ -136,9 +145,9 @@ import Testing
     /// maxGraceEndings = 0 disables the semantic hold entirely.
     @Test func zeroGraceBehavesLikeBefore() {
         var e = Endpointer(config: cfg(grace: 0))
-        _ = e.process(speechStarted: true, speechEnded: false, sentenceEnded: false, dt: 0.5)
-        let events = e.process(speechStarted: false, speechEnded: true, sentenceEnded: false,
-                               sentenceIncomplete: true, dt: 0.1)
+        _ = e.process(speechStarted: true, speechEnded: false, dt: 0.5)
+        let events = e.process(speechStarted: false, speechEnded: true,
+                               partial: "We need to", dt: 0.1)
         #expect(events == [.finalize])
     }
 }

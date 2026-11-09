@@ -7,8 +7,8 @@ name: Release Please
 #     last release and maintains an open "release PR" that bumps the version
 #     (version.txt + MARKETING_VERSION in project.yml) and updates CHANGELOG.md.
 #  2. When YOU merge that release PR, release-please tags `vX.Y.Z` and creates the
-#     GitHub Release — and the build-dmg job below builds the signed DMG and
-#     uploads it to that release.
+#     GitHub Release. The build-dmg job uploads the DMG, with Developer ID
+#     signing and notarization when the runner has those credentials.
 #
 # So "publishing" = merging the release PR. No manual tagging needed.
 
@@ -40,6 +40,8 @@ jobs:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: macos-15
+    # Signing requires a certificate + private key and an existing notarytool
+    # credential profile on this runner. These secrets select their names.
     # Job-level env so the notarize step's `if` can actually see it (a step's `if`
     # cannot read that same step's own env block).
     env:
@@ -52,6 +54,12 @@ jobs:
         uses: maxim-lobanov/setup-xcode@v1
         with:
           xcode-version: latest-stable
+
+      - name: Ensure Metal Toolchain
+        run: |
+          if ! xcrun metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
 
       - name: Install XcodeGen
         run: brew install xcodegen
