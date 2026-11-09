@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/huang422/EdgeAI-Flow-Translate/compare/v1.4.0...v1.4.1) (2026-11-09)
+
+
+### Bug Fixes
+
+* stabilize live captions and polish the app UI ([13b9f5e](https://github.com/huang422/EdgeAI-Flow-Translate/commit/13b9f5ed5cc04ef9033563db3e6b02635a10ff46))
+
 ## [1.4.0](https://github.com/huang422/EdgeAI-Flow-Translate/compare/v1.3.0...v1.4.0) (2026-08-10)
 
 
